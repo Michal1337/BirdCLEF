@@ -1,16 +1,21 @@
 import random
 import re
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterator, List, Optional, Tuple
 
 import pandas as pd
 import soundfile as sf
 import torch
 import torchaudio
 import torchaudio.functional as AF
+from tqdm import tqdm
+
 from torch import Tensor, nn
 from torch.nn import functional as F
 from torch.utils.data import Dataset
+
+
+PRIMARY_LABEL_SPLIT_RE = re.compile(r"[;,\s]+")
 
 
 class SpectrogramTransform(nn.Module):
@@ -49,11 +54,18 @@ class SpectrogramTransform(nn.Module):
         return spec
 
 
-def _split_secondary_labels(raw_value: Optional[str]) -> List[str]:
-    if not raw_value or not isinstance(raw_value, str):
+def parse_primary_labels(raw_value: object) -> List[str]:
+    if raw_value is None:
         return []
-    labels = [label for label in re.split(r"[,;\s]+", raw_value.strip()) if label]
-    return labels
+    try:
+        if pd.isna(raw_value):
+            return []
+    except TypeError:
+        pass
+    raw_text = str(raw_value).strip()
+    if not raw_text or raw_text == "[]":
+        return []
+    return [label for label in PRIMARY_LABEL_SPLIT_RE.split(raw_text) if label]
 
 
 def _read_audio(filepath: Path) -> Tuple[Tensor, int]:
@@ -80,22 +92,14 @@ def build_label_map(
 
     if taxonomy_csv and taxonomy_csv.exists():
         taxonomy = pd.read_csv(taxonomy_csv)
-        for col in ("primary_label", "ebird_code", "species_id"):
-            if col in taxonomy.columns:
-                for label in taxonomy[col].dropna().astype(str).tolist():
-                    if label not in label_order:
-                        label_order.append(label)
-                break
+        if "primary_label" in taxonomy.columns:
+            for label in taxonomy["primary_label"].dropna().astype(str).tolist():
+                if label not in label_order:
+                    label_order.append(label)
 
     if "primary_label" in metadata.columns:
-        for label in metadata["primary_label"].dropna().astype(str).tolist():
-            if label not in label_order:
-                label_order.append(label)
-
-    if "secondary_labels" in metadata.columns:
-        secondary_series = metadata["secondary_labels"].dropna()
-        for raw in secondary_series.astype(str):
-            for label in _split_secondary_labels(raw):
+        for raw_value in metadata["primary_label"].tolist():
+            for label in parse_primary_labels(raw_value):
                 if label not in label_order:
                     label_order.append(label)
 
@@ -105,27 +109,58 @@ def build_label_map(
     return {label: idx for idx, label in enumerate(label_order)}
 
 
+def prepare_train_audio_metadata(metadata: pd.DataFrame, audio_dir: Path) -> pd.DataFrame:
+    required_cols = {"filename", "primary_label"}
+    missing = required_cols.difference(metadata.columns)
+    if missing:
+        missing_list = ", ".join(sorted(missing))
+        raise ValueError(f"train.csv is missing required columns: {missing_list}")
+
+    prepared = metadata.copy()
+    prepared = prepared.dropna(subset=["filename", "primary_label"]).reset_index(drop=True)
+    prepared["filename"] = prepared["filename"].astype(str)
+    prepared["primary_label"] = prepared["primary_label"].astype(str)
+    prepared["audio_filepath"] = prepared["filename"].map(lambda name: str(audio_dir / name))
+    prepared["source"] = "train_audio"
+    return prepared
+
+
+def prepare_soundscape_metadata(metadata: pd.DataFrame, soundscape_dir: Path) -> pd.DataFrame:
+    required_cols = {"filename", "start", "end", "primary_label"}
+    missing = required_cols.difference(metadata.columns)
+    if missing:
+        missing_list = ", ".join(sorted(missing))
+        raise ValueError(f"train_soundscapes_labels.csv is missing required columns: {missing_list}")
+
+    prepared = metadata.copy()
+    prepared = prepared.dropna(subset=["filename", "start", "end", "primary_label"]).reset_index(drop=True)
+    prepared["filename"] = prepared["filename"].astype(str)
+    prepared["primary_label"] = prepared["primary_label"].astype(str)
+    prepared["audio_filepath"] = prepared["filename"].map(lambda name: str(soundscape_dir / name))
+    prepared["source"] = "train_soundscapes"
+    return prepared
+
+
 class BirdCLEFDataset(Dataset):
     def __init__(
         self,
-        audio_dir: Path,
         metadata: pd.DataFrame,
         label_map: Dict[str, int],
         sample_rate: int = 32000,
         duration: float = 5.0,
-        transform: Optional[SpectrogramTransform] = None,
         training: bool = True,
+        preload_audio: bool = True,
     ):
-        self.audio_dir = Path(audio_dir)
         self.metadata = metadata.reset_index(drop=True)
         self.label_map = label_map
         self.sample_rate = sample_rate
         self.segment_samples = int(duration * sample_rate)
         self.training = training
-        self.transform = transform or SpectrogramTransform(sample_rate=sample_rate)
-        self._cache_path: Optional[Path] = None
-        self._cache_waveform: Optional[Tensor] = None
-        self._cache_sr: Optional[int] = None
+        self.preload_audio = preload_audio
+        self._audio_cache: Dict[Path, Tensor] = {}
+
+        if self.preload_audio:
+            self._preload_all_audio()
 
     def __len__(self) -> int:
         return len(self.metadata)
@@ -133,50 +168,61 @@ class BirdCLEFDataset(Dataset):
     def __getitem__(self, idx: int) -> Tuple[Tensor, Tensor]:
         row = self.metadata.iloc[idx]
         waveform = self._load_waveform(row)
-        spec = self.transform(waveform)
         target = self._encode_target(row)
-        return spec, target
+        return waveform, target
+
+    def _preload_all_audio(self) -> None:
+        unique_paths = [
+            Path(path_str)
+            for path_str in self.metadata["audio_filepath"].dropna().astype(str).drop_duplicates().tolist()
+        ]
+        if not unique_paths:
+            return
+
+        desc = "Preloading train audio" if self.training else "Preloading val audio"
+        for filepath in tqdm(unique_paths, desc=desc, leave=False):
+            self._audio_cache[filepath] = self._load_audio_file(filepath)
 
     def _load_waveform(self, row: pd.Series) -> Tensor:
-        filename = str(row.get("filename") or row.get("recording_id"))
-        filepath = self.audio_dir / filename
+        filepath = Path(str(row["audio_filepath"]))
         if not filepath.exists():
-            species_folder = row.get("primary_label") or row.get("common_name")
-            filepath = self.audio_dir / species_folder / filename
-        if not filepath.exists():
-            raise FileNotFoundError(f"Missing audio file {filename} in {self.audio_dir}")
+            raise FileNotFoundError(f"Missing audio file {filepath}")
 
-        waveform, sr = self._load_cached_audio(filepath)
-        if waveform.size(0) > 1:
-            waveform = waveform.mean(dim=0, keepdim=True)
-        if sr != self.sample_rate:
-            waveform = AF.resample(waveform, orig_freq=sr, new_freq=self.sample_rate)
+        waveform = self._load_cached_audio(filepath)
+
         start_time = row.get("start")
         end_time = row.get("end")
         if isinstance(start_time, str) and isinstance(end_time, str):
             return self._slice_by_times(waveform, start_time, end_time)
+
+        return self._sample_fixed_length_chunk(waveform)
+
+    def _load_audio_file(self, filepath: Path) -> Tensor:
+        waveform, sr = _read_audio(filepath)
+        if waveform.size(0) > 1:
+            waveform = waveform.mean(dim=0, keepdim=True)
+        if sr != self.sample_rate:
+            waveform = AF.resample(waveform, orig_freq=sr, new_freq=self.sample_rate)
+        return waveform.contiguous()
+
+    def _load_cached_audio(self, filepath: Path) -> Tensor:
+        cached = self._audio_cache.get(filepath)
+        if cached is not None:
+            return cached
+
+        waveform = self._load_audio_file(filepath)
+        self._audio_cache[filepath] = waveform
+        return waveform
+
+    def _sample_fixed_length_chunk(self, waveform: Tensor) -> Tensor:
         num_samples = waveform.size(1)
         if num_samples < self.segment_samples:
-            pad_len = self.segment_samples - num_samples
-            waveform = F.pad(waveform, (0, pad_len))
-            return waveform
+            return F.pad(waveform, (0, self.segment_samples - num_samples))
 
         max_start = num_samples - self.segment_samples
-        if self.training:
-            start = random.randint(0, max_start)
-        else:
-            start = max_start // 2
+        start = random.randint(0, max_start) if self.training else max_start // 2
         end = start + self.segment_samples
         return waveform[:, start:end]
-
-    def _load_cached_audio(self, filepath: Path) -> Tuple[Tensor, int]:
-        if self._cache_path == filepath and self._cache_waveform is not None and self._cache_sr is not None:
-            return self._cache_waveform, self._cache_sr
-        waveform, sr = _read_audio(filepath)
-        self._cache_path = filepath
-        self._cache_waveform = waveform
-        self._cache_sr = sr
-        return waveform, sr
 
     def _slice_by_times(self, waveform: Tensor, start_time: str, end_time: str) -> Tensor:
         total = waveform.size(1)
@@ -187,21 +233,14 @@ class BirdCLEFDataset(Dataset):
         chunk = waveform[:, start_sample:end_sample]
         length = chunk.size(1)
         if length < self.segment_samples:
-            pad_len = self.segment_samples - length
-            chunk = F.pad(chunk, (0, pad_len))
+            chunk = F.pad(chunk, (0, self.segment_samples - length))
         elif length > self.segment_samples:
             chunk = chunk[:, : self.segment_samples]
         return chunk
 
     def _encode_target(self, row: pd.Series) -> Tensor:
         target = torch.zeros(len(self.label_map), dtype=torch.float32)
-        primary = str(row.get("primary_label", ""))
-        primary_idx = self.label_map.get(primary)
-        if primary_idx is not None:
-            target[primary_idx] = 1.0
-
-        secondary = _split_secondary_labels(row.get("secondary_labels"))
-        for label in secondary:
+        for label in parse_primary_labels(row.get("primary_label")):
             idx = self.label_map.get(label)
             if idx is not None:
                 target[idx] = 1.0
@@ -209,37 +248,57 @@ class BirdCLEFDataset(Dataset):
 
 
 class SoundscapeSampler:
-    """Yield fixed-length segments for each soundscape for inference."""
+    """Yield fixed-length raw waveform segments for inference."""
 
     def __init__(
         self,
         sample_rate: int = 32000,
         duration: float = 5.0,
-        hop: float = 2.5,
-        transform: Optional[SpectrogramTransform] = None,
+        hop: float = 5.0,
+        preload_audio: bool = True,
     ):
+        if hop <= 0:
+            raise ValueError(f"hop must be positive, got {hop}")
         self.sample_rate = sample_rate
+        self.duration = duration
         self.segment_samples = int(duration * sample_rate)
         self.hop_samples = int(hop * sample_rate)
-        self.transform = transform or SpectrogramTransform(sample_rate=sample_rate)
+        self.preload_audio = preload_audio
+        self._audio_cache: Dict[Path, Tensor] = {}
 
-    def iterate_segments(self, soundscape_path: Path) -> Iterable[Tensor]:
+    def _load_audio_file(self, soundscape_path: Path) -> Tensor:
         waveform, sr = _read_audio(soundscape_path)
         if waveform.size(0) > 1:
             waveform = waveform.mean(dim=0, keepdim=True)
         if sr != self.sample_rate:
             waveform = AF.resample(waveform, orig_freq=sr, new_freq=self.sample_rate)
+        return waveform.contiguous()
+
+    def _load_cached_audio(self, soundscape_path: Path) -> Tensor:
+        cached = self._audio_cache.get(soundscape_path)
+        if cached is not None:
+            return cached
+
+        waveform = self._load_audio_file(soundscape_path)
+        if self.preload_audio:
+            self._audio_cache[soundscape_path] = waveform
+        return waveform
+
+    def iterate_segment_items(self, soundscape_path: Path) -> Iterator[Tuple[int, Tensor]]:
+        waveform = self._load_cached_audio(soundscape_path)
+
         total = waveform.size(1)
+        if total == 0:
+            return
+
         start = 0
-        while start + self.segment_samples <= total:
-            chunk = waveform[:, start : start + self.segment_samples]
-            yield self.transform(chunk)
+        while start < total:
+            end = min(total, start + self.segment_samples)
+            chunk = waveform[:, start:end]
+            if chunk.size(1) < self.segment_samples:
+                chunk = F.pad(chunk, (0, self.segment_samples - chunk.size(1)))
+            segment_end_seconds = int(
+                round((start + self.segment_samples) / self.sample_rate)
+            )
+            yield segment_end_seconds, chunk
             start += self.hop_samples
-        if start < total:
-            remainder = waveform[:, start:]
-            pad = self.segment_samples - remainder.size(1)
-            remainder = F.pad(remainder, (0, pad))
-            yield self.transform(remainder)
-
-
-import re
