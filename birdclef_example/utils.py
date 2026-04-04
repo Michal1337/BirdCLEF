@@ -18,7 +18,7 @@ def set_seed(seed: int = 42) -> None:
 
 
 def birdclef_roc_auc(targets: np.ndarray, preds: np.ndarray) -> float:
-    """Competition-style macro ROC AUC that skips degenerate classes."""
+    """Exact equivalent of Kaggle macro ROC-AUC (skip classes with no positives)."""
 
     if targets.shape != preds.shape:
         raise ValueError(
@@ -27,16 +27,19 @@ def birdclef_roc_auc(targets: np.ndarray, preds: np.ndarray) -> float:
     if targets.ndim != 2:
         raise ValueError(f"Expected 2D arrays, got targets.ndim={targets.ndim}.")
 
-    class_scores = []
-    for class_idx in range(targets.shape[1]):
-        class_targets = targets[:, class_idx]
-        if np.unique(class_targets).size < 2:
-            continue
-        class_scores.append(roc_auc_score(class_targets, preds[:, class_idx]))
+    # Select classes with at least one positive
+    class_sums = targets.sum(axis=0)
+    valid_classes = np.where(class_sums > 0)[0]
 
-    if not class_scores:
-        return float("nan")
-    return float(np.mean(class_scores))
+    if len(valid_classes) == 0:
+        raise ValueError("No valid classes with positive samples.")
+
+    # Slice only valid classes
+    targets_filtered = targets[:, valid_classes]
+    preds_filtered = preds[:, valid_classes]
+
+    # Compute macro ROC-AUC (same as Kaggle)
+    return roc_auc_score(targets_filtered, preds_filtered, average="macro")
 
 
 def evaluate_model(
@@ -44,21 +47,28 @@ def evaluate_model(
     dataloader: torch.utils.data.DataLoader,
     criterion,
     device: torch.device,
+    use_bf16: bool = False,
 ) -> Tuple[float, float]:
     model.eval()
     losses = []
     all_targets = []
     all_preds = []
+    amp_enabled = use_bf16 and device.type == "cuda"
 
     with torch.no_grad():
         for inputs, targets in dataloader:
             inputs = inputs.to(device, non_blocking=True)
             targets = targets.to(device, non_blocking=True)
-            logits = model(inputs)
-            loss = criterion(logits, targets)
+            with torch.autocast(
+                device_type=device.type,
+                dtype=torch.bfloat16,
+                enabled=amp_enabled,
+            ):
+                logits = model(inputs)
+                loss = criterion(logits, targets)
             losses.append(loss.item())
-            all_targets.append(targets.cpu())
-            all_preds.append(torch.sigmoid(logits).cpu())
+            all_targets.append(targets.float().cpu())
+            all_preds.append(torch.sigmoid(logits).float().cpu())
 
     avg_loss = float(np.mean(losses)) if losses else float("nan")
     if not all_targets:

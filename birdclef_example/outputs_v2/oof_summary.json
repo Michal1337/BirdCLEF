@@ -1,0 +1,15 @@
+{
+  "num_folds": 5,
+  "fold_auc_scores": [
+    0.8672701359222106,
+    0.8910006237551925,
+    0.881225045271245,
+    0.8356817312830678,
+    0.8765619306985305
+  ],
+  "oof_auc": 0.7206689151901772,
+  "oof_rows": 1478,
+  "num_labels": 234,
+  "oof_predictions_csv": "/mnt/evafs/faculty/home/mgromadzki/src/BirdCLEF/birdclef_example/outputs_v2/oof_predictions.csv",
+  "oof_predictions_npz": "/mnt/evafs/faculty/home/mgromadzki/src/BirdCLEF/birdclef_example/outputs_v2/oof_predictions.npz"
+}

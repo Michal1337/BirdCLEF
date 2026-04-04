@@ -1,7 +1,10 @@
+import ast
+from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import random
 import re
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional, Tuple
+from typing import Iterator, List, Optional, Tuple, Dict
 
 import pandas as pd
 import soundfile as sf
@@ -13,9 +16,20 @@ from tqdm import tqdm
 from torch import Tensor, nn
 from torch.nn import functional as F
 from torch.utils.data import Dataset
+import warnings
+warnings.filterwarnings("ignore")
 
 
 PRIMARY_LABEL_SPLIT_RE = re.compile(r"[;,\s]+")
+
+
+def _is_missing(raw_value: object) -> bool:
+    if raw_value is None:
+        return True
+    try:
+        return bool(pd.isna(raw_value))
+    except TypeError:
+        return False
 
 
 class SpectrogramTransform(nn.Module):
@@ -55,17 +69,44 @@ class SpectrogramTransform(nn.Module):
 
 
 def parse_primary_labels(raw_value: object) -> List[str]:
-    if raw_value is None:
+    if _is_missing(raw_value):
         return []
-    try:
-        if pd.isna(raw_value):
-            return []
-    except TypeError:
-        pass
     raw_text = str(raw_value).strip()
     if not raw_text or raw_text == "[]":
         return []
     return [label for label in PRIMARY_LABEL_SPLIT_RE.split(raw_text) if label]
+
+
+def parse_secondary_labels(raw_value: object) -> List[str]:
+    if _is_missing(raw_value):
+        return []
+    if isinstance(raw_value, (list, tuple, set)):
+        return [str(label).strip() for label in raw_value if str(label).strip()]
+
+    raw_text = str(raw_value).strip()
+    if not raw_text or raw_text == "[]":
+        return []
+
+    try:
+        parsed = ast.literal_eval(raw_text)
+    except (ValueError, SyntaxError):
+        parsed = None
+
+    if isinstance(parsed, (list, tuple, set)):
+        labels = []
+        for value in parsed:
+            label = str(value).strip()
+            if label:
+                labels.append(label)
+        return labels
+
+    cleaned = raw_text.strip("[]")
+    labels = []
+    for value in cleaned.split(","):
+        label = value.strip().strip("'").strip('"')
+        if label:
+            labels.append(label)
+    return labels
 
 
 def _read_audio(filepath: Path) -> Tuple[Tensor, int]:
@@ -120,6 +161,9 @@ def prepare_train_audio_metadata(metadata: pd.DataFrame, audio_dir: Path) -> pd.
     prepared = prepared.dropna(subset=["filename", "primary_label"]).reset_index(drop=True)
     prepared["filename"] = prepared["filename"].astype(str)
     prepared["primary_label"] = prepared["primary_label"].astype(str)
+    if "secondary_labels" not in prepared.columns:
+        prepared["secondary_labels"] = "[]"
+    prepared["secondary_labels"] = prepared["secondary_labels"].fillna("[]").astype(str)
     prepared["audio_filepath"] = prepared["filename"].map(lambda name: str(audio_dir / name))
     prepared["source"] = "train_audio"
     return prepared
@@ -150,6 +194,18 @@ class BirdCLEFDataset(Dataset):
         duration: float = 5.0,
         training: bool = True,
         preload_audio: bool = True,
+        max_cached_files: int = 100,
+        preload_workers: int = 1,
+        waveform_aug_prob: float = 0.0,
+        gain_prob: float = 0.0,
+        gain_db_limit: float = 0.0,
+        noise_prob: float = 0.0,
+        noise_snr_db_min: float = 20.0,
+        noise_snr_db_max: float = 35.0,
+        time_shift_prob: float = 0.0,
+        time_shift_max_frac: float = 0.0,
+        drop_segment_prob: float = 0.0,
+        drop_segment_max_frac: float = 0.0,
     ):
         self.metadata = metadata.reset_index(drop=True)
         self.label_map = label_map
@@ -157,7 +213,19 @@ class BirdCLEFDataset(Dataset):
         self.segment_samples = int(duration * sample_rate)
         self.training = training
         self.preload_audio = preload_audio
-        self._audio_cache: Dict[Path, Tensor] = {}
+        self.max_cached_files = max_cached_files
+        self.preload_workers = max(1, preload_workers)
+        self.waveform_aug_prob = max(0.0, min(1.0, waveform_aug_prob))
+        self.gain_prob = max(0.0, min(1.0, gain_prob))
+        self.gain_db_limit = max(0.0, gain_db_limit)
+        self.noise_prob = max(0.0, min(1.0, noise_prob))
+        self.noise_snr_db_min = min(noise_snr_db_min, noise_snr_db_max)
+        self.noise_snr_db_max = max(noise_snr_db_min, noise_snr_db_max)
+        self.time_shift_prob = max(0.0, min(1.0, time_shift_prob))
+        self.time_shift_max_frac = max(0.0, time_shift_max_frac)
+        self.drop_segment_prob = max(0.0, min(1.0, drop_segment_prob))
+        self.drop_segment_max_frac = max(0.0, drop_segment_max_frac)
+        self._audio_cache: OrderedDict[Path, Tensor] = OrderedDict()
 
         if self.preload_audio:
             self._preload_all_audio()
@@ -168,8 +236,49 @@ class BirdCLEFDataset(Dataset):
     def __getitem__(self, idx: int) -> Tuple[Tensor, Tensor]:
         row = self.metadata.iloc[idx]
         waveform = self._load_waveform(row)
+        if self.training:
+            waveform = self._apply_waveform_augmentations(waveform)
         target = self._encode_target(row)
         return waveform, target
+
+    def _apply_waveform_augmentations(self, waveform: Tensor) -> Tensor:
+        if self.waveform_aug_prob <= 0.0 or random.random() >= self.waveform_aug_prob:
+            return waveform
+
+        augmented = waveform.clone()
+
+        if self.gain_db_limit > 0.0 and random.random() < self.gain_prob:
+            gain_db = random.uniform(-self.gain_db_limit, self.gain_db_limit)
+            augmented = augmented * float(10 ** (gain_db / 20.0))
+
+        if self.time_shift_max_frac > 0.0 and random.random() < self.time_shift_prob:
+            max_shift = int(self.segment_samples * self.time_shift_max_frac)
+            if max_shift > 0:
+                shift = random.randint(-max_shift, max_shift)
+                if shift != 0:
+                    shifted = torch.zeros_like(augmented)
+                    if shift > 0:
+                        shifted[:, shift:] = augmented[:, :-shift]
+                    else:
+                        abs_shift = -shift
+                        shifted[:, :-abs_shift] = augmented[:, abs_shift:]
+                    augmented = shifted
+
+        if self.noise_prob > 0.0 and random.random() < self.noise_prob:
+            signal_rms = augmented.pow(2).mean().sqrt()
+            if signal_rms > 0:
+                snr_db = random.uniform(self.noise_snr_db_min, self.noise_snr_db_max)
+                noise_rms = signal_rms / float(10 ** (snr_db / 20.0))
+                augmented = augmented + torch.randn_like(augmented) * noise_rms
+
+        if self.drop_segment_max_frac > 0.0 and random.random() < self.drop_segment_prob:
+            max_width = int(self.segment_samples * self.drop_segment_max_frac)
+            max_width = max(1, min(max_width, self.segment_samples))
+            width = random.randint(1, max_width)
+            start = random.randint(0, self.segment_samples - width)
+            augmented[:, start : start + width] = 0
+
+        return augmented.clamp(min=-1.0, max=1.0)
 
     def _preload_all_audio(self) -> None:
         unique_paths = [
@@ -180,8 +289,18 @@ class BirdCLEFDataset(Dataset):
             return
 
         desc = "Preloading train audio" if self.training else "Preloading val audio"
-        for filepath in tqdm(unique_paths, desc=desc, leave=False):
-            self._audio_cache[filepath] = self._load_audio_file(filepath)
+        if self.preload_workers == 1:
+            for filepath in tqdm(unique_paths, desc=desc, leave=False):
+                self._audio_cache[filepath] = self._load_audio_file(filepath)
+            return
+
+        with ThreadPoolExecutor(max_workers=self.preload_workers) as executor:
+            futures = {
+                executor.submit(self._load_audio_file, filepath): filepath for filepath in unique_paths
+            }
+            for future in tqdm(as_completed(futures), total=len(futures), desc=desc, leave=False):
+                filepath = futures[future]
+                self._audio_cache[filepath] = future.result()
 
     def _load_waveform(self, row: pd.Series) -> Tensor:
         filepath = Path(str(row["audio_filepath"]))
@@ -208,10 +327,13 @@ class BirdCLEFDataset(Dataset):
     def _load_cached_audio(self, filepath: Path) -> Tensor:
         cached = self._audio_cache.get(filepath)
         if cached is not None:
+            self._audio_cache.move_to_end(filepath)
             return cached
 
         waveform = self._load_audio_file(filepath)
         self._audio_cache[filepath] = waveform
+        if not self.preload_audio and len(self._audio_cache) > self.max_cached_files:
+            self._audio_cache.popitem(last=False)
         return waveform
 
     def _sample_fixed_length_chunk(self, waveform: Tensor) -> Tensor:
@@ -240,7 +362,10 @@ class BirdCLEFDataset(Dataset):
 
     def _encode_target(self, row: pd.Series) -> Tensor:
         target = torch.zeros(len(self.label_map), dtype=torch.float32)
-        for label in parse_primary_labels(row.get("primary_label")):
+        labels = parse_primary_labels(row.get("primary_label"))
+        if str(row.get("source", "")) == "train_audio":
+            labels.extend(parse_secondary_labels(row.get("secondary_labels")))
+        for label in labels:
             idx = self.label_map.get(label)
             if idx is not None:
                 target[idx] = 1.0
@@ -256,6 +381,8 @@ class SoundscapeSampler:
         duration: float = 5.0,
         hop: float = 5.0,
         preload_audio: bool = True,
+        max_cached_files: int = 100,
+        preload_workers: int = 1,
     ):
         if hop <= 0:
             raise ValueError(f"hop must be positive, got {hop}")
@@ -264,7 +391,9 @@ class SoundscapeSampler:
         self.segment_samples = int(duration * sample_rate)
         self.hop_samples = int(hop * sample_rate)
         self.preload_audio = preload_audio
-        self._audio_cache: Dict[Path, Tensor] = {}
+        self.max_cached_files = max_cached_files
+        self.preload_workers = max(1, preload_workers)
+        self._audio_cache: OrderedDict[Path, Tensor] = OrderedDict()
 
     def _load_audio_file(self, soundscape_path: Path) -> Tensor:
         waveform, sr = _read_audio(soundscape_path)
@@ -277,11 +406,13 @@ class SoundscapeSampler:
     def _load_cached_audio(self, soundscape_path: Path) -> Tensor:
         cached = self._audio_cache.get(soundscape_path)
         if cached is not None:
+            self._audio_cache.move_to_end(soundscape_path)
             return cached
 
         waveform = self._load_audio_file(soundscape_path)
-        if self.preload_audio:
-            self._audio_cache[soundscape_path] = waveform
+        self._audio_cache[soundscape_path] = waveform
+        if not self.preload_audio and len(self._audio_cache) > self.max_cached_files:
+            self._audio_cache.popitem(last=False)
         return waveform
 
     def iterate_segment_items(self, soundscape_path: Path) -> Iterator[Tuple[int, Tensor]]:

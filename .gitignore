@@ -3,3 +3,7 @@ data/
 .ipynb_checkpoints
 outputs
 __pycache__
+.venv
+*.pt
+*.npz
+*.csv
