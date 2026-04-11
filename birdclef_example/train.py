@@ -14,7 +14,7 @@ from birdclef_example.data import (
     prepare_soundscape_metadata,
     prepare_train_audio_metadata,
 )
-from birdclef_example.model import SimpleCNN
+from birdclef_example.model import build_model
 from birdclef_example.utils import evaluate_model, is_better_score, save_model, set_seed
 
 
@@ -221,7 +221,8 @@ def main() -> None:
         "time_mask_param": 32,
         "specaugment_masks": 3,
     }
-    model = SimpleCNN(**model_config).to(device)
+    model_config["architecture"] = "spec_transformer"
+    model = build_model(architecture=model_config["architecture"], model_config=model_config).to(device)
 
     if resume is not None and resume.exists():
         checkpoint = torch.load(resume, map_location=device)

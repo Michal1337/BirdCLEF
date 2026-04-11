@@ -1,4 +1,6 @@
 import math
+import inspect
+from typing import Any, Dict
 
 import torch
 from torch import Tensor, nn
@@ -52,47 +54,60 @@ class HybridPool(nn.Module):
 
 
 class SpecAugment(nn.Module):
+    """Apply time/frequency masking on log-mel spectrograms."""
+
     def __init__(
         self,
-        freq_mask_param: int = 12,
-        time_mask_param: int = 24,
-        num_masks: int = 2,
+        freq_mask_param: int = 0,
+        time_mask_param: int = 0,
+        num_masks: int = 0,
+        spec_noise_std: float = 0.0,
     ):
         super().__init__()
-        self.freq_mask_param = max(0, freq_mask_param)
-        self.time_mask_param = max(0, time_mask_param)
-        self.num_masks = max(0, num_masks)
+        self.freq_mask_param = max(0, int(freq_mask_param))
+        self.time_mask_param = max(0, int(time_mask_param))
+        self.num_masks = max(0, int(num_masks))
+        self.spec_noise_std = max(0.0, float(spec_noise_std))
 
-    def _sample_width(self, max_width: int, limit: int, device: torch.device) -> int:
-        width_limit = min(max_width, limit)
-        if width_limit <= 0:
-            return 0
-        return int(torch.randint(0, width_limit + 1, (1,), device=device).item())
+    def _mask_axis(self, spec: Tensor, axis: int, mask_param: int) -> Tensor:
+        if mask_param <= 0:
+            return spec
+        dim_size = spec.size(axis)
+        if dim_size <= 1:
+            return spec
 
-    def _apply_mask(self, x: Tensor, dim: int, max_width: int) -> Tensor:
-        size = x.size(dim)
-        width = self._sample_width(max_width=max_width, limit=size, device=x.device)
-        if width <= 0 or width >= size:
-            return x
-        start = int(torch.randint(0, size - width + 1, (1,), device=x.device).item())
-        masked = x.clone()
-        if dim == -2:
-            masked[:, :, start : start + width, :] = 0
-        else:
-            masked[:, :, :, start : start + width] = 0
-        return masked
+        max_width = min(mask_param, dim_size - 1)
+        if max_width < 1:
+            return spec
 
-    def forward(self, x: Tensor) -> Tensor:
-        if not self.training or self.num_masks == 0:
-            return x
         for _ in range(self.num_masks):
-            x = self._apply_mask(x, dim=-2, max_width=self.freq_mask_param)
-            x = self._apply_mask(x, dim=-1, max_width=self.time_mask_param)
-        return x
+            width = int(torch.randint(0, max_width + 1, (1,), device=spec.device).item())
+            if width == 0:
+                continue
+            start_max = dim_size - width
+            start = int(torch.randint(0, start_max + 1, (1,), device=spec.device).item())
+            if axis == 2:
+                spec[:, :, start : start + width, :] = 0.0
+            elif axis == 3:
+                spec[:, :, :, start : start + width] = 0.0
+        return spec
+
+    def forward(self, spec: Tensor) -> Tensor:
+        if self.num_masks <= 0:
+            if self.spec_noise_std > 0:
+                return spec + torch.randn_like(spec) * self.spec_noise_std
+            return spec
+
+        spec = spec.clone()
+        spec = self._mask_axis(spec, axis=2, mask_param=self.freq_mask_param)
+        spec = self._mask_axis(spec, axis=3, mask_param=self.time_mask_param)
+        if self.spec_noise_std > 0:
+            spec = spec + torch.randn_like(spec) * self.spec_noise_std
+        return spec
 
 
 class SimpleCNN(nn.Module):
-    """Compact spectrogram transformer for BirdCLEF."""
+    """Compact spectrogram transformer baseline for BirdCLEF."""
 
     def __init__(
         self,
@@ -109,13 +124,15 @@ class SimpleCNN(nn.Module):
         num_layers: int = 4,
         token_grid_size: int = 22,
         pooling: str = "hybrid",
-        freq_mask_param: int = 12,
-        time_mask_param: int = 24,
-        specaugment_masks: int = 2,
+        freq_mask_param: int = 0,
+        time_mask_param: int = 0,
+        specaugment_masks: int = 0,
+        spec_noise_std: float = 0.0,
     ):
         super().__init__()
         if pooling not in {"attention", "hybrid"}:
             raise ValueError(f"Unsupported pooling mode: {pooling}")
+
         self.spectrogram = SpectrogramTransform(
             sample_rate=sample_rate,
             n_mels=n_mels,
@@ -124,10 +141,11 @@ class SimpleCNN(nn.Module):
             f_min=f_min,
             f_max=f_max,
         )
-        self.specaugment = SpecAugment(
+        self.spec_augment = SpecAugment(
             freq_mask_param=freq_mask_param,
             time_mask_param=time_mask_param,
             num_masks=specaugment_masks,
+            spec_noise_std=spec_noise_std,
         )
         self.stem = nn.Sequential(
             nn.Conv2d(1, embed_dim // 2, kernel_size=5, stride=2, padding=2, bias=False),
@@ -160,7 +178,8 @@ class SimpleCNN(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         x = self.spectrogram(x)
-        x = self.specaugment(x)
+        if self.training:
+            x = self.spec_augment(x)
         x = self.stem(x)
         x = self.token_pool(x)
         x = x.flatten(2).transpose(1, 2)
@@ -173,3 +192,90 @@ class SimpleCNN(nn.Module):
         x = self.encoder(x)
         x = self.pool(x)
         return self.head(x)
+
+
+class ConvNetClassifier(nn.Module):
+    """Pure convolutional spectrogram encoder baseline."""
+
+    def __init__(
+        self,
+        n_classes: int,
+        dropout: float = 0.3,
+        sample_rate: int = 32000,
+        n_mels: int = 160,
+        n_fft: int = 2048,
+        hop_length: int = 512,
+        f_min: int = 20,
+        f_max: int | None = None,
+        channels: int = 48,
+        freq_mask_param: int = 0,
+        time_mask_param: int = 0,
+        specaugment_masks: int = 0,
+        spec_noise_std: float = 0.0,
+    ):
+        super().__init__()
+        self.spectrogram = SpectrogramTransform(
+            sample_rate=sample_rate,
+            n_mels=n_mels,
+            n_fft=n_fft,
+            hop_length=hop_length,
+            f_min=f_min,
+            f_max=f_max,
+        )
+        self.spec_augment = SpecAugment(
+            freq_mask_param=freq_mask_param,
+            time_mask_param=time_mask_param,
+            num_masks=specaugment_masks,
+            spec_noise_std=spec_noise_std,
+        )
+        self.features = nn.Sequential(
+            nn.Conv2d(1, channels, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(channels, channels * 2, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(channels * 2),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(channels * 2, channels * 4, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(channels * 4),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(channels * 4, channels * 6, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(channels * 6),
+            nn.SiLU(inplace=True),
+        )
+        hidden = channels * 6
+        self.pool = nn.AdaptiveAvgPool2d((1, 1))
+        self.head = nn.Sequential(
+            nn.Flatten(),
+            nn.LayerNorm(hidden),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, n_classes),
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        x = self.spectrogram(x)
+        if self.training:
+            x = self.spec_augment(x)
+        x = self.features(x)
+        x = self.pool(x)
+        return self.head(x)
+
+
+def _filter_model_kwargs(model_cls: type[nn.Module], model_config: Dict[str, Any]) -> Dict[str, Any]:
+    valid = set(inspect.signature(model_cls.__init__).parameters.keys())
+    valid.discard("self")
+    return {key: value for key, value in model_config.items() if key in valid}
+
+
+def build_model(architecture: str, model_config: Dict[str, Any]) -> nn.Module:
+    architecture = architecture.lower()
+    model_registry: Dict[str, type[nn.Module]] = {
+        "spec_transformer": SimpleCNN,
+        "simple_transformer": SimpleCNN,
+        "simplecnn": SimpleCNN,
+        "convnet": ConvNetClassifier,
+    }
+    model_cls = model_registry.get(architecture)
+    if model_cls is None:
+        supported = ", ".join(sorted(model_registry.keys()))
+        raise ValueError(f"Unknown architecture '{architecture}'. Supported: {supported}")
+    return model_cls(**_filter_model_kwargs(model_cls, model_config))

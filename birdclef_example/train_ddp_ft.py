@@ -6,9 +6,12 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
+import timm
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 from sklearn.model_selection import train_test_split
+from torch import nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -17,14 +20,15 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from birdclef_example.data import (
+from birdclef_example.data import (  # noqa: E402
     BirdCLEFDataset,
+    SpectrogramTransform,
     build_label_map,
     prepare_soundscape_metadata,
     prepare_train_audio_metadata,
 )
-from birdclef_example.model import build_model
-from birdclef_example.utils import evaluate_model, is_better_score, save_model, set_seed
+from birdclef_example.model import SpecAugment  # noqa: E402
+from birdclef_example.utils import evaluate_model, is_better_score, save_model, set_seed  # noqa: E402
 
 
 def _get_distributed_context() -> tuple[bool, int, int, int]:
@@ -58,11 +62,7 @@ def _print_main(rank: int, message: str) -> None:
         print(message)
 
 
-def build_rank_metadata_shard(
-    metadata: pd.DataFrame,
-    world_size: int,
-    rank: int,
-) -> pd.DataFrame:
+def build_rank_metadata_shard(metadata: pd.DataFrame, world_size: int, rank: int) -> pd.DataFrame:
     if world_size <= 1:
         return metadata.reset_index(drop=True)
     if metadata.empty:
@@ -76,53 +76,6 @@ def build_rank_metadata_shard(
     if missing > 0:
         shard = pd.concat([shard, metadata.iloc[:missing].copy()], ignore_index=True)
     return shard.reset_index(drop=True)
-
-
-def build_optimizer(
-    model: torch.nn.Module,
-    lr: float,
-    weight_decay: float,
-    device: torch.device,
-) -> tuple[torch.optim.Optimizer, bool]:
-    optimizer_kwargs = {"lr": lr, "weight_decay": weight_decay}
-    fused_enabled = False
-    if device.type == "cuda" and "fused" in inspect.signature(torch.optim.AdamW).parameters:
-        optimizer_kwargs["fused"] = True
-        fused_enabled = True
-    optimizer = torch.optim.AdamW(model.parameters(), **optimizer_kwargs)
-    return optimizer, fused_enabled
-
-
-def build_scheduler(
-    optimizer: torch.optim.Optimizer,
-    epochs: int,
-    warmup_epochs: int,
-    min_lr_ratio: float,
-) -> torch.optim.lr_scheduler._LRScheduler:
-    warmup_epochs = max(0, min(warmup_epochs, epochs))
-    if warmup_epochs == 0:
-        return torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer,
-            T_max=max(epochs, 1),
-            eta_min=optimizer.param_groups[0]["lr"] * min_lr_ratio,
-        )
-
-    warmup = torch.optim.lr_scheduler.LinearLR(
-        optimizer,
-        start_factor=0.1,
-        end_factor=1.0,
-        total_iters=warmup_epochs,
-    )
-    cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=max(epochs - warmup_epochs, 1),
-        eta_min=optimizer.param_groups[0]["lr"] * min_lr_ratio,
-    )
-    return torch.optim.lr_scheduler.SequentialLR(
-        optimizer,
-        schedulers=[warmup, cosine],
-        milestones=[warmup_epochs],
-    )
 
 
 def apply_mixup(
@@ -143,10 +96,153 @@ def apply_mixup(
     return mixed_inputs, mixed_targets
 
 
+class TimmSpectrogramClassifier(nn.Module):
+    def __init__(
+        self,
+        n_classes: int,
+        backbone_name: str,
+        pretrained: bool = True,
+        image_size: int = 224,
+        dropout: float = 0.3,
+        sample_rate: int = 32000,
+        n_mels: int = 160,
+        n_fft: int = 2048,
+        hop_length: int = 512,
+        f_min: int = 20,
+        f_max: int | None = None,
+        freq_mask_param: int = 0,
+        time_mask_param: int = 0,
+        specaugment_masks: int = 0,
+        spec_noise_std: float = 0.0,
+    ):
+        super().__init__()
+        self.image_size = int(image_size)
+        self.spectrogram = SpectrogramTransform(
+            sample_rate=sample_rate,
+            n_mels=n_mels,
+            n_fft=n_fft,
+            hop_length=hop_length,
+            f_min=f_min,
+            f_max=f_max,
+        )
+        self.spec_augment = SpecAugment(
+            freq_mask_param=freq_mask_param,
+            time_mask_param=time_mask_param,
+            num_masks=specaugment_masks,
+            spec_noise_std=spec_noise_std,
+        )
+
+        self.backbone = timm.create_model(
+            backbone_name,
+            pretrained=False,
+            in_chans=3,
+            num_classes=n_classes,
+            drop_rate=dropout,
+        )
+
+    def freeze_backbone(self) -> None:
+        for param in self.backbone.parameters():
+            param.requires_grad = False
+        classifier = self.backbone.get_classifier()
+        if isinstance(classifier, nn.Module):
+            for param in classifier.parameters():
+                param.requires_grad = True
+
+    def unfreeze_backbone(self) -> None:
+        for param in self.backbone.parameters():
+            param.requires_grad = True
+
+    def _wave_to_image(self, waveform: torch.Tensor) -> torch.Tensor:
+        x = self.spectrogram(waveform)
+        if self.training:
+            x = self.spec_augment(x)
+
+        # Robust normalization for image backbones pretrained on RGB inputs.
+        x = x.clamp(min=-4.0, max=4.0)
+        x = (x + 4.0) / 8.0
+        x = F.interpolate(
+            x,
+            size=(self.image_size, self.image_size),
+            mode="bilinear",
+            align_corners=False,
+        )
+        x = x.repeat(1, 3, 1, 1)
+        return x
+
+    def forward(self, waveform: torch.Tensor) -> torch.Tensor:
+        x = self._wave_to_image(waveform)
+        return self.backbone(x)
+
+
+def build_optimizer(
+    model: nn.Module,
+    lr_backbone: float,
+    lr_head: float,
+    weight_decay: float,
+    device: torch.device,
+) -> tuple[torch.optim.Optimizer, bool]:
+    head_params: List[nn.Parameter] = []
+    backbone_params: List[nn.Parameter] = []
+
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if "backbone" in name and "classifier" not in name and "head" not in name and "fc" not in name:
+            backbone_params.append(param)
+        else:
+            head_params.append(param)
+
+    param_groups = [
+        {"params": head_params, "lr": lr_head, "weight_decay": weight_decay},
+        {"params": backbone_params, "lr": lr_backbone, "weight_decay": weight_decay},
+    ]
+
+    fused_enabled = False
+    optimizer_kwargs = {}
+    if device.type == "cuda" and "fused" in inspect.signature(torch.optim.AdamW).parameters:
+        optimizer_kwargs["fused"] = True
+        fused_enabled = True
+
+    optimizer = torch.optim.AdamW(param_groups, **optimizer_kwargs)
+    return optimizer, fused_enabled
+
+
+def build_scheduler(
+    optimizer: torch.optim.Optimizer,
+    epochs: int,
+    warmup_epochs: int,
+    min_lr_ratio: float,
+) -> torch.optim.lr_scheduler._LRScheduler:
+    warmup_epochs = max(0, min(warmup_epochs, epochs))
+    if warmup_epochs == 0:
+        return torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=max(epochs, 1),
+            eta_min=min(group["lr"] for group in optimizer.param_groups) * min_lr_ratio,
+        )
+
+    warmup = torch.optim.lr_scheduler.LinearLR(
+        optimizer,
+        start_factor=0.1,
+        end_factor=1.0,
+        total_iters=warmup_epochs,
+    )
+    cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=max(epochs - warmup_epochs, 1),
+        eta_min=min(group["lr"] for group in optimizer.param_groups) * min_lr_ratio,
+    )
+    return torch.optim.lr_scheduler.SequentialLR(
+        optimizer,
+        schedulers=[warmup, cosine],
+        milestones=[warmup_epochs],
+    )
+
+
 def train_one_epoch_ddp(
-    model: torch.nn.Module,
+    model: nn.Module,
     train_loader: DataLoader,
-    criterion: torch.nn.Module,
+    criterion: nn.Module,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     amp_enabled: bool,
@@ -176,11 +272,7 @@ def train_one_epoch_ddp(
         )
 
         optimizer.zero_grad(set_to_none=True)
-        with torch.autocast(
-            device_type=device.type,
-            dtype=torch.bfloat16,
-            enabled=amp_enabled,
-        ):
+        with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=amp_enabled):
             logits = model(inputs)
             loss = criterion(logits, targets)
         loss.backward()
@@ -201,223 +293,107 @@ def train_one_epoch_ddp(
 
 
 def build_experiment_configs() -> List[Dict[str, Any]]:
+    # Model families are inspired by strong BirdCLEF pipelines using timm image backbones on log-mels.
     return [
         {
-            "name": "exp01_anchor_best_recipe",
-            "architecture": "spec_transformer",
-            "model_overrides": {
-                "embed_dim": 256,
-                "num_heads": 8,
-                "num_layers": 4,
-                "token_grid_size": 18,
-                "pooling": "attention",
-                "freq_mask_param": 12,
-                "time_mask_param": 24,
-                "specaugment_masks": 2,
-                "spec_noise_std": 0.01,
-            },
-            "mixup_alpha": 0.4,
+            "name": "ft01_effb0_anchor",
+            "backbone_name": "efficientnet_b0",
+            "image_size": 224,
+            "freq_mask_param": 12,
+            "time_mask_param": 24,
+            "specaugment_masks": 2,
+            "spec_noise_std": 0.01,
+            "mixup_alpha": 0.35,
             "mixup_probability": 1.0,
-            "lr": 1e-3,
+            "freeze_backbone_epochs": 2,
+            "lr_head": 1e-3,
+            "lr_backbone": 2e-4,
             "weight_decay": 2e-4,
             "warmup_epochs": 2,
-            "min_lr_ratio": 0.05,
+            "min_lr_ratio": 0.03,
         },
         {
-            "name": "exp02_big_transformer_attention",
-            "architecture": "spec_transformer",
-            "model_overrides": {
-                "embed_dim": 384,
-                "num_heads": 12,
-                "num_layers": 8,
-                "token_grid_size": 24,
-                "pooling": "attention",
-                "freq_mask_param": 12,
-                "time_mask_param": 24,
-                "specaugment_masks": 2,
-                "spec_noise_std": 0.01,
-            },
+            "name": "ft02_effb2",
+            "backbone_name": "efficientnet_b2",
+            "image_size": 260,
+            "freq_mask_param": 12,
+            "time_mask_param": 24,
+            "specaugment_masks": 2,
+            "spec_noise_std": 0.01,
+            "mixup_alpha": 0.35,
+            "mixup_probability": 1.0,
+            "freeze_backbone_epochs": 2,
+            "lr_head": 1e-3,
+            "lr_backbone": 1.5e-4,
+            "weight_decay": 2e-4,
+            "warmup_epochs": 2,
+            "min_lr_ratio": 0.03,
+        },
+        {
+            "name": "ft03_convnext_tiny",
+            "backbone_name": "convnext_tiny",
+            "image_size": 224,
+            "freq_mask_param": 10,
+            "time_mask_param": 20,
+            "specaugment_masks": 2,
+            "spec_noise_std": 0.0,
             "mixup_alpha": 0.3,
             "mixup_probability": 1.0,
-            "lr": 8e-4,
-            "weight_decay": 3e-4,
-            "warmup_epochs": 3,
-            "min_lr_ratio": 0.02,
-        },
-        {
-            "name": "exp03_big_transformer_hybrid",
-            "architecture": "spec_transformer",
-            "model_overrides": {
-                "embed_dim": 384,
-                "num_heads": 12,
-                "num_layers": 8,
-                "token_grid_size": 24,
-                "pooling": "hybrid",
-                "freq_mask_param": 8,
-                "time_mask_param": 16,
-                "specaugment_masks": 1,
-                "spec_noise_std": 0.0,
-            },
-            "mixup_alpha": 0.0,
-            "mixup_probability": 0.0,
-            "lr": 7e-4,
+            "freeze_backbone_epochs": 3,
+            "lr_head": 8e-4,
+            "lr_backbone": 1e-4,
             "weight_decay": 4e-4,
             "warmup_epochs": 3,
             "min_lr_ratio": 0.02,
         },
         {
-            "name": "exp04_highres_mel_frontend",
-            "architecture": "spec_transformer",
-            "model_overrides": {
-                "embed_dim": 256,
-                "num_heads": 8,
-                "num_layers": 4,
-                "token_grid_size": 18,
-                "pooling": "attention",
-                "n_mels": 256,
-                "n_fft": 3072,
-                "hop_length": 400,
-                "freq_mask_param": 24,
-                "time_mask_param": 24,
-                "specaugment_masks": 2,
-                "spec_noise_std": 0.01,
-            },
-            "mixup_alpha": 0.3,
+            "name": "ft04_mobilenetv3",
+            "backbone_name": "mobilenetv3_large_100",
+            "image_size": 224,
+            "freq_mask_param": 12,
+            "time_mask_param": 24,
+            "specaugment_masks": 2,
+            "spec_noise_std": 0.01,
+            "mixup_alpha": 0.4,
             "mixup_probability": 1.0,
-            "lr": 9e-4,
-            "weight_decay": 2e-4,
-            "warmup_epochs": 2,
-            "min_lr_ratio": 0.03,
-        },
-        {
-            "name": "exp05_lowres_mel_frontend",
-            "architecture": "spec_transformer",
-            "model_overrides": {
-                "embed_dim": 256,
-                "num_heads": 8,
-                "num_layers": 4,
-                "token_grid_size": 18,
-                "pooling": "attention",
-                "n_mels": 96,
-                "n_fft": 1024,
-                "hop_length": 640,
-                "freq_mask_param": 8,
-                "time_mask_param": 16,
-                "specaugment_masks": 2,
-                "spec_noise_std": 0.0,
-            },
-            "mixup_alpha": 0.5,
-            "mixup_probability": 1.0,
-            "lr": 1e-3,
+            "freeze_backbone_epochs": 1,
+            "lr_head": 1.2e-3,
+            "lr_backbone": 3e-4,
             "weight_decay": 1e-4,
             "warmup_epochs": 1,
             "min_lr_ratio": 0.05,
         },
         {
-            "name": "exp06_no_mixup_no_specaug",
-            "architecture": "spec_transformer",
-            "model_overrides": {
-                "embed_dim": 256,
-                "num_heads": 8,
-                "num_layers": 4,
-                "token_grid_size": 18,
-                "pooling": "attention",
-                "freq_mask_param": 0,
-                "time_mask_param": 0,
-                "specaugment_masks": 0,
-                "spec_noise_std": 0.0,
-            },
-            "mixup_alpha": 0.0,
-            "mixup_probability": 0.0,
-            "lr": 8e-4,
-            "weight_decay": 2e-4,
-            "warmup_epochs": 2,
-            "min_lr_ratio": 0.05,
-        },
-        {
-            "name": "exp07_heavy_aug_no_mixup",
-            "architecture": "spec_transformer",
-            "model_overrides": {
-                "embed_dim": 256,
-                "num_heads": 8,
-                "num_layers": 4,
-                "token_grid_size": 18,
-                "pooling": "attention",
-                "freq_mask_param": 28,
-                "time_mask_param": 56,
-                "specaugment_masks": 4,
-                "spec_noise_std": 0.03,
-            },
-            "mixup_alpha": 0.0,
-            "mixup_probability": 0.0,
-            "lr": 8e-4,
+            "name": "ft05_resnet50",
+            "backbone_name": "resnet50",
+            "image_size": 224,
+            "freq_mask_param": 8,
+            "time_mask_param": 16,
+            "specaugment_masks": 1,
+            "spec_noise_std": 0.0,
+            "mixup_alpha": 0.2,
+            "mixup_probability": 0.8,
+            "freeze_backbone_epochs": 2,
+            "lr_head": 1e-3,
+            "lr_backbone": 2e-4,
             "weight_decay": 3e-4,
             "warmup_epochs": 2,
             "min_lr_ratio": 0.03,
         },
-        {
-            "name": "exp08_convnet_wide_highres",
-            "architecture": "convnet",
-            "model_overrides": {
-                "channels": 96,
-                "n_mels": 256,
-                "n_fft": 3072,
-                "hop_length": 400,
-                "freq_mask_param": 16,
-                "time_mask_param": 32,
-                "specaugment_masks": 2,
-                "spec_noise_std": 0.01,
-            },
-            "mixup_alpha": 0.3,
-            "mixup_probability": 1.0,
-            "lr": 1.2e-3,
-            "weight_decay": 1e-4,
-            "warmup_epochs": 1,
-            "min_lr_ratio": 0.1,
-        },
-        {
-            "name": "exp09_transformer_small_fast",
-            "architecture": "spec_transformer",
-            "model_overrides": {
-                "embed_dim": 192,
-                "num_heads": 6,
-                "num_layers": 3,
-                "token_grid_size": 16,
-                "pooling": "hybrid",
-                "freq_mask_param": 8,
-                "time_mask_param": 16,
-                "specaugment_masks": 2,
-                "spec_noise_std": 0.0,
-            },
-            "mixup_alpha": 0.5,
-            "mixup_probability": 1.0,
-            "lr": 1.3e-3,
-            "weight_decay": 1e-4,
-            "warmup_epochs": 1,
-            "min_lr_ratio": 0.1,
-        },
-        {
-            "name": "exp10_transformer_medium_hybrid_strong_wd",
-            "architecture": "spec_transformer",
-            "model_overrides": {
-                "embed_dim": 320,
-                "num_heads": 10,
-                "num_layers": 6,
-                "token_grid_size": 22,
-                "pooling": "hybrid",
-                "freq_mask_param": 12,
-                "time_mask_param": 24,
-                "specaugment_masks": 2,
-                "spec_noise_std": 0.01,
-            },
-            "mixup_alpha": 0.3,
-            "mixup_probability": 1.0,
-            "lr": 6e-4,
-            "weight_decay": 6e-4,
-            "warmup_epochs": 3,
-            "min_lr_ratio": 0.02,
-        },
     ]
+
+
+def save_experiment_summaries(output_dir: Path, all_summaries: List[Dict[str, Any]], rank: int) -> None:
+    results_json_path = output_dir / "experiments_summary.json"
+    results_csv_path = output_dir / "experiments_summary.csv"
+    with open(results_json_path, "w", encoding="utf-8") as f:
+        json.dump(all_summaries, f, indent=2, sort_keys=True)
+    if all_summaries:
+        summary_df = pd.DataFrame(all_summaries)
+        summary_df = summary_df.sort_values(by=["best_val_auc", "best_val_loss"], ascending=[False, True])
+        summary_df.to_csv(results_csv_path, index=False)
+    _print_main(rank, f"Saved experiment summary: {results_json_path}")
+    _print_main(rank, f"Saved experiment summary: {results_csv_path}")
 
 
 def run_experiment(
@@ -438,12 +414,8 @@ def run_experiment(
     batch_size: int,
     num_workers: int,
     epochs: int,
-    lr: float,
-    weight_decay: float,
-    warmup_epochs: int,
-    min_lr_ratio: float,
     grad_clip_norm: float,
-    resume: Optional[Path],
+    early_stop_patience: int,
 ) -> Dict[str, Any]:
     exp_name = experiment["name"]
     exp_output_dir = output_dir / exp_name
@@ -468,19 +440,27 @@ def run_experiment(
             pin_memory=torch.cuda.is_available(),
         )
 
-    architecture = experiment["architecture"]
     model_config = base_model_config.copy()
-    model_config.update(experiment.get("model_overrides", {}))
-    model_config["architecture"] = architecture
-    model = build_model(architecture=architecture, model_config=model_config).to(device)
-    exp_lr = float(experiment.get("lr", lr))
-    exp_weight_decay = float(experiment.get("weight_decay", weight_decay))
-    exp_warmup_epochs = int(experiment.get("warmup_epochs", warmup_epochs))
-    exp_min_lr_ratio = float(experiment.get("min_lr_ratio", min_lr_ratio))
+    model_config.update(
+        {
+            "n_classes": len(label_map),
+            "backbone_name": experiment["backbone_name"],
+            "image_size": int(experiment["image_size"]),
+            "freq_mask_param": int(experiment["freq_mask_param"]),
+            "time_mask_param": int(experiment["time_mask_param"]),
+            "specaugment_masks": int(experiment["specaugment_masks"]),
+            "spec_noise_std": float(experiment["spec_noise_std"]),
+        }
+    )
 
-    if resume is not None and resume.exists():
-        checkpoint = torch.load(resume, map_location=device)
-        model.load_state_dict(checkpoint["model_state"])
+    model = TimmSpectrogramClassifier(
+        **model_config,
+        pretrained=True,
+    ).to(device)
+
+    freeze_backbone_epochs = int(experiment.get("freeze_backbone_epochs", 0))
+    if freeze_backbone_epochs > 0:
+        model.freeze_backbone()
 
     if distributed:
         model = DDP(
@@ -490,41 +470,49 @@ def run_experiment(
             find_unused_parameters=False,
         )
 
-    criterion = torch.nn.BCEWithLogitsLoss()
+    criterion = nn.BCEWithLogitsLoss()
     optimizer, fused_enabled = build_optimizer(
-        model,
-        lr=exp_lr,
-        weight_decay=exp_weight_decay,
+        model=model,
+        lr_backbone=float(experiment["lr_backbone"]),
+        lr_head=float(experiment["lr_head"]),
+        weight_decay=float(experiment["weight_decay"]),
         device=device,
     )
     scheduler = build_scheduler(
         optimizer=optimizer,
         epochs=epochs,
-        warmup_epochs=exp_warmup_epochs,
-        min_lr_ratio=exp_min_lr_ratio,
+        warmup_epochs=int(experiment["warmup_epochs"]),
+        min_lr_ratio=float(experiment["min_lr_ratio"]),
     )
     amp_enabled = use_bf16 and device.type == "cuda"
 
     _print_main(rank, "")
     _print_main(rank, f"=== {exp_name} ===")
-    _print_main(rank, f"DDP enabled: {distributed}")
+    _print_main(rank, f"Backbone: {experiment['backbone_name']} | image_size={experiment['image_size']}")
+    _print_main(rank, f"DDP enabled: {distributed} (world_size={dist.get_world_size() if dist.is_initialized() else 1})")
     _print_main(rank, f"Training rows: {train_meta_len}")
     _print_main(rank, f"Rows per-rank training shard: {train_rank_meta_len}")
     _print_main(rank, f"Validation rows: {val_meta_len}")
     _print_main(rank, f"Num labels: {len(label_map)}")
-    _print_main(rank, f"Architecture: {architecture}")
-    _print_main(rank, f"Mixup alpha/probability: {experiment['mixup_alpha']}/{experiment['mixup_probability']}")
     _print_main(
         rank,
-        f"LR={exp_lr} | weight_decay={exp_weight_decay} | warmup_epochs={exp_warmup_epochs} | min_lr_ratio={exp_min_lr_ratio}",
+        (
+            f"mixup(alpha={experiment['mixup_alpha']}, p={experiment['mixup_probability']}) | "
+            f"freeze_backbone_epochs={freeze_backbone_epochs}"
+        ),
     )
 
     best_val_auc = float("nan")
     best_val_loss = float("inf")
     best_epoch = -1
+    no_improve_epochs = 0
     history: List[Dict[str, Any]] = []
 
     for epoch in range(1, epochs + 1):
+        if epoch == freeze_backbone_epochs + 1 and freeze_backbone_epochs > 0:
+            live_model = model.module if isinstance(model, DDP) else model
+            live_model.unfreeze_backbone()
+
         avg_train_loss = train_one_epoch_ddp(
             model=model,
             train_loader=train_loader,
@@ -543,6 +531,7 @@ def run_experiment(
         if dist.is_initialized():
             dist.barrier()
 
+        stop_flag = torch.tensor([0], device=device, dtype=torch.int32)
         if _is_main_process(rank):
             eval_model = model.module if isinstance(model, DDP) else model
             if val_loader is None:
@@ -561,13 +550,12 @@ def run_experiment(
                 "train_loss": avg_train_loss,
                 "val_loss": val_loss,
                 "val_auc": val_auc,
-                "architecture": architecture,
+                "backbone_name": experiment["backbone_name"],
                 "mixup_alpha": float(experiment["mixup_alpha"]),
                 "mixup_probability": float(experiment["mixup_probability"]),
-                "lr": exp_lr,
-                "weight_decay": exp_weight_decay,
-                "warmup_epochs": exp_warmup_epochs,
-                "min_lr_ratio": exp_min_lr_ratio,
+                "lr_head": float(experiment["lr_head"]),
+                "lr_backbone": float(experiment["lr_backbone"]),
+                "freeze_backbone_epochs": freeze_backbone_epochs,
             }
             history.append(row)
             print(
@@ -579,8 +567,12 @@ def run_experiment(
             if is_better_score(val_auc, best_val_auc):
                 best_val_auc = val_auc
                 should_save = True
+                no_improve_epochs = 0
             elif pd.isna(val_auc) and val_loss < best_val_loss:
                 should_save = True
+                no_improve_epochs = 0
+            else:
+                no_improve_epochs += 1
 
             if should_save:
                 best_val_loss = val_loss
@@ -591,37 +583,58 @@ def run_experiment(
                         "model_state": eval_model.state_dict(),
                         "label_map": label_map,
                         "model_config": model_config,
-                        "architecture": architecture,
                         "epoch": epoch,
                         "best_val_auc": val_auc,
                         "best_val_loss": val_loss,
                         "use_bf16": amp_enabled,
                         "fused_adamw": fused_enabled,
-                        "lr": exp_lr,
-                        "weight_decay": exp_weight_decay,
-                        "warmup_epochs": exp_warmup_epochs,
-                        "min_lr_ratio": exp_min_lr_ratio,
+                        "backbone_name": experiment["backbone_name"],
+                        "freeze_backbone_epochs": freeze_backbone_epochs,
+                        "lr_head": float(experiment["lr_head"]),
+                        "lr_backbone": float(experiment["lr_backbone"]),
                     },
                     model_path,
                 )
                 with open(exp_output_dir / "label_map.json", "w", encoding="utf-8") as f:
                     json.dump(label_map, f, indent=2, sort_keys=True)
 
+            save_model(
+                {
+                    "model_state": eval_model.state_dict(),
+                    "epoch": epoch,
+                    "best_val_auc": best_val_auc,
+                    "best_val_loss": best_val_loss,
+                    "history": history,
+                    "experiment": experiment,
+                    "model_config": model_config,
+                },
+                exp_output_dir / "last_model.pt",
+            )
+
+            if no_improve_epochs >= early_stop_patience:
+                stop_flag[0] = 1
+
         if dist.is_initialized():
+            dist.broadcast(stop_flag, src=0)
             dist.barrier()
+
+        if int(stop_flag.item()) == 1:
+            _print_main(rank, f"Early stopping triggered for {exp_name} at epoch {epoch}.")
+            break
 
     summary: Dict[str, Any] = {
         "experiment": exp_name,
-        "architecture": architecture,
+        "architecture": "timm_spectrogram",
+        "backbone_name": experiment["backbone_name"],
         "best_epoch": best_epoch,
         "best_val_auc": best_val_auc,
         "best_val_loss": best_val_loss,
         "mixup_alpha": float(experiment["mixup_alpha"]),
         "mixup_probability": float(experiment["mixup_probability"]),
-        "lr": exp_lr,
-        "weight_decay": exp_weight_decay,
-        "warmup_epochs": exp_warmup_epochs,
-        "min_lr_ratio": exp_min_lr_ratio,
+        "lr_head": float(experiment["lr_head"]),
+        "lr_backbone": float(experiment["lr_backbone"]),
+        "weight_decay": float(experiment["weight_decay"]),
+        "freeze_backbone_epochs": freeze_backbone_epochs,
         "output_dir": str(exp_output_dir),
         "model_path": str(exp_output_dir / "best_model.pt"),
         "model_config": model_config,
@@ -644,23 +657,6 @@ def run_experiment(
     return summary
 
 
-def save_experiment_summaries(
-    output_dir: Path,
-    all_summaries: List[Dict[str, Any]],
-    rank: int,
-) -> None:
-    results_json_path = output_dir / "experiments_summary.json"
-    results_csv_path = output_dir / "experiments_summary.csv"
-    with open(results_json_path, "w", encoding="utf-8") as f:
-        json.dump(all_summaries, f, indent=2, sort_keys=True)
-    if all_summaries:
-        summary_df = pd.DataFrame(all_summaries)
-        summary_df = summary_df.sort_values(by=["best_val_auc", "best_val_loss"], ascending=[False, True])
-        summary_df.to_csv(results_csv_path, index=False)
-    _print_main(rank, f"Saved experiment summary: {results_json_path}")
-    _print_main(rank, f"Saved experiment summary: {results_csv_path}")
-
-
 def main() -> None:
     distributed, world_size, rank, local_rank = _get_distributed_context()
     _setup_distributed(distributed)
@@ -674,7 +670,7 @@ def main() -> None:
 
     repo_root = Path(__file__).resolve().parents[1]
     data_dir = repo_root / "data"
-    output_dir = repo_root / "birdclef_example" / "outputs" / "experiments4"
+    output_dir = repo_root / "birdclef_example" / "outputs" / "experiments_ft2"
 
     train_audio_metadata_path = data_dir / "train.csv"
     soundscape_labels_path = data_dir / "train_soundscapes_labels.csv"
@@ -684,10 +680,6 @@ def main() -> None:
 
     epochs = 15
     batch_size = 32
-    lr = 1e-3
-    min_lr_ratio = 0.05
-    warmup_epochs = 2
-    weight_decay = 2e-4
     dropout = 0.35
     sample_rate = 32000
     segment_duration = 5.0
@@ -701,7 +693,7 @@ def main() -> None:
     num_workers = 4
     use_bf16 = True
     grad_clip_norm = 1.0
-    resume: Optional[Path] = None
+    early_stop_patience = 4
 
     if not train_audio_dir.exists():
         raise FileNotFoundError(f"Missing directory: {train_audio_dir}")
@@ -781,31 +773,44 @@ def main() -> None:
     all_summaries: List[Dict[str, Any]] = []
 
     for experiment in experiments:
-        summary = run_experiment(
-            experiment=experiment,
-            train_dataset=train_dataset,
-            val_dataset=val_dataset,
-            label_map=label_map,
-            base_model_config=base_model_config,
-            output_dir=output_dir,
-            device=device,
-            rank=rank,
-            local_rank=local_rank,
-            distributed=distributed,
-            use_bf16=use_bf16,
-            train_meta_len=len(train_meta),
-            train_rank_meta_len=len(train_rank_meta),
-            val_meta_len=len(val_meta),
-            batch_size=batch_size,
-            num_workers=num_workers,
-            epochs=epochs,
-            lr=lr,
-            weight_decay=weight_decay,
-            warmup_epochs=warmup_epochs,
-            min_lr_ratio=min_lr_ratio,
-            grad_clip_norm=grad_clip_norm,
-            resume=resume,
-        )
+        summary: Dict[str, Any]
+        try:
+            summary = run_experiment(
+                experiment=experiment,
+                train_dataset=train_dataset,
+                val_dataset=val_dataset,
+                label_map=label_map,
+                base_model_config=base_model_config,
+                output_dir=output_dir,
+                device=device,
+                rank=rank,
+                local_rank=local_rank,
+                distributed=distributed,
+                use_bf16=use_bf16,
+                train_meta_len=len(train_meta),
+                train_rank_meta_len=len(train_rank_meta),
+                val_meta_len=len(val_meta),
+                batch_size=batch_size,
+                num_workers=num_workers,
+                epochs=epochs,
+                grad_clip_norm=grad_clip_norm,
+                early_stop_patience=early_stop_patience,
+            )
+        except Exception as ex:
+            if _is_main_process(rank):
+                failure = {
+                    "experiment": experiment.get("name", "unknown"),
+                    "architecture": "timm_spectrogram",
+                    "backbone_name": experiment.get("backbone_name", "unknown"),
+                    "status": "failed",
+                    "error": str(ex),
+                }
+                all_summaries.append(failure)
+                save_experiment_summaries(output_dir=output_dir, all_summaries=all_summaries, rank=rank)
+                print(f"[WARN] Experiment failed: {failure['experiment']} -> {failure['error']}")
+            if dist.is_initialized():
+                dist.barrier()
+            continue
 
         if _is_main_process(rank):
             all_summaries.append({key: value for key, value in summary.items() if key != "history"})

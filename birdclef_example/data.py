@@ -1,7 +1,6 @@
 import ast
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import random
 import re
 from pathlib import Path
 from typing import Iterator, List, Optional, Tuple, Dict
@@ -16,8 +15,6 @@ from tqdm import tqdm
 from torch import Tensor, nn
 from torch.nn import functional as F
 from torch.utils.data import Dataset
-import warnings
-warnings.filterwarnings("ignore")
 
 
 PRIMARY_LABEL_SPLIT_RE = re.compile(r"[;,\s]+")
@@ -196,16 +193,6 @@ class BirdCLEFDataset(Dataset):
         preload_audio: bool = True,
         max_cached_files: int = 100,
         preload_workers: int = 1,
-        waveform_aug_prob: float = 0.0,
-        gain_prob: float = 0.0,
-        gain_db_limit: float = 0.0,
-        noise_prob: float = 0.0,
-        noise_snr_db_min: float = 20.0,
-        noise_snr_db_max: float = 35.0,
-        time_shift_prob: float = 0.0,
-        time_shift_max_frac: float = 0.0,
-        drop_segment_prob: float = 0.0,
-        drop_segment_max_frac: float = 0.0,
     ):
         self.metadata = metadata.reset_index(drop=True)
         self.label_map = label_map
@@ -215,16 +202,6 @@ class BirdCLEFDataset(Dataset):
         self.preload_audio = preload_audio
         self.max_cached_files = max_cached_files
         self.preload_workers = max(1, preload_workers)
-        self.waveform_aug_prob = max(0.0, min(1.0, waveform_aug_prob))
-        self.gain_prob = max(0.0, min(1.0, gain_prob))
-        self.gain_db_limit = max(0.0, gain_db_limit)
-        self.noise_prob = max(0.0, min(1.0, noise_prob))
-        self.noise_snr_db_min = min(noise_snr_db_min, noise_snr_db_max)
-        self.noise_snr_db_max = max(noise_snr_db_min, noise_snr_db_max)
-        self.time_shift_prob = max(0.0, min(1.0, time_shift_prob))
-        self.time_shift_max_frac = max(0.0, time_shift_max_frac)
-        self.drop_segment_prob = max(0.0, min(1.0, drop_segment_prob))
-        self.drop_segment_max_frac = max(0.0, drop_segment_max_frac)
         self._audio_cache: OrderedDict[Path, Tensor] = OrderedDict()
 
         if self.preload_audio:
@@ -236,49 +213,8 @@ class BirdCLEFDataset(Dataset):
     def __getitem__(self, idx: int) -> Tuple[Tensor, Tensor]:
         row = self.metadata.iloc[idx]
         waveform = self._load_waveform(row)
-        if self.training:
-            waveform = self._apply_waveform_augmentations(waveform)
         target = self._encode_target(row)
         return waveform, target
-
-    def _apply_waveform_augmentations(self, waveform: Tensor) -> Tensor:
-        if self.waveform_aug_prob <= 0.0 or random.random() >= self.waveform_aug_prob:
-            return waveform
-
-        augmented = waveform.clone()
-
-        if self.gain_db_limit > 0.0 and random.random() < self.gain_prob:
-            gain_db = random.uniform(-self.gain_db_limit, self.gain_db_limit)
-            augmented = augmented * float(10 ** (gain_db / 20.0))
-
-        if self.time_shift_max_frac > 0.0 and random.random() < self.time_shift_prob:
-            max_shift = int(self.segment_samples * self.time_shift_max_frac)
-            if max_shift > 0:
-                shift = random.randint(-max_shift, max_shift)
-                if shift != 0:
-                    shifted = torch.zeros_like(augmented)
-                    if shift > 0:
-                        shifted[:, shift:] = augmented[:, :-shift]
-                    else:
-                        abs_shift = -shift
-                        shifted[:, :-abs_shift] = augmented[:, abs_shift:]
-                    augmented = shifted
-
-        if self.noise_prob > 0.0 and random.random() < self.noise_prob:
-            signal_rms = augmented.pow(2).mean().sqrt()
-            if signal_rms > 0:
-                snr_db = random.uniform(self.noise_snr_db_min, self.noise_snr_db_max)
-                noise_rms = signal_rms / float(10 ** (snr_db / 20.0))
-                augmented = augmented + torch.randn_like(augmented) * noise_rms
-
-        if self.drop_segment_max_frac > 0.0 and random.random() < self.drop_segment_prob:
-            max_width = int(self.segment_samples * self.drop_segment_max_frac)
-            max_width = max(1, min(max_width, self.segment_samples))
-            width = random.randint(1, max_width)
-            start = random.randint(0, self.segment_samples - width)
-            augmented[:, start : start + width] = 0
-
-        return augmented.clamp(min=-1.0, max=1.0)
 
     def _preload_all_audio(self) -> None:
         unique_paths = [
@@ -342,7 +278,7 @@ class BirdCLEFDataset(Dataset):
             return F.pad(waveform, (0, self.segment_samples - num_samples))
 
         max_start = num_samples - self.segment_samples
-        start = random.randint(0, max_start) if self.training else max_start // 2
+        start = torch.randint(0, max_start + 1, (1,)).item() if self.training else max_start // 2
         end = start + self.segment_samples
         return waveform[:, start:end]
 
