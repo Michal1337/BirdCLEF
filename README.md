@@ -3,11 +3,11 @@
 This repository codifies a BirdCLEF 2026-style baseline: start from the Kaggle-provided cleaned clips, convert them into log-mel spectrograms, train a lightweight CNN, and reuse the same feature extractor during inference to score the long-form soundscapes.
 
 ## Data layout
-1. `train_metadata.csv` – each row describes a short clip along with the `primary_label`, optional `secondary_labels`, and its filename inside `train_audio/`.
-2. `train_audio/` – 5-10 second recordings grouped by species (the script will search for each `filename` under this folder and optionally under `train_audio/<label>/`).
-3. `train_soundscapes/` – unlabeled long recordings for pseudo-labeling or validation helpers.
-4. `test_soundscapes.csv` and accompanying `test_soundscapes/` – the public and private leaderboard predictions are produced on these minute-long files.
-5. `taxonomy.csv` – contains the allowed species codes; `build_label_map` fetches `primary_label`, `ebird_code`, or `species_id` from it to keep consistent ordering across splits.
+1. `train_metadata.csv` ï¿½ each row describes a short clip along with the `primary_label`, optional `secondary_labels`, and its filename inside `train_audio/`.
+2. `train_audio/` ï¿½ 5-10 second recordings grouped by species (the script will search for each `filename` under this folder and optionally under `train_audio/<label>/`).
+3. `train_soundscapes/` ï¿½ unlabeled long recordings for pseudo-labeling or validation helpers.
+4. `test_soundscapes.csv` and accompanying `test_soundscapes/` ï¿½ the public and private leaderboard predictions are produced on these minute-long files.
+5. `taxonomy.csv` ï¿½ contains the allowed species codes; `build_label_map` fetches `primary_label`, `ebird_code`, or `species_id` from it to keep consistent ordering across splits.
 
 Place those folders under `data/` (or anywhere you like) and pass their paths to the CLI scripts below.
 
@@ -50,3 +50,37 @@ BirdCLEF continues to use a macro-averaged ROC-AUC that ignores classes never se
 - Use `torchaudio`'s `FrequencyMasking`/`TimeMasking` or `SpecAugment` to improve generalization.
 
 Refer to the Kaggle competition page for the latest rules, private-test constraints, and entry dates.
+
+## Perch v2 fine-tuning and Kaggle inference
+Use the TensorFlow Perch encoder with the PyTorch classifier head:
+
+```
+python -m birdclef_example.train_tf_perch_ft \
+  --data-dir data \
+  --model-dir models/perch_v2/1 \
+  --output-dir birdclef_example/outputs/perch_ft \
+  --epochs 8 \
+  --batch-size 128
+```
+
+This training run now exports:
+- `best_model.pt` (PyTorch head weights)
+- `label_map.json` (class ordering used by the head)
+- `inference_config.json` (sample rate, duration, labels)
+
+Create a Kaggle submission from test soundscapes:
+
+```
+python -m birdclef_example.predict_tf_perch_ft \
+  --model-dir models/perch_v2/1 \
+  --head-path birdclef_example/outputs/perch_ft/best_model.pt \
+  --label-map birdclef_example/outputs/perch_ft/label_map.json \
+  --taxonomy-csv data/taxonomy.csv \
+  --test-metadata data/test.csv \
+  --soundscape-dir data/test_soundscapes \
+  --output-csv birdclef_example/outputs/perch_ft/submission.csv
+```
+
+Notes:
+- If Kaggle or your cluster lacks TensorFlow GPU compatibility, add `--disable-tf-gpu`.
+- The inference script consumes Kaggle `row_id` format (`<soundscape_stem>_<seconds>`) and writes a wide submission CSV in the same row order as the metadata file.

@@ -1,17 +1,14 @@
 """
 Fine-tune a Perch v2 model on BirdCLEF using the same data split as other experiments.
 
-Notes:
-- This script keeps the validation split identical to train_ddp_sota.py:
-  train_audio + soundscape_train -> training, soundscape_val -> validation.
-- Perch runs in TensorFlow only to extract embeddings; the classifier is trained in PyTorch.
+This script mirrors train_tf_perch_ft.py but uses a PyTorch Perch backbone
+(checkpoint: perch_backbone.pt) to extract embeddings.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import os
 import random
 from pathlib import Path
 from typing import Dict, Iterable, List, Tuple
@@ -20,17 +17,19 @@ import numpy as np
 import pandas as pd
 import soundfile as sf
 import torchaudio.functional as AF
-from tqdm import tqdm
 from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import train_test_split
+from tqdm import tqdm
 import torch
 
 import sys
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from birdclef_example.data import (
+    SpectrogramTransform,
     build_label_map,
     parse_primary_labels,
     parse_secondary_labels,
@@ -42,6 +41,8 @@ from birdclef_example.data import (
 def set_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
 
 def _read_audio(filepath: Path) -> Tuple[np.ndarray, int]:
@@ -138,57 +139,97 @@ def iter_dataset(
         yield chunk, target
 
 
-def extract_perch_embeddings(
-    perch_dir: Path,
+class PerchTorchEmbedder(torch.nn.Module):
+    def __init__(self, backbone_path: Path, image_size: int, sample_rate: int):
+        super().__init__()
+        try:
+            import timm
+        except ImportError as exc:
+            raise ImportError(
+                "timm is required to load perch_backbone.pt. Install with: pip install timm"
+            ) from exc
+
+        self.spectrogram = SpectrogramTransform(
+            sample_rate=sample_rate,
+            n_mels=160,
+            n_fft=2048,
+            hop_length=512,
+            f_min=20,
+            f_max=None,
+            normalize=True,
+        )
+        self.image_size = int(image_size)
+        self.backbone = timm.create_model(
+            "efficientnet_b3",
+            pretrained=False,
+            num_classes=0,
+            global_pool="",
+            in_chans=3,
+        )
+
+        state = torch.load(str(backbone_path), map_location="cpu")
+        if isinstance(state, dict) and "state_dict" in state:
+            state = state["state_dict"]
+        missing, unexpected = self.backbone.load_state_dict(state, strict=False)
+        if missing or unexpected:
+            print(
+                f"Warning: backbone checkpoint load mismatch (missing={len(missing)}, unexpected={len(unexpected)})"
+            )
+
+    def _wave_to_image(self, waveform: torch.Tensor) -> torch.Tensor:
+        x = self.spectrogram(waveform)
+        x = x.clamp(min=-4.0, max=4.0)
+        x = (x + 4.0) / 8.0
+        x = torch.nn.functional.interpolate(
+            x,
+            size=(self.image_size, self.image_size),
+            mode="bilinear",
+            align_corners=False,
+        )
+        x = x.repeat(1, 3, 1, 1)
+        return x
+
+    def forward(self, waveform: torch.Tensor) -> torch.Tensor:
+        images = self._wave_to_image(waveform)
+        feats = self.backbone(images)
+        if feats.ndim == 4:
+            feats = feats.mean(dim=(2, 3))
+        elif feats.ndim > 2:
+            feats = feats.flatten(1)
+        return feats
+
+
+def extract_perch_embeddings_torch(
+    backbone_path: Path,
     metadata: pd.DataFrame,
     label_map: Dict[str, int],
     sample_rate: int,
     duration: float,
     batch_size: int,
     training: bool,
-    disable_tf_gpu: bool,
-    require_gpu: bool,
+    image_size: int,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    if disable_tf_gpu:
-        os.environ["CUDA_VISIBLE_DEVICES"] = ""
-
-    import tensorflow as tf  # local import to control GPU visibility
-
-    try:
-        if disable_tf_gpu:
-            tf.config.set_visible_devices([], "GPU")
-        else:
-            gpus = tf.config.list_physical_devices("GPU")
-            if require_gpu and not gpus:
-                raise RuntimeError("No TensorFlow GPU devices found, but --require-gpu was set.")
-            for gpu in gpus:
-                try:
-                    tf.config.experimental.set_memory_growth(gpu, True)
-                except Exception:
-                    pass
-        intra = int(os.environ.get("TF_NUM_INTRAOP_THREADS", "0"))
-        inter = int(os.environ.get("TF_NUM_INTEROP_THREADS", "0"))
-        if intra > 0:
-            tf.config.threading.set_intra_op_parallelism_threads(intra)
-        if inter > 0:
-            tf.config.threading.set_inter_op_parallelism_threads(inter)
-    except Exception:
-        pass
-
-    perch = tf.saved_model.load(str(perch_dir))
-    infer_fn = perch.signatures["serving_default"]
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(device)
+    model = PerchTorchEmbedder(
+        backbone_path=backbone_path,
+        image_size=image_size,
+        sample_rate=sample_rate,
+    ).to(device)
+    model.eval()
 
     X_chunks: List[np.ndarray] = []
     Y_chunks: List[np.ndarray] = []
     batch: List[np.ndarray] = []
 
     def _flush(batch_arr: List[np.ndarray]) -> np.ndarray:
-        inp = np.stack(batch_arr, axis=0)
-        outputs = infer_fn(inputs=tf.convert_to_tensor(inp))
-        return outputs["embedding"].numpy()
+        inp = torch.from_numpy(np.stack(batch_arr, axis=0)).float().unsqueeze(1).to(device)
+        with torch.no_grad():
+            embeddings = model(inp).float().cpu().numpy()
+        return embeddings
 
     total = len(metadata)
-    with tqdm(total=total, desc="Perch embeddings", leave=False) as pbar:
+    with tqdm(total=total, desc="Perch embeddings (torch)", leave=False) as pbar:
         for chunk, target in iter_dataset(
             metadata,
             label_map=label_map,
@@ -206,7 +247,14 @@ def extract_perch_embeddings(
     if batch:
         X_chunks.append(_flush(batch))
 
-    X_arr = np.vstack(X_chunks) if X_chunks else np.zeros((0, 1536), dtype=np.float32)
+    if X_chunks:
+        X_arr = np.vstack(X_chunks)
+    else:
+        with torch.no_grad():
+            dummy = torch.zeros(1, 1, int(sample_rate * duration), device=device)
+            emb_dim = int(model(dummy).shape[1])
+        X_arr = np.zeros((0, emb_dim), dtype=np.float32)
+
     Y_arr = np.vstack(Y_chunks) if Y_chunks else np.zeros((0, len(label_map)), dtype=np.float32)
     return X_arr, Y_arr
 
@@ -292,7 +340,10 @@ def train_torch_head(
             best_auc = val_auc
             best_epoch = epoch
             torch.save(
-                {"model_state": model.state_dict(), "input_dim": X_train.shape[1]},
+                {
+                    "model_state": model.state_dict(),
+                    "input_dim": X_train.shape[1],
+                },
                 output_dir / "best_model.pt",
             )
 
@@ -313,27 +364,24 @@ def birdclef_roc_auc(targets: np.ndarray, preds: np.ndarray) -> float:
     if targets.ndim != 2:
         raise ValueError(f"Expected 2D arrays, got targets.ndim={targets.ndim}.")
 
-    # Select classes with at least one positive
     class_sums = targets.sum(axis=0)
     valid_classes = np.where(class_sums > 0)[0]
 
     if len(valid_classes) == 0:
         raise ValueError("No valid classes with positive samples.")
 
-    # Slice only valid classes
     targets_filtered = targets[:, valid_classes]
     preds_filtered = preds[:, valid_classes]
-
-    # Compute macro ROC-AUC (same as Kaggle)
     return roc_auc_score(targets_filtered, preds_filtered, average="macro")
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Fine-tune Perch v2 on BirdCLEF.")
+    parser = argparse.ArgumentParser(description="Fine-tune Perch v2 on BirdCLEF with torch backbone.")
     parser.add_argument("--data-dir", type=Path, default=Path("/mnt/evafs/groups/re-com/mgromadzki/data"))
-    parser.add_argument("--model-dir", type=Path, required=True)
+    parser.add_argument("--backbone-path", type=Path, default=Path("perch_backbone.pt"))
+    parser.add_argument("--model-dir", type=Path, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--output-dir", type=Path, default=Path("birdclef_example/outputs/perch_ft"))
-    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--epochs", type=int, default=8)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
@@ -341,18 +389,7 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--sample-rate", type=int, default=32000)
     parser.add_argument("--duration", type=float, default=5.0)
-    parser.add_argument("--intra-threads", type=int, default=0)
-    parser.add_argument("--inter-threads", type=int, default=0)
-    parser.add_argument(
-        "--disable-tf-gpu",
-        action="store_true",
-        help="Force TensorFlow to run on CPU to avoid CUDA binary mismatches.",
-    )
-    parser.add_argument(
-        "--require-gpu",
-        action="store_true",
-        help="Exit if no TensorFlow GPU is available.",
-    )
+    parser.add_argument("--image-size", type=int, default=300)
     parser.add_argument(
         "--cache-embeddings",
         action="store_true",
@@ -360,12 +397,10 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    if args.model_dir is not None:
+        args.backbone_path = args.model_dir
+
     set_seed(args.seed)
-    if args.intra_threads > 0:
-        os.environ["OMP_NUM_THREADS"] = str(args.intra_threads)
-        os.environ["TF_NUM_INTRAOP_THREADS"] = str(args.intra_threads)
-    if args.inter_threads > 0:
-        os.environ["TF_NUM_INTEROP_THREADS"] = str(args.inter_threads)
 
     data_dir = args.data_dir
     output_dir = args.output_dir
@@ -407,48 +442,30 @@ def main() -> None:
             f"Expected {expected_num_classes} classes from taxonomy, got {len(label_map)}."
         )
 
-    ordered_labels = sorted(label_map.keys(), key=lambda label: label_map[label])
-    with (output_dir / "label_map.json").open("w", encoding="utf-8") as f:
-        json.dump(label_map, f, indent=2, sort_keys=True)
-    with (output_dir / "inference_config.json").open("w", encoding="utf-8") as f:
-        json.dump(
-            {
-                "sample_rate": args.sample_rate,
-                "duration": args.duration,
-                "labels": ordered_labels,
-                "num_classes": len(label_map),
-            },
-            f,
-            indent=2,
-            sort_keys=True,
-        )
+    if not args.backbone_path.exists():
+        raise FileNotFoundError(f"Backbone checkpoint not found: {args.backbone_path}")
 
-    if args.require_gpu and args.disable_tf_gpu:
-        raise ValueError("--require-gpu and --disable-tf-gpu cannot be used together.")
-
-    print("Extracting Perch embeddings for training set...")
-    X_train, y_train = extract_perch_embeddings(
-        perch_dir=args.model_dir,
+    print("Extracting Perch embeddings (torch) for training set...")
+    X_train, y_train = extract_perch_embeddings_torch(
+        backbone_path=args.backbone_path,
         metadata=train_meta,
         label_map=label_map,
         sample_rate=args.sample_rate,
         duration=args.duration,
         batch_size=args.batch_size,
         training=True,
-        disable_tf_gpu=args.disable_tf_gpu,
-        require_gpu=args.require_gpu,
+        image_size=args.image_size,
     )
-    print("Extracting Perch embeddings for validation set...")
-    X_val, y_val = extract_perch_embeddings(
-        perch_dir=args.model_dir,
+    print("Extracting Perch embeddings (torch) for validation set...")
+    X_val, y_val = extract_perch_embeddings_torch(
+        backbone_path=args.backbone_path,
         metadata=val_meta,
         label_map=label_map,
         sample_rate=args.sample_rate,
         duration=args.duration,
         batch_size=args.batch_size,
         training=False,
-        disable_tf_gpu=args.disable_tf_gpu,
-        require_gpu=args.require_gpu,
+        image_size=args.image_size,
     )
 
     if args.cache_embeddings:
@@ -478,8 +495,9 @@ def main() -> None:
             "batch_size": args.batch_size,
             "lr": args.lr,
             "weight_decay": args.weight_decay,
-            "model_dir": str(args.model_dir),
+            "backbone_path": str(args.backbone_path),
             "output_dir": str(output_dir),
+            "image_size": args.image_size,
         }
     )
     with (output_dir / "summary.json").open("w", encoding="utf-8") as f:
