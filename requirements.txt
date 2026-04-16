@@ -7,3 +7,5 @@ scikit-learn>=1.3
 tqdm>=4.65
 soundfile>=0.12
 tensorflow>=2.15
+onnxruntime>=1.17
+tf2onnx>=1.16
