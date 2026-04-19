@@ -35,7 +35,7 @@ except Exception as exc:
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_BASE_ONNX = REPO_ROOT / "models" / "perch_onnx" / "perch_v2.onnx"
-DEFAULT_OUTPUT_ONNX = REPO_ROOT / "models" / "perch_onnx" / "perch_v2_finetuned.onnx"
+DEFAULT_OUTPUT_ONNX = REPO_ROOT / "models" / "perch_onnx" / "perch_v2_finetuned_partial.onnx"
 HEAD_W_NAME = "jit(infer_fn)/MultiHeadClassifier/MultiHeadClassifier._call_model/heads_protopnet_logits/dot_general6_reshaped_0"
 HEAD_ALPHA_NAME = "arith.constant62"
 HEAD_BIAS_NAME = "arith.constant61"

@@ -11,8 +11,10 @@ import numpy as np
 import gc
 import json
 import re
+import shutil
 import time
 import warnings
+from safetensors.torch import save_file
 from collections import defaultdict
 import pandas as pd
 import soundfile as sf
@@ -30,12 +32,7 @@ from tqdm.auto import tqdm
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 from sklearn.isotonic import IsotonicRegression
 import concurrent.futures
-from copy import deepcopy
 from sklearn.model_selection import StratifiedGroupKFold
-try:
-    from birdclef_example.experiment_presets import EXPERIMENT_PRESETS, KEY_HYPERPARAMETERS
-except Exception:
-    from experiment_presets import EXPERIMENT_PRESETS, KEY_HYPERPARAMETERS
 
 # 2. Function and Class Definitions
 
@@ -54,6 +51,26 @@ def get_cosine_restart_scheduler(optimizer, restart_period=20):
     return CosineAnnealingWarmRestarts(
         optimizer, T_0=restart_period, T_mult=1, eta_min=1e-5
     )
+
+
+def cfg_to_jsonable(obj):
+    if isinstance(obj, Path):
+        return str(obj)
+    if isinstance(obj, dict):
+        return {str(k): cfg_to_jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [cfg_to_jsonable(v) for v in obj]
+    if isinstance(obj, set):
+        return [cfg_to_jsonable(v) for v in sorted(obj)]
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+    if isinstance(obj, (np.floating,)):
+        return float(obj)
+    if isinstance(obj, (np.bool_,)):
+        return bool(obj)
+    return obj
 
 def mixup_cutmix(emb, logits, labels, alpha=0.4, cutmix_prob=0.3):
     B, T, D = emb.shape
@@ -1460,22 +1477,8 @@ def train_proto_ssm_single(model, emb_train, logits_train, labels_train,
             print(f"  Fusion alpha: mean={alphas.mean():.3f} min={alphas.min():.3f} max={alphas.max():.3f}")
             print(f"  Proto temperature: {F.softplus(model.proto_temp).item():.3f}")
 
-    PROC_MODE = "DoTrain"
-    if PROC_MODE == "DoTrain":
-        save_model_path = CFG.get("proto_model_path", "train_proto_ssm_single/models/proto_ssm_best.pt")
-        save_hist_path = CFG.get("proto_hist_path", "train_proto_ssm_single/models/proto_ssm_history.json")
-
-        os.makedirs(os.path.dirname(save_model_path) or ".", exist_ok=True)
-
-        torch.save(model.state_dict(), save_model_path)
-
-        import json
-        with open(save_hist_path, "w") as f:
-            json.dump(history, f, indent=4)
-
-        if verbose:
-            print(f"▶ [Save] Model successfully saved to {save_model_path}")
-            print(f"▶ [Save] History successfully saved to {save_hist_path}")
+    if verbose:
+        print("▶ [Info] Skipping standalone ProtoSSM checkpoint/history saves; bundle export is the persistence path.")
 
     return model, history
 
@@ -1662,116 +1665,6 @@ def adaptive_delta_smooth(probs, n_windows, base_alpha=0.20):
         view[:, i, :] = (1.0 - a) * p_view[:, i, :] + a * neighbor_avg
     return result.reshape(probs.shape)
 
-def _json_safe(obj):
-    if isinstance(obj, dict):
-        return {str(k): _json_safe(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
-        return [_json_safe(v) for v in obj]
-    if isinstance(obj, Path):
-        return str(obj)
-    if isinstance(obj, np.ndarray):
-        return obj.tolist()
-    if isinstance(obj, (np.floating, np.integer, np.bool_)):
-        return obj.item()
-    return obj
-
-def _r4(x):
-    if x is None:
-        return np.nan
-    try:
-        return round(float(x), 4)
-    except Exception:
-        return np.nan
-
-def _deep_update(dst, src):
-    for k, v in src.items():
-        if isinstance(v, dict) and isinstance(dst.get(k), dict):
-            _deep_update(dst[k], v)
-        else:
-            dst[k] = v
-    return dst
-
-def apply_experiment_preset(cfg, preset_name):
-    if preset_name not in EXPERIMENT_PRESETS:
-        available = ", ".join(sorted(EXPERIMENT_PRESETS.keys()))
-        raise ValueError(f"Unknown EXPERIMENT_PRESET={preset_name!r}. Available: {available}")
-    _deep_update(cfg, EXPERIMENT_PRESETS[preset_name])
-    cfg["experiment_name"] = preset_name
-    return cfg
-
-def build_experiment_record(cfg, logs, submission_df, mode):
-    score_values = submission_df.iloc[:, 1:].to_numpy(dtype=np.float32, copy=False)
-
-    train_history = logs.get("train_history", {})
-    val_loss_hist = train_history.get("val_loss", [])
-    val_auc_hist = train_history.get("val_auc", [])
-    train_loss_hist = train_history.get("train_loss", [])
-
-    return {
-        "mode": mode,
-        "key_metric": _r4(logs.get("ensemble_auc", logs.get("oof_auc_proto", np.nan))),
-        "oof_auc_proto": _r4(logs.get("oof_auc_proto", np.nan)),
-        "mlp_only_auc": _r4(logs.get("mlp_only_auc", np.nan)),
-        "ensemble_auc": _r4(logs.get("ensemble_auc", np.nan)),
-        "ensemble_weight_proto": _r4(logs.get("ensemble_weight", logs.get("ensemble_weight_proto", np.nan))),
-        "best_val_auc": _r4(max(val_auc_hist)) if len(val_auc_hist) else np.nan,
-        "best_val_loss": _r4(min(val_loss_hist)) if len(val_loss_hist) else np.nan,
-        "final_train_loss": _r4(train_loss_hist[-1]) if len(train_loss_hist) else np.nan,
-        "train_time_final": _r4(logs.get("train_time_final", np.nan)),
-        "wall_time_seconds": _r4(logs.get("wall_time_seconds", np.nan)),
-        "n_probe_models": int(logs.get("n_probe_models", 0)),
-        "residual_best_val_mse": _r4(logs.get("residual_ssm", {}).get("best_val_mse", np.nan)),
-        "submission_mean": _r4(score_values.mean()),
-        "submission_std": _r4(score_values.std()),
-        "submission_min": _r4(score_values.min()),
-        "submission_max": _r4(score_values.max()),
-        "submission_p95": _r4(np.quantile(score_values, 0.95)),
-        "submission_p99": _r4(np.quantile(score_values, 0.99)),
-    }
-
-def save_experiment_artifacts(repo_root, cfg, logs, submission_df, mode):
-    out_dir = repo_root / "outputs" / "experiments_w_frozen"
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    record = build_experiment_record(cfg, logs, submission_df, mode)
-    run_base = str(cfg.get("experiment_name", cfg.get("mode", mode))).strip() or mode
-    run_base = re.sub(r"[^A-Za-z0-9_.-]+", "_", run_base)
-    run_idx = 1
-    while (out_dir / f"{run_base}_{run_idx:04d}.json").exists():
-        run_idx += 1
-    run_id = f"{run_base}_{run_idx:04d}"
-    record["run_id"] = run_id
-
-    run_payload = {
-        "record": _json_safe(record),
-        "cfg": _json_safe(cfg),
-        "logs": _json_safe(logs),
-    }
-    run_json_path = out_dir / f"{run_id}.json"
-    with open(run_json_path, "w") as f:
-        json.dump(run_payload, f, indent=2)
-
-    summary_csv = out_dir / "experiments_summary.csv"
-    summary_json = out_dir / "experiments_summary.json"
-    rec_df = pd.DataFrame([record])
-
-    if summary_csv.exists():
-        prev_df = pd.read_csv(summary_csv)
-        rec_df = pd.concat([prev_df, rec_df], ignore_index=True)
-    rec_df.to_csv(summary_csv, index=False)
-
-    summary_items = []
-    if summary_json.exists():
-        try:
-            summary_items = json.loads(summary_json.read_text())
-        except Exception:
-            summary_items = []
-    summary_items.append(_json_safe(record))
-    with open(summary_json, "w") as f:
-        json.dump(summary_items, f, indent=2)
-
-    return run_json_path, summary_csv, summary_json, record
-
 # 3. Config Variables
 REPO_ROOT = Path(__file__).resolve().parent.parent
 MODE = "train"
@@ -1797,7 +1690,7 @@ CFG = {
     "proxy_reduce_grid": ["max", "mean", "median"],
     "proxy_reduce": "max",
     "run_proxy_reduce_grid": False,
-    "dryrun_n_files": 1000 if MODE == "train" else 20,
+    "dryrun_n_files": 50 if MODE == "train" else 20,
     "require_full_cache_in_submit": False,
     "full_cache_input_dir": Path(os.environ.get("PERCH_CACHE_DIR", REPO_ROOT / "data" / "perch_cache_finetuned")),
     "full_cache_work_dir": Path(os.environ.get("PERCH_CACHE_DIR", REPO_ROOT / "data" / "perch_cache_finetuned")),
@@ -1842,10 +1735,10 @@ CFG = {
     },
     # V18: strengthened MLP probe
     "frozen_best_probe": {
-        "pca_dim": 128,          # V17: 64
-        "min_pos": 5,            # V17: 8
-        "C": 0.75,               # V17: 0.50
-        "alpha": 0.45,           # V17: 0.40
+        "pca_dim": 224,          # V17: 64
+        "min_pos": 3,            # V17: 8
+        "C": 1.8,               # V17: 0.50
+        "alpha": 0.65,           # V17: 0.40
     },
     # V18: strengthened ResidualSSM
     "residual_ssm": {
@@ -1906,16 +1799,14 @@ CFG["tta_shifts"]        = [0, 1, -1, 2, -2]
 CFG["rank_aware_power"]  = 0.4
 CFG["delta_shift_alpha"] = 0.20
 CFG["mlp_params"] = {
-    "hidden_layer_sizes": (256, 128), "activation": "relu",
+    "hidden_layer_sizes": (384, 192), "activation": "relu",
     "max_iter": 500, "early_stopping": True,
     "validation_fraction": 0.15, "n_iter_no_change": 20,
-    "random_state": 42, "learning_rate_init": 5e-4, "alpha": 0.005,
+    "random_state": 42, "learning_rate_init": 8.0e-4, "alpha": 0.0025,
 }
 CFG["frozen_best_probe"] = {
-    "pca_dim": 128, "min_pos": 5, "C": 0.75, "alpha": 0.45
+    "pca_dim": 224, "min_pos": 2, "C": 1.2, "alpha": 0.64,
 }
-BASE_CFG = deepcopy(CFG)
-PRESET_RUN_LIST = sorted(EXPERIMENT_PRESETS.keys())
 ONNX_PERCH_PATH = Path(os.environ.get("PERCH_ONNX_PATH", REPO_ROOT / "models" / "perch_onnx" / "perch_v2_finetuned.onnx"))
 USE_ONNX_PERCH = ONNX_PERCH_PATH.exists()
 NO_LABEL_INDEX = 0
@@ -1945,578 +1836,518 @@ CORRECTION_WEIGHT = 0.0
 PER_CLASS_THRESHOLDS = np.array([], dtype=np.float32)
 T_AVES = 1.0
 T_TEXTURE = 1.0
+BUNDLE_DIR = Path(os.environ.get("PORTED_BUNDLE_DIR", REPO_ROOT / "outputs" / "ported_bundle_old"))
 
 # 4. Execution
-for EXPERIMENT_PRESET in PRESET_RUN_LIST:
-    CFG = apply_experiment_preset(deepcopy(BASE_CFG), EXPERIMENT_PRESET)
-    BEST = CFG["best_fusion"]
-    PROXY_REDUCE_CACHE = CFG["full_cache_work_dir"] / "proxy_reduce_grid.json"
-    OOF_META_CACHE = CFG["full_cache_work_dir"] / "full_oof_meta_features.npz"
-    LOGS = {}
-    _WALL_START = time.time()
-    seed_everything(1891)
-    assert MODE in {"train", "submit"}
-    print("MODE =", MODE)
-    warnings.filterwarnings("ignore")
-    tf.experimental.numpy.experimental_enable_numpy_behavior()
-    CFG["full_cache_work_dir"].mkdir(parents=True, exist_ok=True)
-    print("TensorFlow:", tf.__version__)
-    print("PyTorch:", torch.__version__)
-    print("Competition dir exists:", BASE.exists())
-    print("Model dir exists:", MODEL_DIR.exists())
-    print("V17 CFG: d_model=256, n_ssm_layers=3")
-    print(json.dumps(
-        {k: (str(v) if isinstance(v, Path) else v) for k, v in CFG.items()},
-        indent=2
-    ))
-    print(f"Experiment preset: {EXPERIMENT_PRESET}")
-    print(f"Tracked hyperparameters: {len(KEY_HYPERPARAMETERS)}")
+BEST = CFG["best_fusion"]
+PROXY_REDUCE_CACHE = CFG["full_cache_work_dir"] / "proxy_reduce_grid.json"
+OOF_META_CACHE = CFG["full_cache_work_dir"] / "full_oof_meta_features.npz"
+LOGS = {}
+_WALL_START = time.time()
+seed_everything(1891)
+assert MODE in {"train", "submit"}
+print("MODE =", MODE)
+warnings.filterwarnings("ignore")
+tf.experimental.numpy.experimental_enable_numpy_behavior()
+CFG["full_cache_work_dir"].mkdir(parents=True, exist_ok=True)
+print("TensorFlow:", tf.__version__)
+print("PyTorch:", torch.__version__)
+print("Competition dir exists:", BASE.exists())
+print("Model dir exists:", MODEL_DIR.exists())
+print("V17 CFG: d_model=256, n_ssm_layers=3")
+print(json.dumps(
+    {k: (str(v) if isinstance(v, Path) else v) for k, v in CFG.items()},
+    indent=2
+))
 
-    taxonomy = pd.read_csv(BASE / "taxonomy.csv")
-    sample_sub = pd.read_csv(BASE / "sample_submission.csv")
-    soundscape_labels = pd.read_csv(BASE / "train_soundscapes_labels.csv")
-    PRIMARY_LABELS = sample_sub.columns[1:].tolist()
-    N_CLASSES = len(PRIMARY_LABELS)
-    taxonomy["primary_label"] = taxonomy["primary_label"].astype(str)
-    soundscape_labels["primary_label"] = soundscape_labels["primary_label"].astype(str)
-    FNAME_RE = re.compile(r"BC2026_(?:Train|Test)_(\d+)_(S\d+)_(\d{8})_(\d{6})\.ogg")
-    sc_clean = (
-        soundscape_labels
-        .groupby(["filename", "start", "end"])["primary_label"]
-        .apply(union_labels)
-        .reset_index(name="label_list")
+taxonomy = pd.read_csv(BASE / "taxonomy.csv")
+sample_sub = pd.read_csv(BASE / "sample_submission.csv")
+soundscape_labels = pd.read_csv(BASE / "train_soundscapes_labels.csv")
+PRIMARY_LABELS = sample_sub.columns[1:].tolist()
+N_CLASSES = len(PRIMARY_LABELS)
+taxonomy["primary_label"] = taxonomy["primary_label"].astype(str)
+soundscape_labels["primary_label"] = soundscape_labels["primary_label"].astype(str)
+FNAME_RE = re.compile(r"BC2026_(?:Train|Test)_(\d+)_(S\d+)_(\d{8})_(\d{6})\.ogg")
+sc_clean = (
+    soundscape_labels
+    .groupby(["filename", "start", "end"])["primary_label"]
+    .apply(union_labels)
+    .reset_index(name="label_list")
+)
+sc_clean["start_sec"] = pd.to_timedelta(sc_clean["start"]).dt.total_seconds().astype(int)
+sc_clean["end_sec"] = pd.to_timedelta(sc_clean["end"]).dt.total_seconds().astype(int)
+sc_clean["row_id"] = sc_clean["filename"].str.replace(".ogg", "", regex=False) + "_" + sc_clean["end_sec"].astype(str)
+meta = sc_clean["filename"].apply(parse_soundscape_filename).apply(pd.Series)
+sc_clean = pd.concat([sc_clean, meta], axis=1)
+windows_per_file = sc_clean.groupby("filename").size()
+full_files = sorted(windows_per_file[windows_per_file == N_WINDOWS].index.tolist())
+sc_clean["file_fully_labeled"] = sc_clean["filename"].isin(full_files)
+label_to_idx = {c: i for i, c in enumerate(PRIMARY_LABELS)}
+Y_SC = np.zeros((len(sc_clean), N_CLASSES), dtype=np.uint8)
+for i, labels in enumerate(sc_clean["label_list"]):
+    idxs = [label_to_idx[lbl] for lbl in labels if lbl in label_to_idx]
+    if idxs:
+        Y_SC[i, idxs] = 1
+full_truth = (
+    sc_clean[sc_clean["file_fully_labeled"]]
+    .sort_values(["filename", "end_sec"])
+    .reset_index(drop=False)
+)
+Y_FULL_TRUTH = Y_SC[full_truth["index"].to_numpy()]
+print("sc_clean:", sc_clean.shape)
+print("Y_SC:", Y_SC.shape, Y_SC.dtype)
+print("Full files:", len(full_files))
+print("Trusted full windows:", len(full_truth))
+print("Active classes in full windows:", int((Y_FULL_TRUTH.sum(axis=0) > 0).sum()))
+CLASS_WEIGHTS = build_class_freq_weights(Y_FULL_TRUTH)
+print("✅ Class weights built")
+print("✅ Calibration + Threshold function defined")
+print("✅ Ensemble Weight Sweep defined")
+if USE_ONNX_PERCH:
+    print(f"Using ONNX Perch (150x faster)")
+    _so = ort.SessionOptions()
+    _so.intra_op_num_threads = 4
+    ONNX_SESSION = ort.InferenceSession(str(ONNX_PERCH_PATH), sess_options=_so, providers=["CPUExecutionProvider"])
+    ONNX_INPUT_NAME = ONNX_SESSION.get_inputs()[0].name
+    ONNX_OUTPUT_MAP = {o.name: i for i, o in enumerate(ONNX_SESSION.get_outputs())}
+birdclassifier = tf.saved_model.load(str(MODEL_DIR))
+infer_fn = birdclassifier.signatures["serving_default"]
+bc_labels = (
+    pd.read_csv(MODEL_DIR / "assets" / "labels.csv")
+    .reset_index()
+    .rename(columns={"index": "bc_index", "inat2024_fsd50k": "scientific_name"})
+)
+NO_LABEL_INDEX = len(bc_labels)
+MANUAL_SCIENTIFIC_NAME_MAP = {}
+taxonomy = taxonomy.copy()
+taxonomy["scientific_name_lookup"] = taxonomy["scientific_name"].replace(MANUAL_SCIENTIFIC_NAME_MAP)
+bc_lookup = bc_labels.rename(columns={"scientific_name": "scientific_name_lookup"})
+mapping = taxonomy.merge(
+    bc_lookup[["scientific_name_lookup", "bc_index"]],
+    on="scientific_name_lookup",
+    how="left"
+)
+mapping["bc_index"] = mapping["bc_index"].fillna(NO_LABEL_INDEX).astype(int)
+label_to_bc_index = mapping.set_index("primary_label")["bc_index"]
+BC_INDICES = np.array([int(label_to_bc_index.loc[c]) for c in PRIMARY_LABELS], dtype=np.int32)
+MAPPED_MASK = BC_INDICES != NO_LABEL_INDEX
+MAPPED_POS = np.where(MAPPED_MASK)[0].astype(np.int32)
+UNMAPPED_POS = np.where(~MAPPED_MASK)[0].astype(np.int32)
+MAPPED_BC_INDICES = BC_INDICES[MAPPED_MASK].astype(np.int32)
+CLASS_NAME_MAP = taxonomy.set_index("primary_label")["class_name"].to_dict()
+ACTIVE_CLASSES = [PRIMARY_LABELS[i] for i in np.where(Y_SC.sum(axis=0) > 0)[0]]
+idx_active_texture = np.array(
+    [label_to_idx[c] for c in ACTIVE_CLASSES if CLASS_NAME_MAP.get(c) in TEXTURE_TAXA],
+    dtype=np.int32
+)
+idx_active_event = np.array(
+    [label_to_idx[c] for c in ACTIVE_CLASSES if CLASS_NAME_MAP.get(c) not in TEXTURE_TAXA],
+    dtype=np.int32
+)
+idx_mapped_active_texture = idx_active_texture[MAPPED_MASK[idx_active_texture]]
+idx_mapped_active_event = idx_active_event[MAPPED_MASK[idx_active_event]]
+idx_unmapped_active_texture = idx_active_texture[~MAPPED_MASK[idx_active_texture]]
+idx_unmapped_active_event = idx_active_event[~MAPPED_MASK[idx_active_event]]
+idx_unmapped_inactive = np.array(
+    [i for i in UNMAPPED_POS if PRIMARY_LABELS[i] not in ACTIVE_CLASSES],
+    dtype=np.int32
+)
+unmapped_df = mapping[mapping["bc_index"] == NO_LABEL_INDEX].copy()
+unmapped_non_sonotype = unmapped_df[
+    ~unmapped_df["primary_label"].astype(str).str.contains("son", na=False)
+].copy()
+proxy_map = {}
+for _, row in unmapped_non_sonotype.iterrows():
+    target = row["primary_label"]
+    sci = row["scientific_name"]
+    genus, hits = get_genus_hits(sci)
+    if len(hits) > 0:
+        proxy_map[target] = {
+            "target_scientific_name": sci,
+            "genus": genus,
+            "bc_indices": hits["bc_index"].astype(int).tolist(),
+            "proxy_scientific_names": hits["scientific_name"].tolist(),
+        }
+SELECTED_PROXY_TARGETS = sorted([
+    t for t in proxy_map.keys()
+    if CLASS_NAME_MAP.get(t) in PROXY_TAXA
+])
+print(f"Proxy targets by class: { {cls: sum(1 for t in SELECTED_PROXY_TARGETS if CLASS_NAME_MAP.get(t)==cls) for cls in PROXY_TAXA} }")
+selected_proxy_pos = np.array([label_to_idx[c] for c in SELECTED_PROXY_TARGETS], dtype=np.int32)
+selected_proxy_pos_to_bc = {
+    label_to_idx[target]: np.array(proxy_map[target]["bc_indices"], dtype=np.int32)
+    for target in SELECTED_PROXY_TARGETS
+}
+idx_selected_proxy_active_texture = np.intersect1d(selected_proxy_pos, idx_active_texture)
+idx_selected_prioronly_active_texture = np.setdiff1d(idx_unmapped_active_texture, selected_proxy_pos)
+idx_selected_prioronly_active_event = np.setdiff1d(idx_unmapped_active_event, selected_proxy_pos)
+print(f"Mapped classes: {MAPPED_MASK.sum()} / {N_CLASSES}")
+print(f"Unmapped classes: {(~MAPPED_MASK).sum()}")
+print("Selected frog proxy targets:", SELECTED_PROXY_TARGETS)
+print("Active texture classes:", len(idx_active_texture))
+print("Selected proxy active texture:", len(idx_selected_proxy_active_texture))
+print("Prior-only active texture:", len(idx_selected_prioronly_active_texture))
+print("Prior-only active event:", len(idx_selected_prioronly_active_event))
+print("V17 utilities defined: focal_bce_with_logits, file_level_confidence_scale, temporal_shift_tta,")
+print("  rank_aware_scaling, delta_shift_smooth, optimize_per_class_thresholds, apply_per_class_thresholds")
+cache_meta, cache_npz = resolve_full_cache_paths()
+if cache_meta is not None and cache_npz is not None:
+    print("Loading cached full-file Perch outputs from:")
+    print("  ", cache_meta)
+    print("  ", cache_npz)
+    meta_full = pd.read_parquet(cache_meta)
+    arr = np.load(cache_npz)
+    scores_full_raw = arr["scores_full_raw"].astype(np.float32)
+    emb_full = arr["emb_full"].astype(np.float32)
+else:
+    if CFG["mode"] == "submit" and CFG["require_full_cache_in_submit"]:
+        raise FileNotFoundError(
+            "Submit mode requires cached full-file Perch outputs. "
+            "Attach the cache dataset or place full_perch_meta.parquet/full_perch_arrays.npz in working dir."
+        )
+    print("No cache found. Running Perch on trusted full files...")
+    full_paths = [BASE / "train_soundscapes" / fn for fn in full_files]
+    meta_full, scores_full_raw, emb_full = infer_perch_with_embeddings(
+        full_paths,
+        batch_files=CFG["batch_files"],
+        verbose=CFG["verbose"],
+        proxy_reduce=CFG["proxy_reduce"],
     )
-    sc_clean["start_sec"] = pd.to_timedelta(sc_clean["start"]).dt.total_seconds().astype(int)
-    sc_clean["end_sec"] = pd.to_timedelta(sc_clean["end"]).dt.total_seconds().astype(int)
-    sc_clean["row_id"] = sc_clean["filename"].str.replace(".ogg", "", regex=False) + "_" + sc_clean["end_sec"].astype(str)
-    meta = sc_clean["filename"].apply(parse_soundscape_filename).apply(pd.Series)
-    sc_clean = pd.concat([sc_clean, meta], axis=1)
-    windows_per_file = sc_clean.groupby("filename").size()
-    full_files = sorted(windows_per_file[windows_per_file == N_WINDOWS].index.tolist())
-    sc_clean["file_fully_labeled"] = sc_clean["filename"].isin(full_files)
-    label_to_idx = {c: i for i, c in enumerate(PRIMARY_LABELS)}
-    Y_SC = np.zeros((len(sc_clean), N_CLASSES), dtype=np.uint8)
-    for i, labels in enumerate(sc_clean["label_list"]):
-        idxs = [label_to_idx[lbl] for lbl in labels if lbl in label_to_idx]
-        if idxs:
-            Y_SC[i, idxs] = 1
-    full_truth = (
-        sc_clean[sc_clean["file_fully_labeled"]]
-        .sort_values(["filename", "end_sec"])
-        .reset_index(drop=False)
+    out_meta = CFG["full_cache_work_dir"] / "full_perch_meta.parquet"
+    out_npz = CFG["full_cache_work_dir"] / "full_perch_arrays.npz"
+    meta_full.to_parquet(out_meta, index=False)
+    np.savez_compressed(
+        out_npz,
+        scores_full_raw=scores_full_raw,
+        emb_full=emb_full,
     )
-    Y_FULL_TRUTH = Y_SC[full_truth["index"].to_numpy()]
-    print("sc_clean:", sc_clean.shape)
-    print("Y_SC:", Y_SC.shape, Y_SC.dtype)
-    print("Full files:", len(full_files))
-    print("Trusted full windows:", len(full_truth))
-    print("Active classes in full windows:", int((Y_FULL_TRUTH.sum(axis=0) > 0).sum()))
-    CLASS_WEIGHTS = build_class_freq_weights(Y_FULL_TRUTH)
-    print("✅ Class weights built")
-    print("✅ Calibration + Threshold function defined")
-    print("✅ Ensemble Weight Sweep defined")
-    if USE_ONNX_PERCH:
-        print(f"Using ONNX Perch (150x faster)")
-        _so = ort.SessionOptions()
-        _so.intra_op_num_threads = 4
-        ONNX_SESSION = ort.InferenceSession(str(ONNX_PERCH_PATH), sess_options=_so, providers=["CPUExecutionProvider"])
-        ONNX_INPUT_NAME = ONNX_SESSION.get_inputs()[0].name
-        ONNX_OUTPUT_MAP = {o.name: i for i, o in enumerate(ONNX_SESSION.get_outputs())}
-    birdclassifier = tf.saved_model.load(str(MODEL_DIR))
-    infer_fn = birdclassifier.signatures["serving_default"]
-    bc_labels = (
-        pd.read_csv(MODEL_DIR / "assets" / "labels.csv")
-        .reset_index()
-        .rename(columns={"index": "bc_index", "inat2024_fsd50k": "scientific_name"})
-    )
-    NO_LABEL_INDEX = len(bc_labels)
-    MANUAL_SCIENTIFIC_NAME_MAP = {}
-    taxonomy = taxonomy.copy()
-    taxonomy["scientific_name_lookup"] = taxonomy["scientific_name"].replace(MANUAL_SCIENTIFIC_NAME_MAP)
-    bc_lookup = bc_labels.rename(columns={"scientific_name": "scientific_name_lookup"})
-    mapping = taxonomy.merge(
-        bc_lookup[["scientific_name_lookup", "bc_index"]],
-        on="scientific_name_lookup",
-        how="left"
-    )
-    mapping["bc_index"] = mapping["bc_index"].fillna(NO_LABEL_INDEX).astype(int)
-    label_to_bc_index = mapping.set_index("primary_label")["bc_index"]
-    BC_INDICES = np.array([int(label_to_bc_index.loc[c]) for c in PRIMARY_LABELS], dtype=np.int32)
-    MAPPED_MASK = BC_INDICES != NO_LABEL_INDEX
-    MAPPED_POS = np.where(MAPPED_MASK)[0].astype(np.int32)
-    UNMAPPED_POS = np.where(~MAPPED_MASK)[0].astype(np.int32)
-    MAPPED_BC_INDICES = BC_INDICES[MAPPED_MASK].astype(np.int32)
-    CLASS_NAME_MAP = taxonomy.set_index("primary_label")["class_name"].to_dict()
-    ACTIVE_CLASSES = [PRIMARY_LABELS[i] for i in np.where(Y_SC.sum(axis=0) > 0)[0]]
-    idx_active_texture = np.array(
-        [label_to_idx[c] for c in ACTIVE_CLASSES if CLASS_NAME_MAP.get(c) in TEXTURE_TAXA],
-        dtype=np.int32
-    )
-    idx_active_event = np.array(
-        [label_to_idx[c] for c in ACTIVE_CLASSES if CLASS_NAME_MAP.get(c) not in TEXTURE_TAXA],
-        dtype=np.int32
-    )
-    idx_mapped_active_texture = idx_active_texture[MAPPED_MASK[idx_active_texture]]
-    idx_mapped_active_event = idx_active_event[MAPPED_MASK[idx_active_event]]
-    idx_unmapped_active_texture = idx_active_texture[~MAPPED_MASK[idx_active_texture]]
-    idx_unmapped_active_event = idx_active_event[~MAPPED_MASK[idx_active_event]]
-    idx_unmapped_inactive = np.array(
-        [i for i in UNMAPPED_POS if PRIMARY_LABELS[i] not in ACTIVE_CLASSES],
-        dtype=np.int32
-    )
-    unmapped_df = mapping[mapping["bc_index"] == NO_LABEL_INDEX].copy()
-    unmapped_non_sonotype = unmapped_df[
-        ~unmapped_df["primary_label"].astype(str).str.contains("son", na=False)
-    ].copy()
-    proxy_map = {}
-    for _, row in unmapped_non_sonotype.iterrows():
-        target = row["primary_label"]
-        sci = row["scientific_name"]
-        genus, hits = get_genus_hits(sci)
-        if len(hits) > 0:
-            proxy_map[target] = {
-                "target_scientific_name": sci,
-                "genus": genus,
-                "bc_indices": hits["bc_index"].astype(int).tolist(),
-                "proxy_scientific_names": hits["scientific_name"].tolist(),
-            }
-    SELECTED_PROXY_TARGETS = sorted([
-        t for t in proxy_map.keys()
-        if CLASS_NAME_MAP.get(t) in PROXY_TAXA
-    ])
-    print(f"Proxy targets by class: { {cls: sum(1 for t in SELECTED_PROXY_TARGETS if CLASS_NAME_MAP.get(t)==cls) for cls in PROXY_TAXA} }")
-    selected_proxy_pos = np.array([label_to_idx[c] for c in SELECTED_PROXY_TARGETS], dtype=np.int32)
-    selected_proxy_pos_to_bc = {
-        label_to_idx[target]: np.array(proxy_map[target]["bc_indices"], dtype=np.int32)
-        for target in SELECTED_PROXY_TARGETS
-    }
-    idx_selected_proxy_active_texture = np.intersect1d(selected_proxy_pos, idx_active_texture)
-    idx_selected_prioronly_active_texture = np.setdiff1d(idx_unmapped_active_texture, selected_proxy_pos)
-    idx_selected_prioronly_active_event = np.setdiff1d(idx_unmapped_active_event, selected_proxy_pos)
-    print(f"Mapped classes: {MAPPED_MASK.sum()} / {N_CLASSES}")
-    print(f"Unmapped classes: {(~MAPPED_MASK).sum()}")
-    print("Selected frog proxy targets:", SELECTED_PROXY_TARGETS)
-    print("Active texture classes:", len(idx_active_texture))
-    print("Selected proxy active texture:", len(idx_selected_proxy_active_texture))
-    print("Prior-only active texture:", len(idx_selected_prioronly_active_texture))
-    print("Prior-only active event:", len(idx_selected_prioronly_active_event))
-    print("V17 utilities defined: focal_bce_with_logits, file_level_confidence_scale, temporal_shift_tta,")
-    print("  rank_aware_scaling, delta_shift_smooth, optimize_per_class_thresholds, apply_per_class_thresholds")
-    cache_meta, cache_npz = resolve_full_cache_paths()
-    if cache_meta is not None and cache_npz is not None:
-        print("Loading cached full-file Perch outputs from:")
-        print("  ", cache_meta)
-        print("  ", cache_npz)
-        meta_full = pd.read_parquet(cache_meta)
-        arr = np.load(cache_npz)
-        scores_full_raw = arr["scores_full_raw"].astype(np.float32)
-        emb_full = arr["emb_full"].astype(np.float32)
-    else:
-        if CFG["mode"] == "submit" and CFG["require_full_cache_in_submit"]:
-            raise FileNotFoundError(
-                "Submit mode requires cached full-file Perch outputs. "
-                "Attach the cache dataset or place full_perch_meta.parquet/full_perch_arrays.npz in working dir."
-            )
-        print("No cache found. Running Perch on trusted full files...")
+    print("Saved cache to:")
+    print("  ", out_meta)
+    print("  ", out_npz)
+full_truth_aligned = full_truth.set_index("row_id").loc[meta_full["row_id"]].reset_index()
+Y_FULL = Y_SC[full_truth_aligned["index"].to_numpy()]
+assert np.all(full_truth_aligned["filename"].values == meta_full["filename"].values)
+assert np.all(full_truth_aligned["row_id"].values == meta_full["row_id"].values)
+print("meta_full:", meta_full.shape)
+print("scores_full_raw:", scores_full_raw.shape, scores_full_raw.dtype)
+print("emb_full:", emb_full.shape, emb_full.dtype)
+print("Y_FULL:", Y_FULL.shape, Y_FULL.dtype)
+if CFG.get("run_proxy_reduce_grid", False):
+    print("\n[Opsi 3] Running proxy_reduce grid search: max vs mean...")
+    proxy_reduce_results = {}
+    for pr in CFG["proxy_reduce_grid"]:
         full_paths = [BASE / "train_soundscapes" / fn for fn in full_files]
-        meta_full, scores_full_raw, emb_full = infer_perch_with_embeddings(
+        _meta, _scores, _emb = infer_perch_with_embeddings(
             full_paths,
             batch_files=CFG["batch_files"],
-            verbose=CFG["verbose"],
-            proxy_reduce=CFG["proxy_reduce"],
+            verbose=False,
+            proxy_reduce=pr,
         )
-        out_meta = CFG["full_cache_work_dir"] / "full_perch_meta.parquet"
-        out_npz = CFG["full_cache_work_dir"] / "full_perch_arrays.npz"
-        meta_full.to_parquet(out_meta, index=False)
-        np.savez_compressed(
-            out_npz,
-            scores_full_raw=scores_full_raw,
-            emb_full=emb_full,
-        )
-        print("Saved cache to:")
-        print("  ", out_meta)
-        print("  ", out_npz)
-    full_truth_aligned = full_truth.set_index("row_id").loc[meta_full["row_id"]].reset_index()
-    Y_FULL = Y_SC[full_truth_aligned["index"].to_numpy()]
-    assert np.all(full_truth_aligned["filename"].values == meta_full["filename"].values)
-    assert np.all(full_truth_aligned["row_id"].values == meta_full["row_id"].values)
-    print("meta_full:", meta_full.shape)
-    print("scores_full_raw:", scores_full_raw.shape, scores_full_raw.dtype)
-    print("emb_full:", emb_full.shape, emb_full.dtype)
-    print("Y_FULL:", Y_FULL.shape, Y_FULL.dtype)
-    if CFG.get("run_proxy_reduce_grid", False):
-        print("\n[Opsi 3] Running proxy_reduce grid search: max vs mean...")
-        proxy_reduce_results = {}
-        for pr in CFG["proxy_reduce_grid"]:
-            full_paths = [BASE / "train_soundscapes" / fn for fn in full_files]
-            _meta, _scores, _emb = infer_perch_with_embeddings(
-                full_paths,
-                batch_files=CFG["batch_files"],
-                verbose=False,
-                proxy_reduce=pr,
-            )
-            _oof_b, _oof_p, _ = build_oof_base_prior(
-                scores_full_raw=_scores,
-                meta_full=_meta,
-                sc_clean=sc_clean,
-                Y_SC=Y_SC,
-                n_splits=5,
-                verbose=False,
-            )
-            auc = macro_auc_skip_empty(Y_FULL, _oof_b)
-            proxy_reduce_results[pr] = float(auc)
-            print(f"  proxy_reduce={pr!r:6s} → OOF baseline AUC = {auc:.6f}")
-        best_pr = max(proxy_reduce_results, key=proxy_reduce_results.get)
-        CFG["proxy_reduce"] = best_pr
-        print(f"\n  Best proxy_reduce = {best_pr!r} (AUC={proxy_reduce_results[best_pr]:.6f})")
-        PROXY_REDUCE_CACHE.write_text(json.dumps({
-            "results": proxy_reduce_results,
-            "best_proxy_reduce": best_pr,
-        }, indent=2))
-        print("  Saved to:", PROXY_REDUCE_CACHE)
-    elif PROXY_REDUCE_CACHE.exists():
-        _pr_data = json.loads(PROXY_REDUCE_CACHE.read_text())
-        CFG["proxy_reduce"] = _pr_data["best_proxy_reduce"]
-        print(f"[Opsi 3] Loaded proxy_reduce from cache: {CFG['proxy_reduce']!r}")
-        print("  Grid results:", _pr_data["results"])
-    else:
-        print(f"[Opsi 3] Using default proxy_reduce={CFG['proxy_reduce']!r} (submit mode or no cache)")
-    if OOF_META_CACHE.exists():
-        print("Loading cached OOF meta-features from:", OOF_META_CACHE)
-        arr = np.load(OOF_META_CACHE)
-        oof_base = arr["oof_base"].astype(np.float32)
-        oof_prior = arr["oof_prior"].astype(np.float32)
-        oof_fold_id = arr["fold_id"].astype(np.int16)
-    else:
-        print("Building OOF meta-features...")
-        oof_base, oof_prior, oof_fold_id = build_oof_base_prior(
-            scores_full_raw=scores_full_raw,
-            meta_full=meta_full,
+        _oof_b, _oof_p, _ = build_oof_base_prior(
+            scores_full_raw=_scores,
+            meta_full=_meta,
             sc_clean=sc_clean,
             Y_SC=Y_SC,
             n_splits=5,
-            verbose=CFG["verbose"],
+            verbose=False,
         )
-        np.savez_compressed(
-            OOF_META_CACHE,
-            oof_base=oof_base,
-            oof_prior=oof_prior,
-            fold_id=oof_fold_id,
-        )
-        print("Saved OOF meta-features to:", OOF_META_CACHE)
-    baseline_oof_auc = macro_auc_skip_empty(Y_FULL, oof_base)
-    if MODE == "train":
-        raw_local_auc = macro_auc_skip_empty(Y_FULL, scores_full_raw)
-        print(f"Raw local AUC (not OOF-dependent): {raw_local_auc:.6f}")
-        print(f"Honest OOF baseline AUC: {baseline_oof_auc:.6f}")
-    ssm_cfg = CFG["proto_ssm"]
-    print("ProtoSSMv4 architecture defined (with cross-attention).")
-    test_model = ProtoSSMv2(
-        d_model=ssm_cfg["d_model"], n_ssm_layers=2,
-        n_sites=ssm_cfg["n_sites"], meta_dim=ssm_cfg["meta_dim"],
-        use_cross_attn=ssm_cfg.get("use_cross_attn", True),
-        cross_attn_heads=ssm_cfg.get("cross_attn_heads", 4),
+        auc = macro_auc_skip_empty(Y_FULL, _oof_b)
+        proxy_reduce_results[pr] = float(auc)
+        print(f"  proxy_reduce={pr!r:6s} → OOF baseline AUC = {auc:.6f}")
+    best_pr = max(proxy_reduce_results, key=proxy_reduce_results.get)
+    CFG["proxy_reduce"] = best_pr
+    print(f"\n  Best proxy_reduce = {best_pr!r} (AUC={proxy_reduce_results[best_pr]:.6f})")
+    PROXY_REDUCE_CACHE.write_text(json.dumps({
+        "results": proxy_reduce_results,
+        "best_proxy_reduce": best_pr,
+    }, indent=2))
+    print("  Saved to:", PROXY_REDUCE_CACHE)
+elif PROXY_REDUCE_CACHE.exists():
+    _pr_data = json.loads(PROXY_REDUCE_CACHE.read_text())
+    CFG["proxy_reduce"] = _pr_data["best_proxy_reduce"]
+    print(f"[Opsi 3] Loaded proxy_reduce from cache: {CFG['proxy_reduce']!r}")
+    print("  Grid results:", _pr_data["results"])
+else:
+    print(f"[Opsi 3] Using default proxy_reduce={CFG['proxy_reduce']!r} (submit mode or no cache)")
+if OOF_META_CACHE.exists():
+    print("Loading cached OOF meta-features from:", OOF_META_CACHE)
+    arr = np.load(OOF_META_CACHE)
+    oof_base = arr["oof_base"].astype(np.float32)
+    oof_prior = arr["oof_prior"].astype(np.float32)
+    oof_fold_id = arr["fold_id"].astype(np.int16)
+else:
+    print("Building OOF meta-features...")
+    oof_base, oof_prior, oof_fold_id = build_oof_base_prior(
+        scores_full_raw=scores_full_raw,
+        meta_full=meta_full,
+        sc_clean=sc_clean,
+        Y_SC=Y_SC,
+        n_splits=5,
+        verbose=CFG["verbose"],
     )
-    print(f"Parameter count: {test_model.count_parameters():,}")
-    del test_model
-    print("ProtoSSM v4 training functions defined (with mixup, focal loss, SWA, TTA).")
-    if CFG["run_probe_check"]:
-        probe_result = run_oof_embedding_probe(
+    np.savez_compressed(
+        OOF_META_CACHE,
+        oof_base=oof_base,
+        oof_prior=oof_prior,
+        fold_id=oof_fold_id,
+    )
+    print("Saved OOF meta-features to:", OOF_META_CACHE)
+baseline_oof_auc = macro_auc_skip_empty(Y_FULL, oof_base)
+if MODE == "train":
+    raw_local_auc = macro_auc_skip_empty(Y_FULL, scores_full_raw)
+    print(f"Raw local AUC (not OOF-dependent): {raw_local_auc:.6f}")
+    print(f"Honest OOF baseline AUC: {baseline_oof_auc:.6f}")
+ssm_cfg = CFG["proto_ssm"]
+print("ProtoSSMv4 architecture defined (with cross-attention).")
+test_model = ProtoSSMv2(
+    d_model=ssm_cfg["d_model"], n_ssm_layers=2,
+    n_sites=ssm_cfg["n_sites"], meta_dim=ssm_cfg["meta_dim"],
+    use_cross_attn=ssm_cfg.get("use_cross_attn", True),
+    cross_attn_heads=ssm_cfg.get("cross_attn_heads", 4),
+)
+print(f"Parameter count: {test_model.count_parameters():,}")
+del test_model
+print("ProtoSSM v4 training functions defined (with mixup, focal loss, SWA, TTA).")
+if CFG["run_probe_check"]:
+    probe_result = run_oof_embedding_probe(
+        scores_raw=scores_full_raw,
+        emb=emb_full,
+        meta_df=meta_full,
+        y_true=Y_FULL,
+        pca_dim=64,
+        min_pos=8,
+        C=0.25,
+        alpha=0.5,
+    )
+    print(f"Honest OOF baseline AUC: {probe_result['score_base']:.6f}")
+    print(f"Honest OOF embedding-probe AUC: {probe_result['score_final']:.6f}")
+    print(f"Delta: {probe_result['score_final'] - probe_result['score_base']:.6f}")
+    modeled_classes = np.where(probe_result["modeled_counts"] > 0)[0]
+    print("Modeled classes:", len(modeled_classes))
+    print([PRIMARY_LABELS[i] for i in modeled_classes[:20]])
+if CFG["run_probe_grid"]:
+    param_grid = [
+        {"pca_dim": 32, "min_pos": 8,  "C": 0.25, "alpha": 0.4},
+        {"pca_dim": 64, "min_pos": 8,  "C": 0.25, "alpha": 0.4},
+        {"pca_dim": 64, "min_pos": 8,  "C": 0.25, "alpha": 0.5},
+        {"pca_dim": 64, "min_pos": 12, "C": 0.25, "alpha": 0.4},
+        {"pca_dim": 96, "min_pos": 8,  "C": 0.25, "alpha": 0.4},
+        {"pca_dim": 64, "min_pos": 8,  "C": 0.50, "alpha": 0.4},
+    ]
+    results = []
+    for params in tqdm(param_grid, desc="Probe grid", disable=not CFG["verbose"]):
+        out = run_oof_embedding_probe(
             scores_raw=scores_full_raw,
             emb=emb_full,
             meta_df=meta_full,
             y_true=Y_FULL,
-            pca_dim=64,
-            min_pos=8,
-            C=0.25,
-            alpha=0.5,
+            pca_dim=params["pca_dim"],
+            min_pos=params["min_pos"],
+            C=params["C"],
+            alpha=params["alpha"],
         )
-        print(f"Honest OOF baseline AUC: {probe_result['score_base']:.6f}")
-        print(f"Honest OOF embedding-probe AUC: {probe_result['score_final']:.6f}")
-        print(f"Delta: {probe_result['score_final'] - probe_result['score_base']:.6f}")
-        modeled_classes = np.where(probe_result["modeled_counts"] > 0)[0]
-        print("Modeled classes:", len(modeled_classes))
-        print([PRIMARY_LABELS[i] for i in modeled_classes[:20]])
-    if CFG["run_probe_grid"]:
-        param_grid = [
-            {"pca_dim": 32, "min_pos": 8,  "C": 0.25, "alpha": 0.4},
-            {"pca_dim": 64, "min_pos": 8,  "C": 0.25, "alpha": 0.4},
-            {"pca_dim": 64, "min_pos": 8,  "C": 0.25, "alpha": 0.5},
-            {"pca_dim": 64, "min_pos": 12, "C": 0.25, "alpha": 0.4},
-            {"pca_dim": 96, "min_pos": 8,  "C": 0.25, "alpha": 0.4},
-            {"pca_dim": 64, "min_pos": 8,  "C": 0.50, "alpha": 0.4},
-        ]
-        results = []
-        for params in tqdm(param_grid, desc="Probe grid", disable=not CFG["verbose"]):
-            out = run_oof_embedding_probe(
-                scores_raw=scores_full_raw,
-                emb=emb_full,
-                meta_df=meta_full,
-                y_true=Y_FULL,
-                pca_dim=params["pca_dim"],
-                min_pos=params["min_pos"],
-                C=params["C"],
-                alpha=params["alpha"],
-            )
-            results.append({
-                **params,
-                "baseline_oof_auc": out["score_base"],
-                "probe_oof_auc": out["score_final"],
-                "delta": out["score_final"] - out["score_base"],
-                "n_modeled_classes": int((out["modeled_counts"] > 0).sum()),
-            })
-        grid_results = pd.DataFrame(results).sort_values("probe_oof_auc", ascending=False).reset_index(drop=True)
-        BEST_PROBE = {
-            "pca_dim": int(grid_results.iloc[0]["pca_dim"]),
-            "min_pos": int(grid_results.iloc[0]["min_pos"]),
-            "C": float(grid_results.iloc[0]["C"]),
-            "alpha": float(grid_results.iloc[0]["alpha"]),
-        }
-        best_probe_path = CFG["full_cache_work_dir"] / "best_probe_params.json"
-        best_probe_path.write_text(json.dumps(BEST_PROBE, indent=2))
-        print("Saved best probe params to:", best_probe_path)
-    else:
-        BEST_PROBE = CFG["frozen_best_probe"]
-        print("Using frozen BEST_PROBE in submit mode:")
-        print(BEST_PROBE)
-    if grid_results is not None:
-        grid_results.to_csv(CFG["full_cache_work_dir"] / "probe_grid_results.csv", index=False)
-    if BEST_PROBE is None:
-        BEST_PROBE = CFG["frozen_best_probe"]
-    print("Final BEST_PROBE =", BEST_PROBE)
-    if MODE == "train":
-        BEST_OOF_RESULT = run_oof_embedding_probe(
-            scores_raw=scores_full_raw,
-            emb=emb_full,
-            meta_df=meta_full,
-            y_true=Y_FULL,
-            pca_dim=int(BEST_PROBE["pca_dim"]),
-            min_pos=int(BEST_PROBE["min_pos"]),
-            C=float(BEST_PROBE["C"]),
-            alpha=float(BEST_PROBE["alpha"]),
-        )
-        print(f"Honest OOF baseline AUC (BEST_PROBE rerun): {BEST_OOF_RESULT['score_base']:.6f}")
-        print(f"Honest OOF probe AUC   (BEST_PROBE rerun): {BEST_OOF_RESULT['score_final']:.6f}")
-    final_prior_tables = fit_prior_tables(sc_clean.reset_index(drop=True), Y_SC)
-    print("Built final prior tables for inference.")
-    print("OOF baseline AUC used for stacker training:", baseline_oof_auc)
-    emb_scaler = StandardScaler()
-    emb_full_scaled = emb_scaler.fit_transform(emb_full)
-    n_comp = min(
-        int(BEST_PROBE["pca_dim"]),
-        emb_full_scaled.shape[0] - 1,
-        emb_full_scaled.shape[1]
+        results.append({
+            **params,
+            "baseline_oof_auc": out["score_base"],
+            "probe_oof_auc": out["score_final"],
+            "delta": out["score_final"] - out["score_base"],
+            "n_modeled_classes": int((out["modeled_counts"] > 0).sum()),
+        })
+    grid_results = pd.DataFrame(results).sort_values("probe_oof_auc", ascending=False).reset_index(drop=True)
+    BEST_PROBE = {
+        "pca_dim": int(grid_results.iloc[0]["pca_dim"]),
+        "min_pos": int(grid_results.iloc[0]["min_pos"]),
+        "C": float(grid_results.iloc[0]["C"]),
+        "alpha": float(grid_results.iloc[0]["alpha"]),
+    }
+    best_probe_path = CFG["full_cache_work_dir"] / "best_probe_params.json"
+    best_probe_path.write_text(json.dumps(BEST_PROBE, indent=2))
+    print("Saved best probe params to:", best_probe_path)
+else:
+    BEST_PROBE = CFG["frozen_best_probe"]
+    print("Using frozen BEST_PROBE in submit mode:")
+    print(BEST_PROBE)
+if grid_results is not None:
+    grid_results.to_csv(CFG["full_cache_work_dir"] / "probe_grid_results.csv", index=False)
+if BEST_PROBE is None:
+    BEST_PROBE = CFG["frozen_best_probe"]
+print("Final BEST_PROBE =", BEST_PROBE)
+if MODE == "train":
+    BEST_OOF_RESULT = run_oof_embedding_probe(
+        scores_raw=scores_full_raw,
+        emb=emb_full,
+        meta_df=meta_full,
+        y_true=Y_FULL,
+        pca_dim=int(BEST_PROBE["pca_dim"]),
+        min_pos=int(BEST_PROBE["min_pos"]),
+        C=float(BEST_PROBE["C"]),
+        alpha=float(BEST_PROBE["alpha"]),
     )
-    emb_pca = PCA(n_components=n_comp)
-    Z_FULL = emb_pca.fit_transform(emb_full_scaled).astype(np.float32)
-    print("emb_full:", emb_full.shape)
-    print("Z_FULL:", Z_FULL.shape)
-    print("Explained variance ratio sum:", emb_pca.explained_variance_ratio_.sum())
-    emb_files, file_list = reshape_to_files(emb_full, meta_full)
-    logits_files, _ = reshape_to_files(scores_full_raw, meta_full)
-    labels_files, _ = reshape_to_files(Y_FULL, meta_full)
-    print(f"Reshaped to file-level: emb={emb_files.shape}, logits={logits_files.shape}, labels={labels_files.shape}")
-    print(f"Files: {len(file_list)}")
-    n_families, class_to_family, fam_to_idx = build_taxonomy_groups(taxonomy, PRIMARY_LABELS)
-    print(f"Taxonomic groups: {n_families}")
-    site_to_idx, n_sites_mapped = build_site_mapping(meta_full)
-    n_sites_cfg = CFG["proto_ssm"]["n_sites"]
-    print(f"Sites mapped: {n_sites_mapped} (capped to {n_sites_cfg})")
-    site_ids_all, hours_all = get_file_metadata(meta_full, file_list, site_to_idx, n_sites_cfg)
-    file_families = np.zeros((len(file_list), n_families), dtype=np.float32)
-    for fi in range(len(file_list)):
-        active_classes = np.where(labels_files[fi].sum(axis=0) > 0)[0]
-        for ci in active_classes:
-            file_families[fi, class_to_family[ci]] = 1.0
-    if MODE == "train":
-        file_groups = np.array([f.split("_")[3] if len(f.split("_")) > 3 else f for f in file_list])
-        print(f"File groups for OOF: {len(set(file_groups))} unique groups: {sorted(set(file_groups))}")
-        t0_oof = time.time()
-        oof_proto_preds, fold_histories, fold_alphas = run_proto_ssm_oof(
-            emb_files, logits_files, labels_files,
-            site_ids_all, hours_all,
-            file_families, file_groups,
-            n_families, class_to_family,
-            cfg=CFG["proto_ssm_train"],
-            verbose=CFG["verbose"],
-        )
-        oof_time = time.time() - t0_oof
-        print(f"\nOOF cross-validation time: {oof_time:.1f}s")
-        oof_proto_flat = oof_proto_preds.reshape(-1, N_CLASSES)
-        y_flat = labels_files.reshape(-1, N_CLASSES).astype(np.float32)
-        per_class_auc_proto = {}
-        for ci in range(N_CLASSES):
-            if y_flat[:, ci].sum() > 0 and y_flat[:, ci].sum() < len(y_flat):
-                try:
-                    per_class_auc_proto[ci] = roc_auc_score(y_flat[:, ci], oof_proto_flat[:, ci])
-                except Exception:
-                    pass
-        overall_oof_auc_proto = macro_auc_skip_empty(y_flat, oof_proto_flat)
-        print(f"ProtoSSM OOF macro AUC: {overall_oof_auc_proto:.4f}")
-        LOGS["oof_auc_proto"] = overall_oof_auc_proto
-        LOGS["per_class_auc_proto"] = {PRIMARY_LABELS[k]: v for k, v in per_class_auc_proto.items()}
-        LOGS["oof_time"] = oof_time
-    else:
-        print("Submit mode: skipping OOF cross-validation")
-    ssm_cfg = CFG["proto_ssm"]
-    model = ProtoSSMv2(
-        d_input=emb_full.shape[1],
-        d_model=ssm_cfg["d_model"],
-        d_state=ssm_cfg["d_state"],
-        n_ssm_layers=ssm_cfg["n_ssm_layers"],
-        n_classes=N_CLASSES,
-        n_windows=N_WINDOWS,
-        dropout=ssm_cfg["dropout"],
-        n_sites=ssm_cfg["n_sites"],
-        meta_dim=ssm_cfg["meta_dim"],
-        use_cross_attn=ssm_cfg.get("use_cross_attn", True),
-        cross_attn_heads=ssm_cfg.get("cross_attn_heads", 4),
-    ).to(DEVICE)
-    emb_flat_tensor = torch.tensor(emb_full, dtype=torch.float32)
-    labels_flat_tensor = torch.tensor(Y_FULL, dtype=torch.float32)
-    model.init_prototypes_from_data(emb_flat_tensor, labels_flat_tensor)
-    model.init_family_head(n_families, class_to_family)
-    print(f"\nProtoSSM v4 parameters: {model.count_parameters():,}")
-    t0_final = time.time()
-    model, train_history = train_proto_ssm_single(
-        model,
-        emb_files, logits_files, labels_files.astype(np.float32),
-        site_ids_train=site_ids_all, hours_train=hours_all,
+    print(f"Honest OOF baseline AUC (BEST_PROBE rerun): {BEST_OOF_RESULT['score_base']:.6f}")
+    print(f"Honest OOF probe AUC   (BEST_PROBE rerun): {BEST_OOF_RESULT['score_final']:.6f}")
+final_prior_tables = fit_prior_tables(sc_clean.reset_index(drop=True), Y_SC)
+print("Built final prior tables for inference.")
+print("OOF baseline AUC used for stacker training:", baseline_oof_auc)
+emb_scaler = StandardScaler()
+emb_full_scaled = emb_scaler.fit_transform(emb_full)
+n_comp = min(
+    int(BEST_PROBE["pca_dim"]),
+    emb_full_scaled.shape[0] - 1,
+    emb_full_scaled.shape[1]
+)
+emb_pca = PCA(n_components=n_comp)
+Z_FULL = emb_pca.fit_transform(emb_full_scaled).astype(np.float32)
+print("emb_full:", emb_full.shape)
+print("Z_FULL:", Z_FULL.shape)
+print("Explained variance ratio sum:", emb_pca.explained_variance_ratio_.sum())
+emb_files, file_list = reshape_to_files(emb_full, meta_full)
+logits_files, _ = reshape_to_files(scores_full_raw, meta_full)
+labels_files, _ = reshape_to_files(Y_FULL, meta_full)
+print(f"Reshaped to file-level: emb={emb_files.shape}, logits={logits_files.shape}, labels={labels_files.shape}")
+print(f"Files: {len(file_list)}")
+n_families, class_to_family, fam_to_idx = build_taxonomy_groups(taxonomy, PRIMARY_LABELS)
+print(f"Taxonomic groups: {n_families}")
+site_to_idx, n_sites_mapped = build_site_mapping(meta_full)
+n_sites_cfg = CFG["proto_ssm"]["n_sites"]
+print(f"Sites mapped: {n_sites_mapped} (capped to {n_sites_cfg})")
+site_ids_all, hours_all = get_file_metadata(meta_full, file_list, site_to_idx, n_sites_cfg)
+file_families = np.zeros((len(file_list), n_families), dtype=np.float32)
+for fi in range(len(file_list)):
+    active_classes = np.where(labels_files[fi].sum(axis=0) > 0)[0]
+    for ci in active_classes:
+        file_families[fi, class_to_family[ci]] = 1.0
+if MODE == "train":
+    file_groups = np.array([f.split("_")[3] if len(f.split("_")) > 3 else f for f in file_list])
+    print(f"File groups for OOF: {len(set(file_groups))} unique groups: {sorted(set(file_groups))}")
+    t0_oof = time.time()
+    oof_proto_preds, fold_histories, fold_alphas = run_proto_ssm_oof(
+        emb_files, logits_files, labels_files,
+        site_ids_all, hours_all,
+        file_families, file_groups,
+        n_families, class_to_family,
         cfg=CFG["proto_ssm_train"],
-        verbose=True,
+        verbose=CFG["verbose"],
     )
-    train_time = time.time() - t0_final
-    print(f"Final model training time: {train_time:.1f}s")
-    with torch.no_grad():
-        final_alphas = torch.sigmoid(model.fusion_alpha).numpy()
-        print(f"Fusion alpha: mean={final_alphas.mean():.4f} min={final_alphas.min():.4f} max={final_alphas.max():.4f}")
-    PROBE_CLASS_IDX = np.where(Y_FULL.sum(axis=0) >= int(CFG["frozen_best_probe"]["min_pos"]))[0].astype(np.int32)
-    probe_models = {}
-    for cls_idx in tqdm(PROBE_CLASS_IDX, desc="Training MLP probes", disable=not CFG["verbose"]):
-        y = Y_FULL[:, cls_idx]
-        if y.sum() == 0 or y.sum() == len(y):
-            continue
+    oof_time = time.time() - t0_oof
+    print(f"\nOOF cross-validation time: {oof_time:.1f}s")
+    oof_proto_flat = oof_proto_preds.reshape(-1, N_CLASSES)
+    y_flat = labels_files.reshape(-1, N_CLASSES).astype(np.float32)
+    per_class_auc_proto = {}
+    for ci in range(N_CLASSES):
+        if y_flat[:, ci].sum() > 0 and y_flat[:, ci].sum() < len(y_flat):
+            try:
+                per_class_auc_proto[ci] = roc_auc_score(y_flat[:, ci], oof_proto_flat[:, ci])
+            except Exception:
+                pass
+    overall_oof_auc_proto = macro_auc_skip_empty(y_flat, oof_proto_flat)
+    print(f"ProtoSSM OOF macro AUC: {overall_oof_auc_proto:.4f}")
+    LOGS["oof_auc_proto"] = overall_oof_auc_proto
+    LOGS["per_class_auc_proto"] = {PRIMARY_LABELS[k]: v for k, v in per_class_auc_proto.items()}
+    LOGS["oof_time"] = oof_time
+else:
+    print("Submit mode: skipping OOF cross-validation")
+ssm_cfg = CFG["proto_ssm"]
+model = ProtoSSMv2(
+    d_input=emb_full.shape[1],
+    d_model=ssm_cfg["d_model"],
+    d_state=ssm_cfg["d_state"],
+    n_ssm_layers=ssm_cfg["n_ssm_layers"],
+    n_classes=N_CLASSES,
+    n_windows=N_WINDOWS,
+    dropout=ssm_cfg["dropout"],
+    n_sites=ssm_cfg["n_sites"],
+    meta_dim=ssm_cfg["meta_dim"],
+    use_cross_attn=ssm_cfg.get("use_cross_attn", True),
+    cross_attn_heads=ssm_cfg.get("cross_attn_heads", 4),
+).to(DEVICE)
+emb_flat_tensor = torch.tensor(emb_full, dtype=torch.float32)
+labels_flat_tensor = torch.tensor(Y_FULL, dtype=torch.float32)
+model.init_prototypes_from_data(emb_flat_tensor, labels_flat_tensor)
+model.init_family_head(n_families, class_to_family)
+print(f"\nProtoSSM v4 parameters: {model.count_parameters():,}")
+t0_final = time.time()
+model, train_history = train_proto_ssm_single(
+    model,
+    emb_files, logits_files, labels_files.astype(np.float32),
+    site_ids_train=site_ids_all, hours_train=hours_all,
+    cfg=CFG["proto_ssm_train"],
+    verbose=True,
+)
+train_time = time.time() - t0_final
+print(f"Final model training time: {train_time:.1f}s")
+with torch.no_grad():
+    final_alphas = torch.sigmoid(model.fusion_alpha).numpy()
+    print(f"Fusion alpha: mean={final_alphas.mean():.4f} min={final_alphas.min():.4f} max={final_alphas.max():.4f}")
+PROBE_CLASS_IDX = np.where(Y_FULL.sum(axis=0) >= int(CFG["frozen_best_probe"]["min_pos"]))[0].astype(np.int32)
+probe_models = {}
+for cls_idx in tqdm(PROBE_CLASS_IDX, desc="Training MLP probes", disable=not CFG["verbose"]):
+    y = Y_FULL[:, cls_idx]
+    if y.sum() == 0 or y.sum() == len(y):
+        continue
+    X_cls = build_class_features(
+        Z_FULL,
+        raw_col=scores_full_raw[:, cls_idx],
+        prior_col=oof_prior[:, cls_idx],
+        base_col=oof_base[:, cls_idx],
+    )
+    n_pos = int(y.sum())
+    n_neg = len(y) - n_pos
+    if n_pos > 0 and n_neg > n_pos:
+        repeat = max(1, n_neg // n_pos)
+        pos_idx = np.where(y == 1)[0]
+        X_bal = np.vstack([X_cls, np.tile(X_cls[pos_idx], (repeat, 1))])
+        y_bal = np.concatenate([y, np.ones(len(pos_idx) * repeat, dtype=y.dtype)])
+    else:
+        X_bal, y_bal = X_cls, y
+    clf = MLPClassifier(**CFG["mlp_params"])
+    clf.fit(X_bal, y_bal)
+    probe_models[cls_idx] = clf
+print(f"MLP probes trained: {len(probe_models)}")
+if MODE == "train" and oof_proto_flat is not None:
+    oof_mlp_flat = oof_base.copy()
+    for cls_idx, clf in probe_models.items():
         X_cls = build_class_features(
             Z_FULL,
             raw_col=scores_full_raw[:, cls_idx],
             prior_col=oof_prior[:, cls_idx],
             base_col=oof_base[:, cls_idx],
         )
-        n_pos = int(y.sum())
-        n_neg = len(y) - n_pos
-        if n_pos > 0 and n_neg > n_pos:
-            repeat = max(1, n_neg // n_pos)
-            pos_idx = np.where(y == 1)[0]
-            X_bal = np.vstack([X_cls, np.tile(X_cls[pos_idx], (repeat, 1))])
-            y_bal = np.concatenate([y, np.ones(len(pos_idx) * repeat, dtype=y.dtype)])
+        if hasattr(clf, "predict_proba"):
+            prob = clf.predict_proba(X_cls)[:, 1].astype(np.float32)
+            pred = np.log(prob + 1e-7) - np.log(1 - prob + 1e-7)
         else:
-            X_bal, y_bal = X_cls, y
-        clf = MLPClassifier(**CFG["mlp_params"])
-        clf.fit(X_bal, y_bal)
-        probe_models[cls_idx] = clf
-    print(f"MLP probes trained: {len(probe_models)}")
-    if MODE == "train" and oof_proto_flat is not None:
-        oof_mlp_flat = oof_base.copy()
-        for cls_idx, clf in probe_models.items():
-            X_cls = build_class_features(
-                Z_FULL,
-                raw_col=scores_full_raw[:, cls_idx],
-                prior_col=oof_prior[:, cls_idx],
-                base_col=oof_base[:, cls_idx],
-            )
-            if hasattr(clf, "predict_proba"):
-                prob = clf.predict_proba(X_cls)[:, 1].astype(np.float32)
-                pred = np.log(prob + 1e-7) - np.log(1 - prob + 1e-7)
-            else:
-                pred = clf.decision_function(X_cls).astype(np.float32)
-            alpha_probe = float(CFG["frozen_best_probe"]["alpha"])
-            oof_mlp_flat[:, cls_idx] = (1.0 - alpha_probe) * oof_base[:, cls_idx] + alpha_probe * pred
-        y_flat = labels_files.reshape(-1, N_CLASSES).astype(np.float32)
-        best_w, best_auc, weight_results = optimize_ensemble_weight(oof_proto_flat, oof_mlp_flat, y_flat)
-        ENSEMBLE_WEIGHT_PROTO = best_w
-        mlp_only_auc = macro_auc_skip_empty(y_flat, oof_mlp_flat)
-        print(f"\n=== Ensemble Optimization ===")
-        print(f"Best ProtoSSM weight: {ENSEMBLE_WEIGHT_PROTO:.2f}")
-        print(f"Best ensemble OOF AUC: {best_auc:.4f}")
-        print(f"MLP-only OOF AUC: {mlp_only_auc:.4f}")
-        for w, auc in weight_results:
-            marker = " <-- best" if abs(w - best_w) < 0.01 else ""
-            print(f"  w={w:.2f}: AUC={auc:.4f}{marker}")
-        LOGS["ensemble_weight"] = ENSEMBLE_WEIGHT_PROTO
-        LOGS["ensemble_auc"] = best_auc
-        LOGS["mlp_only_auc"] = mlp_only_auc
-    else:
-        print(f"\nUsing default ensemble weight: ProtoSSM={ENSEMBLE_WEIGHT_PROTO:.2f}")
-    LOGS["train_time_final"] = train_time
-    LOGS["n_probe_models"] = len(probe_models)
-    if fold_alphas:
-        mean_alphas = np.stack(fold_alphas).mean(axis=0)
-        print(f"\nFusion alpha (mean across folds):")
-        print(f"  ProtoSSM-dominant (alpha>0.5): {(mean_alphas > 0.5).sum()} classes")
-        print(f"  Perch-dominant (alpha<=0.5): {(mean_alphas <= 0.5).sum()} classes")
-    _wall_min = (time.time() - _WALL_START) / 60.0
-    print(f"Wall time: {_wall_min:.1f} min")
-    if ResidualSSM_PATH is not None:
-        print("Loading pretrained ResidualSSM...")
-        load_res_path = CFG.get("pretrained_residual_path", ResidualSSM_PATH)
-        if os.path.exists(load_res_path):
-            res_cfg = CFG["residual_ssm"]
-            res_model = ResidualSSM(
-                d_input=emb_full.shape[1],
-                d_scores=N_CLASSES,
-                d_model=res_cfg["d_model"],
-                d_state=res_cfg["d_state"],
-                n_classes=N_CLASSES,
-                n_windows=N_WINDOWS,
-                dropout=res_cfg["dropout"],
-                n_sites=CFG["proto_ssm"]["n_sites"],
-                meta_dim=8,
-            ).to(DEVICE)
-            res_model.load_state_dict(torch.load(load_res_path, map_location=DEVICE))
-            res_model.eval()
-            CORRECTION_WEIGHT = res_cfg["correction_weight"]
-            print(f"▶ [Load] Loaded ResidualSSM from {load_res_path}")
-            LOGS["residual_ssm"] = {"skipped": False, "mode": "submit", "loaded_from": load_res_path}
-        else:
-            print(f"⚠️ WARNING: Pre-trained ResidualSSM not found at {load_res_path}. Skipping correction.")
-            LOGS["residual_ssm"] = {"skipped": True, "mode": "submit", "reason": "weights_not_found"}
-    elif _wall_min < 120.0:
-        print("───────────────────────────────────")
-        print("────▶▶▶Training ResidualSSM...")
-        print("───────────────────────────────────")
-        model.eval()
-        with torch.no_grad():
-            emb_train_t = torch.tensor(emb_files, dtype=torch.float32)
-            logits_train_t = torch.tensor(logits_files, dtype=torch.float32)
-            site_train_t = torch.tensor(site_ids_all, dtype=torch.long)
-            hour_train_t = torch.tensor(hours_all, dtype=torch.long)
-            proto_train_out, _, _ = model(emb_train_t, logits_train_t,
-                                           site_ids=site_train_t, hours=hour_train_t)
-            proto_train_scores = proto_train_out.numpy()
-        mlp_train_scores_flat = np.zeros_like(scores_full_raw, dtype=np.float32)
-        train_base_scores, train_prior_scores = fuse_scores_with_tables(
-            scores_full_raw,
-            sites=meta_full["site"].to_numpy(),
-            hours=meta_full["hour_utc"].to_numpy(),
-            tables=final_prior_tables,
-        )
-        mlp_train_scores_flat = train_base_scores.copy()
-        alpha_p = float(CFG["frozen_best_probe"]["alpha"])
-        mlp_train_scores_flat = get_vectorized_mlp_scores(
-            Z_FULL, scores_full_raw, train_prior_scores, train_base_scores,
-            probe_models, alpha_p, n_windows=N_WINDOWS, device=DEVICE
-        )
-        mlp_train_scores_files, _ = reshape_to_files(mlp_train_scores_flat, meta_full)
-        first_pass_files = (
-            ENSEMBLE_WEIGHT_PROTO * proto_train_scores +
-            (1 - ENSEMBLE_WEIGHT_PROTO) * mlp_train_scores_files
-        ).astype(np.float32)
-        labels_float = labels_files.astype(np.float32)
-        first_pass_probs = 1.0 / (1.0 + np.exp(-first_pass_files))
-        residuals = labels_float - first_pass_probs
-        print(f"First-pass training scores: {first_pass_files.shape}")
-        print(f"Residuals: mean={residuals.mean():.4f}, std={residuals.std():.4f}, "
-              f"abs_mean={np.abs(residuals).mean():.4f}")
+            pred = clf.decision_function(X_cls).astype(np.float32)
+        alpha_probe = float(CFG["frozen_best_probe"]["alpha"])
+        oof_mlp_flat[:, cls_idx] = (1.0 - alpha_probe) * oof_base[:, cls_idx] + alpha_probe * pred
+    y_flat = labels_files.reshape(-1, N_CLASSES).astype(np.float32)
+    best_w, best_auc, weight_results = optimize_ensemble_weight(oof_proto_flat, oof_mlp_flat, y_flat)
+    ENSEMBLE_WEIGHT_PROTO = best_w
+    mlp_only_auc = macro_auc_skip_empty(y_flat, oof_mlp_flat)
+    print(f"\n=== Ensemble Optimization ===")
+    print(f"Best ProtoSSM weight: {ENSEMBLE_WEIGHT_PROTO:.2f}")
+    print(f"Best ensemble OOF AUC: {best_auc:.4f}")
+    print(f"MLP-only OOF AUC: {mlp_only_auc:.4f}")
+    for w, auc in weight_results:
+        marker = " <-- best" if abs(w - best_w) < 0.01 else ""
+        print(f"  w={w:.2f}: AUC={auc:.4f}{marker}")
+    LOGS["ensemble_weight"] = ENSEMBLE_WEIGHT_PROTO
+    LOGS["ensemble_auc"] = best_auc
+    LOGS["mlp_only_auc"] = mlp_only_auc
+else:
+    print(f"\nUsing default ensemble weight: ProtoSSM={ENSEMBLE_WEIGHT_PROTO:.2f}")
+LOGS["train_time_final"] = train_time
+LOGS["n_probe_models"] = len(probe_models)
+if fold_alphas:
+    mean_alphas = np.stack(fold_alphas).mean(axis=0)
+    print(f"\nFusion alpha (mean across folds):")
+    print(f"  ProtoSSM-dominant (alpha>0.5): {(mean_alphas > 0.5).sum()} classes")
+    print(f"  Perch-dominant (alpha<=0.5): {(mean_alphas <= 0.5).sum()} classes")
+_wall_min = (time.time() - _WALL_START) / 60.0
+print(f"Wall time: {_wall_min:.1f} min")
+if ResidualSSM_PATH is not None:
+    print("Loading pretrained ResidualSSM...")
+    load_res_path = CFG.get("pretrained_residual_path", ResidualSSM_PATH)
+    if os.path.exists(load_res_path):
         res_cfg = CFG["residual_ssm"]
         res_model = ResidualSSM(
             d_input=emb_full.shape[1],
@@ -2529,337 +2360,472 @@ for EXPERIMENT_PRESET in PRESET_RUN_LIST:
             n_sites=CFG["proto_ssm"]["n_sites"],
             meta_dim=8,
         ).to(DEVICE)
-        print(f"ResidualSSM parameters: {res_model.count_parameters():,}")
-        n_files = len(file_list)
-        n_val = max(1, int(n_files * 0.15))
-        perm = torch.randperm(n_files, generator=torch.Generator().manual_seed(123))
-        val_i = perm[:n_val].numpy()
-        train_i = perm[n_val:].numpy()
-        emb_tr = torch.tensor(emb_files[train_i], dtype=torch.float32)
-        fp_tr = torch.tensor(first_pass_files[train_i], dtype=torch.float32)
-        res_tr = torch.tensor(residuals[train_i], dtype=torch.float32)
-        site_tr = torch.tensor(site_ids_all[train_i], dtype=torch.long)
-        hour_tr = torch.tensor(hours_all[train_i], dtype=torch.long)
-        emb_va = torch.tensor(emb_files[val_i], dtype=torch.float32)
-        fp_va = torch.tensor(first_pass_files[val_i], dtype=torch.float32)
-        res_va = torch.tensor(residuals[val_i], dtype=torch.float32)
-        site_va = torch.tensor(site_ids_all[val_i], dtype=torch.long)
-        hour_va = torch.tensor(hours_all[val_i], dtype=torch.long)
-        optimizer = torch.optim.AdamW(res_model.parameters(), lr=res_cfg["lr"], weight_decay=1e-3)
-        scheduler = torch.optim.lr_scheduler.OneCycleLR(
-            optimizer, max_lr=res_cfg["lr"],
-            epochs=res_cfg["n_epochs"], steps_per_epoch=1,
-            pct_start=0.1, anneal_strategy='cos'
-        )
-        best_val_loss = float('inf')
-        best_state = None
-        wait = 0
-        t0_res = time.time()
-        for epoch in range(res_cfg["n_epochs"]):
-            res_model.train()
-            correction = res_model(emb_tr, fp_tr, site_ids=site_tr, hours=hour_tr)
-            loss = F.mse_loss(correction, res_tr)
-            optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(res_model.parameters(), 1.0)
-            optimizer.step()
-            scheduler.step()
-            res_model.eval()
-            with torch.no_grad():
-                val_corr = res_model(emb_va, fp_va, site_ids=site_va, hours=hour_va)
-                val_loss = F.mse_loss(val_corr, res_va)
-            if val_loss.item() < best_val_loss:
-                best_val_loss = val_loss.item()
-                best_state = {k: v.clone() for k, v in res_model.state_dict().items()}
-                wait = 0
-            else:
-                wait += 1
-            if (epoch + 1) % 20 == 0:
-                print(f"  ResidualSSM epoch {epoch+1}: train={loss.item():.6f} val={val_loss.item():.6f} wait={wait}")
-            if wait >= res_cfg["patience"]:
-                print(f"  ResidualSSM early stop at epoch {epoch+1}")
-                break
-        if best_state is not None:
-            res_model.load_state_dict(best_state)
-        res_time = time.time() - t0_res
-        print(f"ResidualSSM training time: {res_time:.1f}s")
-        print(f"Best val MSE: {best_val_loss:.6f}")
-        save_res_path = CFG.get("residual_model_path", "ResidualSSM/models/residual_ssm_best.pt")
-        os.makedirs(os.path.dirname(save_res_path) or ".", exist_ok=True)
-        torch.save(res_model.state_dict(), save_res_path)
-        print(f"▶ [Save] Saved best ResidualSSM model to {save_res_path}")
+        res_model.load_state_dict(torch.load(load_res_path, map_location=DEVICE))
         res_model.eval()
-        with torch.no_grad():
-            all_corr = res_model(emb_train_t, torch.tensor(first_pass_files, dtype=torch.float32),
-                                 site_ids=site_train_t, hours=hour_train_t)
-            corr_np = all_corr.numpy()
-            print(f"Correction magnitude: mean_abs={np.abs(corr_np).mean():.4f}, max={np.abs(corr_np).max():.4f}")
         CORRECTION_WEIGHT = res_cfg["correction_weight"]
-        print(f"Correction weight: {CORRECTION_WEIGHT}")
-        LOGS["residual_ssm"] = {
-            "params": res_model.count_parameters(),
-            "train_time": res_time,
-            "best_val_mse": best_val_loss,
-            "correction_mean_abs": float(np.abs(corr_np).mean()),
-            "correction_weight": CORRECTION_WEIGHT,
-        }
+        print(f"▶ [Load] Loaded ResidualSSM from {load_res_path}")
+        LOGS["residual_ssm"] = {"skipped": False, "mode": "submit", "loaded_from": load_res_path}
     else:
-        print("SKIPPED ResidualSSM (wall time safety)")
-        LOGS["residual_ssm"] = {"skipped": True, "wall_min": _wall_min}
-    if MODE == "train":
-        if grid_results is not None:
-            best_row = grid_results.iloc[0]
-            print(f"Best honest OOF probe AUC: {best_row['probe_oof_auc']:.6f}")
-            print(f"Delta over honest OOF baseline: {best_row['delta']:.6f}")
-    else:
-        print("Skipping train diagnostics in submit mode.")
-    test_paths = sorted((BASE / "test_soundscapes").glob("*.ogg"))
-    if len(test_paths) == 0:
-        print(f"Hidden test not mounted. Dry-run on first {CFG['dryrun_n_files']} train soundscapes.")
-        test_paths = sorted((BASE / "train_soundscapes").glob("*.ogg"))[:CFG["dryrun_n_files"]]
-    else:
-        print(f"Hidden test files: {len(test_paths)}")
-    meta_test, scores_test_raw, emb_test = infer_perch_with_embeddings(
-        test_paths,
-        batch_files=CFG["batch_files"],
-        verbose=CFG["verbose"],
-        proxy_reduce=CFG["proxy_reduce"],
-    )
-    print(f"proxy_reduce used for test inference: {CFG['proxy_reduce']!r}")
-    print("meta_test:", meta_test.shape)
-    print("scores_test_raw:", scores_test_raw.shape)
-    print("emb_test:", emb_test.shape)
-    emb_test_files, test_file_list = reshape_to_files(emb_test, meta_test)
-    logits_test_files, _ = reshape_to_files(scores_test_raw, meta_test)
-    test_site_ids, test_hours = get_file_metadata(meta_test, test_file_list, site_to_idx, CFG["proto_ssm"]["n_sites"])
-    emb_test_tensor = torch.tensor(emb_test_files, dtype=torch.float32)
-    logits_test_tensor = torch.tensor(logits_test_files, dtype=torch.float32)
-    test_site_tensor = torch.tensor(test_site_ids, dtype=torch.long)
-    test_hour_tensor = torch.tensor(test_hours, dtype=torch.long)
+        print(f"⚠️ WARNING: Pre-trained ResidualSSM not found at {load_res_path}. Skipping correction.")
+        LOGS["residual_ssm"] = {"skipped": True, "mode": "submit", "reason": "weights_not_found"}
+elif _wall_min < 120.0:
+    print("───────────────────────────────────")
+    print("────▶▶▶Training ResidualSSM...")
+    print("───────────────────────────────────")
     model.eval()
-    tta_shifts = CFG.get("tta_shifts", [0])
-    if len(tta_shifts) > 1:
-        print(f"Running TTA with shifts: {tta_shifts}")
-        proto_scores = temporal_shift_tta(
-            emb_test_files, logits_test_files, model,
-            test_site_ids, test_hours, shifts=tta_shifts
-        )
-    else:
-        with torch.no_grad():
-            proto_out, _, h_test = model(emb_test_tensor, logits_test_tensor,
-                                          site_ids=test_site_tensor, hours=test_hour_tensor)
-            proto_scores = proto_out.numpy()
-    proto_scores_flat = proto_scores.reshape(-1, N_CLASSES).astype(np.float32)
-    print(f"ProtoSSM v4 test scores: {proto_scores_flat.shape}")
-    print(f"Score range: {proto_scores_flat.min():.3f} to {proto_scores_flat.max():.3f}")
-    test_base_scores, test_prior_scores = fuse_scores_with_tables(
-        scores_test_raw,
-        sites=meta_test["site"].to_numpy(),
-        hours=meta_test["hour_utc"].to_numpy(),
+    with torch.no_grad():
+        emb_train_t = torch.tensor(emb_files, dtype=torch.float32)
+        logits_train_t = torch.tensor(logits_files, dtype=torch.float32)
+        site_train_t = torch.tensor(site_ids_all, dtype=torch.long)
+        hour_train_t = torch.tensor(hours_all, dtype=torch.long)
+        proto_train_out, _, _ = model(emb_train_t, logits_train_t,
+                                        site_ids=site_train_t, hours=hour_train_t)
+        proto_train_scores = proto_train_out.numpy()
+    mlp_train_scores_flat = np.zeros_like(scores_full_raw, dtype=np.float32)
+    train_base_scores, train_prior_scores = fuse_scores_with_tables(
+        scores_full_raw,
+        sites=meta_full["site"].to_numpy(),
+        hours=meta_full["hour_utc"].to_numpy(),
         tables=final_prior_tables,
     )
-    emb_test_scaled = emb_scaler.transform(emb_test)
-    Z_TEST = emb_pca.transform(emb_test_scaled).astype(np.float32)
-    mlp_scores = test_base_scores.copy()
+    mlp_train_scores_flat = train_base_scores.copy()
     alpha_p = float(CFG["frozen_best_probe"]["alpha"])
-    mlp_scores = get_vectorized_mlp_scores(
-        Z_TEST, scores_test_raw, test_prior_scores, test_base_scores,
+    mlp_train_scores_flat = get_vectorized_mlp_scores(
+        Z_FULL, scores_full_raw, train_prior_scores, train_base_scores,
         probe_models, alpha_p, n_windows=N_WINDOWS, device=DEVICE
     )
-    print(f"\nUsing OOF-optimized ensemble weight: {ENSEMBLE_WEIGHT_PROTO:.2f}")
-    final_test_scores = (
-        ENSEMBLE_WEIGHT_PROTO * proto_scores_flat +
-        (1.0 - ENSEMBLE_WEIGHT_PROTO) * mlp_scores
+    mlp_train_scores_files, _ = reshape_to_files(mlp_train_scores_flat, meta_full)
+    first_pass_files = (
+        ENSEMBLE_WEIGHT_PROTO * proto_train_scores +
+        (1 - ENSEMBLE_WEIGHT_PROTO) * mlp_train_scores_files
     ).astype(np.float32)
-    if res_model is not None and CORRECTION_WEIGHT > 0:
-        first_pass_test_files, _ = reshape_to_files(final_test_scores, meta_test)
-        first_pass_test_t = torch.tensor(first_pass_test_files, dtype=torch.float32)
+    labels_float = labels_files.astype(np.float32)
+    first_pass_probs = 1.0 / (1.0 + np.exp(-first_pass_files))
+    residuals = labels_float - first_pass_probs
+    print(f"First-pass training scores: {first_pass_files.shape}")
+    print(f"Residuals: mean={residuals.mean():.4f}, std={residuals.std():.4f}, "
+            f"abs_mean={np.abs(residuals).mean():.4f}")
+    res_cfg = CFG["residual_ssm"]
+    res_model = ResidualSSM(
+        d_input=emb_full.shape[1],
+        d_scores=N_CLASSES,
+        d_model=res_cfg["d_model"],
+        d_state=res_cfg["d_state"],
+        n_classes=N_CLASSES,
+        n_windows=N_WINDOWS,
+        dropout=res_cfg["dropout"],
+        n_sites=CFG["proto_ssm"]["n_sites"],
+        meta_dim=8,
+    ).to(DEVICE)
+    print(f"ResidualSSM parameters: {res_model.count_parameters():,}")
+    n_files = len(file_list)
+    n_val = max(1, int(n_files * 0.15))
+    perm = torch.randperm(n_files, generator=torch.Generator().manual_seed(123))
+    val_i = perm[:n_val].numpy()
+    train_i = perm[n_val:].numpy()
+    emb_tr = torch.tensor(emb_files[train_i], dtype=torch.float32)
+    fp_tr = torch.tensor(first_pass_files[train_i], dtype=torch.float32)
+    res_tr = torch.tensor(residuals[train_i], dtype=torch.float32)
+    site_tr = torch.tensor(site_ids_all[train_i], dtype=torch.long)
+    hour_tr = torch.tensor(hours_all[train_i], dtype=torch.long)
+    emb_va = torch.tensor(emb_files[val_i], dtype=torch.float32)
+    fp_va = torch.tensor(first_pass_files[val_i], dtype=torch.float32)
+    res_va = torch.tensor(residuals[val_i], dtype=torch.float32)
+    site_va = torch.tensor(site_ids_all[val_i], dtype=torch.long)
+    hour_va = torch.tensor(hours_all[val_i], dtype=torch.long)
+    optimizer = torch.optim.AdamW(res_model.parameters(), lr=res_cfg["lr"], weight_decay=1e-3)
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer, max_lr=res_cfg["lr"],
+        epochs=res_cfg["n_epochs"], steps_per_epoch=1,
+        pct_start=0.1, anneal_strategy='cos'
+    )
+    best_val_loss = float('inf')
+    best_state = None
+    wait = 0
+    t0_res = time.time()
+    for epoch in range(res_cfg["n_epochs"]):
+        res_model.train()
+        correction = res_model(emb_tr, fp_tr, site_ids=site_tr, hours=hour_tr)
+        loss = F.mse_loss(correction, res_tr)
+        optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(res_model.parameters(), 1.0)
+        optimizer.step()
+        scheduler.step()
         res_model.eval()
         with torch.no_grad():
-            test_correction = res_model(
-                emb_test_tensor, first_pass_test_t,
-                site_ids=test_site_tensor, hours=test_hour_tensor
-            ).numpy()
-        test_correction_flat = test_correction.reshape(-1, N_CLASSES).astype(np.float32)
-        print(f"\nResidual correction: mean_abs={np.abs(test_correction_flat).mean():.4f}, "
-              f"max={np.abs(test_correction_flat).max():.4f}")
-        final_test_scores = final_test_scores + CORRECTION_WEIGHT * test_correction_flat
-        print(f"Final scores (after residual): range [{final_test_scores.min():.3f}, {final_test_scores.max():.3f}]")
-    else:
-        print("\nResidual correction: SKIPPED")
-    print(f"Final scores: {final_test_scores.shape}")
-    test_logs = {}
-    window_scores = proto_scores.reshape(-1, N_WINDOWS, N_CLASSES).mean(axis=(0, 2))
-    test_logs["window_position_scores"] = window_scores.tolist()
-    print(f"\nWindow position mean scores: {[f'{s:.3f}' for s in window_scores]}")
-    if hasattr(model, 'class_to_family'):
-        taxon_scores = defaultdict(list)
-        idx_to_fam = {v: k for k, v in fam_to_idx.items()}
-        for ci in range(N_CLASSES):
-            fam_idx = class_to_family[ci]
-            fam_name = idx_to_fam.get(fam_idx, f"group_{fam_idx}")
-            taxon_scores[fam_name].append(float(proto_scores_flat[:, ci].mean()))
-        test_logs["taxon_mean_scores"] = {k: float(np.mean(v)) for k, v in taxon_scores.items()}
-        for k, v in sorted(taxon_scores.items(), key=lambda x: -np.mean(x[1]))[:5]:
-            print(f"  {k}: mean_score={np.mean(v):.4f} (n_classes={len(v)})")
+            val_corr = res_model(emb_va, fp_va, site_ids=site_va, hours=hour_va)
+            val_loss = F.mse_loss(val_corr, res_va)
+        if val_loss.item() < best_val_loss:
+            best_val_loss = val_loss.item()
+            best_state = {k: v.clone() for k, v in res_model.state_dict().items()}
+            wait = 0
+        else:
+            wait += 1
+        if (epoch + 1) % 20 == 0:
+            print(f"  ResidualSSM epoch {epoch+1}: train={loss.item():.6f} val={val_loss.item():.6f} wait={wait}")
+        if wait >= res_cfg["patience"]:
+            print(f"  ResidualSSM early stop at epoch {epoch+1}")
+            break
+    if best_state is not None:
+        res_model.load_state_dict(best_state)
+    res_time = time.time() - t0_res
+    print(f"ResidualSSM training time: {res_time:.1f}s")
+    print(f"Best val MSE: {best_val_loss:.6f}")
+    print("▶ [Info] Skipping standalone ResidualSSM checkpoint save; bundle export is the persistence path.")
+    res_model.eval()
     with torch.no_grad():
-        p_norm = F.normalize(model.prototypes, dim=-1)
-        cos_sim = torch.matmul(p_norm, p_norm.T)
-        cos_sim.fill_diagonal_(0)
-        top_sims = cos_sim.max(dim=1)[0].numpy()
-        test_logs["prototype_max_similarity"] = {
-            "mean": float(top_sims.mean()),
-            "max": float(top_sims.max()),
-            "min": float(top_sims.min()),
-        }
-        print(f"\nPrototype nearest-neighbor similarity: mean={top_sims.mean():.3f}, max={top_sims.max():.3f}")
-    LOGS["test_inference"] = test_logs
-    PER_CLASS_THRESHOLDS = np.full(N_CLASSES, 0.5, dtype=np.float32)
-    if MODE == "train" and oof_proto_flat is not None:
-        print("Optimizing per-class thresholds from OOF...")
-        best_thresholds, best_scores = optimize_per_class_thresholds(
+        all_corr = res_model(emb_train_t, torch.tensor(first_pass_files, dtype=torch.float32),
+                                site_ids=site_train_t, hours=hour_train_t)
+        corr_np = all_corr.numpy()
+        print(f"Correction magnitude: mean_abs={np.abs(corr_np).mean():.4f}, max={np.abs(corr_np).max():.4f}")
+    CORRECTION_WEIGHT = res_cfg["correction_weight"]
+    print(f"Correction weight: {CORRECTION_WEIGHT}")
+    LOGS["residual_ssm"] = {
+        "params": res_model.count_parameters(),
+        "train_time": res_time,
+        "best_val_mse": best_val_loss,
+        "correction_mean_abs": float(np.abs(corr_np).mean()),
+        "correction_weight": CORRECTION_WEIGHT,
+    }
+else:
+    print("SKIPPED ResidualSSM (wall time safety)")
+    LOGS["residual_ssm"] = {"skipped": True, "wall_min": _wall_min}
+if MODE == "train":
+    if grid_results is not None:
+        best_row = grid_results.iloc[0]
+        print(f"Best honest OOF probe AUC: {best_row['probe_oof_auc']:.6f}")
+        print(f"Delta over honest OOF baseline: {best_row['delta']:.6f}")
+else:
+    print("Skipping train diagnostics in submit mode.")
+if MODE == "train":
+    if oof_proto_flat is not None:
+        print("Optimizing per-class thresholds from OOF for bundle export...")
+        best_thresholds, _best_scores = optimize_per_class_thresholds(
             oof_proto_flat, Y_FULL, n_windows=N_WINDOWS, thresholds=CFG["threshold_grid"]
         )
         PER_CLASS_THRESHOLDS = best_thresholds.astype(np.float32)
-        print(f"  Mean threshold: {best_thresholds.mean():.3f}")
-        print(f"  Threshold range: [{best_thresholds.min():.2f}, {best_thresholds.max():.2f}]")
-        print(f"  Mean F1 (proxy): {best_scores.mean():.3f}")
-        high_t = np.where(best_thresholds > 0.6)[0]
-        low_t = np.where(best_thresholds < 0.4)[0]
-        if len(high_t) > 0:
-            print(f"  High threshold classes (>0.6): {len(high_t)}")
-        if len(low_t) > 0:
-            print(f"  Low threshold classes (<0.4): {len(low_t)}")
     else:
-        print("Using default per-class thresholds (0.5) for submit mode")
-    temp_cfg = CFG["temperature"]
-    T_AVES = temp_cfg["aves"]
-    T_TEXTURE = temp_cfg["texture"]
-    class_temperatures = np.ones(N_CLASSES, dtype=np.float32) * T_AVES
-    for ci, label in enumerate(PRIMARY_LABELS):
-        cn = CLASS_NAME_MAP.get(label, "Aves")
-        if cn in TEXTURE_TAXA:
-            class_temperatures[ci] = T_TEXTURE
-    print(f"\nPer-taxon temperature: Aves={T_AVES}, Texture={T_TEXTURE}")
-    scaled_scores = final_test_scores / class_temperatures[None, :]
-    probs = sigmoid(scaled_scores)
-    top_k = CFG.get("file_level_top_k", 0)
-    if top_k > 0:
-        print(f"Applying file-level confidence scaling (top_k={top_k})")
-        probs = file_level_confidence_scale(probs, n_windows=N_WINDOWS, top_k=top_k)
-        probs = np.clip(probs, 0.0, 1.0)
-    if CFG.get("rank_aware_scale", False):
-        power = CFG.get("rank_aware_power", 0.5)
-        print(f"Applying rank-aware scaling (power={power})")
-        probs = rank_aware_scaling(probs, n_windows=N_WINDOWS, power=power)
-        probs = np.clip(probs, 0.0, 1.0)
-    alpha = CFG.get("delta_shift_alpha", 0.0)
-    if alpha > 0:
-        print(f"Applying delta shift smoothing (alpha={alpha})")
-        probs = adaptive_delta_smooth(probs, n_windows=N_WINDOWS, base_alpha=alpha)
-        probs = np.clip(probs, 0.0, 1.0)
-    print(f"Applying per-class threshold sharpening...")
-    probs = apply_per_class_thresholds(probs, PER_CLASS_THRESHOLDS, n_windows=N_WINDOWS)
-    submission = pd.DataFrame(probs, columns=PRIMARY_LABELS)
-    submission.insert(0, "row_id", meta_test["row_id"].values)
-    submission[PRIMARY_LABELS] = submission[PRIMARY_LABELS].astype(np.float32)
-    expected_rows = len(test_paths) * N_WINDOWS
-    assert len(submission) == expected_rows, f"Expected {expected_rows}, got {len(submission)}"
-    assert submission.columns.tolist() == ["row_id"] + PRIMARY_LABELS
-    assert not submission.isna().any().any()
-    submission.to_csv("submission.csv", index=False)
-    print("\nSaved submission.csv")
-    print("Submission shape:", submission.shape)
-    print(f"Final score range: {probs.min():.6f} to {probs.max():.6f}")
-    print(f"Final mean: {probs.mean():.4f}")
-    print(submission.iloc[:3, :8])
-    wall_time = time.time() - _WALL_START
-    LOGS["wall_time_seconds"] = wall_time
-    LOGS["temperature"] = CFG["temperature"]
-    LOGS["ensemble_weight_proto"] = ENSEMBLE_WEIGHT_PROTO
-    LOGS["n_classes"] = N_CLASSES
-    LOGS["n_windows"] = N_WINDOWS
-    LOGS["experiment_preset"] = EXPERIMENT_PRESET
-    LOGS["tracked_hyperparameters"] = KEY_HYPERPARAMETERS
-    LOGS["cfg_proto_ssm"] = CFG["proto_ssm"]
-    LOGS["cfg_proto_ssm_train"] = {k: v for k, v in CFG["proto_ssm_train"].items() if not isinstance(v, (np.ndarray,))}
-    LOGS["v17_improvements"] = [
-        "d_model_256", "n_ssm_layers_3", "cross_attention", "mixup", "focal_loss", "swa",
-        "per_taxon_temperature", "file_level_scaling", "tta", "rank_aware_scaling",
-        "delta_shift_smooth", "per_class_thresholds"
-    ]
-    LOGS["per_class_thresholds"] = PER_CLASS_THRESHOLDS.tolist()
-    LOGS["cfg"] = _json_safe(CFG)
-    LOGS["train_history"] = {
-        "train_loss": [float(x) for x in train_history.get("train_loss", [])],
-        "val_loss": [float(x) for x in train_history.get("val_loss", [])],
-        "val_auc": [float(x) for x in train_history.get("val_auc", [])],
+        PER_CLASS_THRESHOLDS = np.full(N_CLASSES, 0.5, dtype=np.float32)
+
+    BUNDLE_DIR.mkdir(parents=True, exist_ok=True)
+    bundle_proto_path = BUNDLE_DIR / "proto_ssm.safetensors"
+    save_file(model.state_dict(), str(bundle_proto_path))
+
+    bundle_residual_path = None
+    if res_model is not None:
+        bundle_residual_path = BUNDLE_DIR / "residual_ssm.safetensors"
+        save_file(res_model.state_dict(), str(bundle_residual_path))
+
+    bundle_meta = {
+        "primary_labels": PRIMARY_LABELS,
+        "n_classes": int(N_CLASSES),
+        "n_windows": int(N_WINDOWS),
+        "cfg": cfg_to_jsonable(CFG),
+        "best_probe": {
+            k: (int(v) if isinstance(v, (np.integer,)) else float(v) if isinstance(v, (np.floating,)) else v)
+            for k, v in BEST_PROBE.items()
+        },
+        "ensemble_weight_proto": float(ENSEMBLE_WEIGHT_PROTO),
+        "correction_weight": float(CORRECTION_WEIGHT),
+        "site_to_idx": site_to_idx,
+        "class_name_map": CLASS_NAME_MAP,
+        "textured_taxa": list(TEXTURE_TAXA),
+        "family_index": fam_to_idx,
+        "class_to_family": list(map(int, class_to_family)),
+        "mapped_pos": list(map(int, MAPPED_POS)),
+        "mapped_bc_indices": list(map(int, MAPPED_BC_INDICES)),
+        "selected_proxy_pos_to_bc": {
+            str(k): list(map(int, v)) for k, v in selected_proxy_pos_to_bc.items()
+        },
+        "idx_active_texture": list(map(int, idx_active_texture)),
+        "idx_active_event": list(map(int, idx_active_event)),
+        "idx_mapped_active_texture": list(map(int, idx_mapped_active_texture)),
+        "idx_mapped_active_event": list(map(int, idx_mapped_active_event)),
+        "idx_selected_proxy_active_texture": list(map(int, idx_selected_proxy_active_texture)),
+        "idx_selected_prioronly_active_texture": list(map(int, idx_selected_prioronly_active_texture)),
+        "idx_selected_prioronly_active_event": list(map(int, idx_selected_prioronly_active_event)),
+        "idx_unmapped_inactive": list(map(int, idx_unmapped_inactive)),
+        "final_prior_tables": {
+            "global_p": final_prior_tables["global_p"].tolist(),
+            "site_to_i": final_prior_tables["site_to_i"],
+            "site_n": final_prior_tables["site_n"].tolist(),
+            "site_p": final_prior_tables["site_p"].tolist(),
+            "hour_to_i": final_prior_tables["hour_to_i"],
+            "hour_n": final_prior_tables["hour_n"].tolist(),
+            "hour_p": final_prior_tables["hour_p"].tolist(),
+            "sh_to_i": {f"{k[0]}||{k[1]}": int(v) for k, v in final_prior_tables["sh_to_i"].items()},
+            "sh_n": final_prior_tables["sh_n"].tolist(),
+            "sh_p": final_prior_tables["sh_p"].tolist(),
+        },
+        "emb_scaler": {
+            "mean": emb_scaler.mean_.tolist(),
+            "scale": emb_scaler.scale_.tolist(),
+        },
+        "emb_pca": {
+            "mean": emb_pca.mean_.tolist(),
+            "components": emb_pca.components_.tolist(),
+            "explained_variance": emb_pca.explained_variance_.tolist(),
+        },
+        "probe_class_indices": sorted(map(int, probe_models.keys())),
+        "probe_activation": "relu",
     }
-    try:
-        (REPO_ROOT / "outputs").mkdir(parents=True, exist_ok=True)
-        with open(str(REPO_ROOT / "outputs" / "v17_logs.json"), "w") as f:
-            json.dump(LOGS, f, indent=2, default=str)
-        print("Saved " + str(REPO_ROOT / "outputs" / "v17_logs.json") + "")
-    except Exception as e:
-        print(f"Warning: could not save logs: {e}")
-    try:
-        run_json_path, summary_csv_path, summary_json_path, exp_record = save_experiment_artifacts(
-            repo_root=REPO_ROOT,
-            cfg=CFG,
-            logs=LOGS,
-            submission_df=submission,
-            mode=MODE,
-        )
-        print("Saved experiment run:", run_json_path)
-        print("Updated experiment summary CSV:", summary_csv_path)
-        print("Updated experiment summary JSON:", summary_json_path)
-        print("Experiment key metrics:")
-        print(
-            "  key_metric={key_metric:.4f} oof_auc_proto={oof_auc_proto:.4f} "
-            "ensemble_auc={ensemble_auc:.4f} mlp_only_auc={mlp_only_auc:.4f}".format(**exp_record)
-        )
-    except Exception as e:
-        print(f"Warning: could not save experiment artifacts: {e}")
-    if MODE == "train":
-        print("=== ProtoSSM v5 Training Summary ===")
-        print(f"Parameters: {model.count_parameters():,}")
-        print(f"d_model: {CFG['proto_ssm']['d_model']}, n_ssm_layers: {CFG['proto_ssm']['n_ssm_layers']}")
-        print(f"Wall time: {wall_time:.1f}s")
-        print(f"OOF CV time: {LOGS.get('oof_time', 0):.1f}s")
-        print(f"Final model training time: {LOGS.get('train_time_final', 0):.1f}s")
-        print(f"Final train loss: {train_history['train_loss'][-1]:.4f}")
-        print(f"Best val loss: {min(train_history['val_loss']):.4f}")
-        print(f"Best val AUC: {max(train_history['val_auc']):.4f}")
-        print(f"\n=== OOF Results ===")
-        print(f"ProtoSSM OOF AUC: {LOGS.get('oof_auc_proto', 0):.4f}")
-        print(f"MLP-only OOF AUC: {LOGS.get('mlp_only_auc', 0):.4f}")
-        print(f"Ensemble OOF AUC: {LOGS.get('ensemble_auc', 0):.4f}")
-        print(f"Optimized ProtoSSM weight: {ENSEMBLE_WEIGHT_PROTO:.2f}")
-        with torch.no_grad():
-            alphas = torch.sigmoid(model.fusion_alpha).numpy()
-            high_proto = (alphas > 0.5).sum()
-            high_perch = (alphas <= 0.5).sum()
-            print(f"\nFusion alpha distribution (final model):")
-            print(f"  ProtoSSM-dominant (alpha>0.5): {high_proto} classes")
-            print(f"  Perch-dominant (alpha<=0.5): {high_perch} classes")
-        print(f"\nPer-class calibration bias stats:")
-        with torch.no_grad():
-            cb = model.class_bias.numpy()
-            print(f"  mean={cb.mean():.4f} std={cb.std():.4f} min={cb.min():.4f} max={cb.max():.4f}")
-        print(f"\nMLP probes: {len(probe_models)} classes")
-        if "per_class_auc_proto" in LOGS and LOGS["per_class_auc_proto"]:
-            sorted_aucs = sorted(LOGS["per_class_auc_proto"].items(), key=lambda x: x[1], reverse=True)
-            print(f"\nTop 10 classes by ProtoSSM OOF AUC:")
-            for label, auc in sorted_aucs[:10]:
-                print(f"  {label}: {auc:.4f}")
-            print(f"\nBottom 10 classes by ProtoSSM OOF AUC:")
-            for label, auc in sorted_aucs[-10:]:
-                print(f"  {label}: {auc:.4f}")
-        print("\nSubmission probability stats:")
-        print(submission.iloc[:, 1:].stack().describe())
-    else:
-        print("Submit mode completed.")
-        print(f"ProtoSSM v5 parameters: {model.count_parameters():,}")
-        print(f"Ensemble weight: {ENSEMBLE_WEIGHT_PROTO:.2f}")
-        print(f"Wall time: {wall_time:.1f}s")
-        print(f"V17 improvements: {LOGS['v17_improvements']}")
+    bundle_meta_path = BUNDLE_DIR / "bundle_meta.json"
+    with open(bundle_meta_path, "w") as f:
+        json.dump(bundle_meta, f, indent=2)
+
+    array_payload = {
+        "per_class_thresholds": PER_CLASS_THRESHOLDS.astype(np.float32),
+    }
+    array_payload.update({
+        "proto_ssm_input_weight": model.input_proj[0].weight.detach().cpu().numpy().astype(np.float32),
+    })
+    for cls_idx, clf in probe_models.items():
+        for layer_idx, coef in enumerate(clf.coefs_):
+            array_payload[f"probe_{int(cls_idx)}_coef_{layer_idx}"] = np.asarray(coef, dtype=np.float32)
+        for layer_idx, intercept in enumerate(clf.intercepts_):
+            array_payload[f"probe_{int(cls_idx)}_intercept_{layer_idx}"] = np.asarray(intercept, dtype=np.float32)
+    bundle_arrays_path = BUNDLE_DIR / "bundle_arrays.npz"
+    np.savez_compressed(bundle_arrays_path, **array_payload)
+
+    copied_files = {}
+    for src in [
+        CFG["full_cache_work_dir"] / "full_perch_meta.parquet",
+        CFG["full_cache_work_dir"] / "full_perch_arrays.npz",
+        OOF_META_CACHE,
+        PROXY_REDUCE_CACHE,
+    ]:
+        if src is not None and Path(src).exists():
+            dst = BUNDLE_DIR / Path(src).name
+            if Path(src).resolve() != dst.resolve():
+                shutil.copy2(src, dst)
+            copied_files[Path(src).name] = str(dst)
+
+    bundle_manifest = {
+        "bundle_meta": str(bundle_meta_path),
+        "bundle_arrays": str(bundle_arrays_path),
+        "proto_model": str(bundle_proto_path),
+        "residual_model": str(bundle_residual_path) if bundle_residual_path is not None else None,
+        "copied_cache_files": copied_files,
+    }
+    with open(BUNDLE_DIR / "bundle_manifest.json", "w") as f:
+        json.dump(bundle_manifest, f, indent=2)
+
+    print("\nSaved portable training bundle:", BUNDLE_DIR)
+    print("This bundle can be copied to Kaggle and consumed by predict_ported_old_infer.py")
+
+test_paths = sorted((BASE / "test_soundscapes").glob("*.ogg"))
+if len(test_paths) == 0:
+    print(f"Hidden test not mounted. Dry-run on first {CFG['dryrun_n_files']} train soundscapes.")
+    test_paths = sorted((BASE / "train_soundscapes").glob("*.ogg"))[:CFG["dryrun_n_files"]]
+else:
+    print(f"Hidden test files: {len(test_paths)}")
+meta_test, scores_test_raw, emb_test = infer_perch_with_embeddings(
+    test_paths,
+    batch_files=CFG["batch_files"],
+    verbose=CFG["verbose"],
+    proxy_reduce=CFG["proxy_reduce"],
+)
+print(f"proxy_reduce used for test inference: {CFG['proxy_reduce']!r}")
+print("meta_test:", meta_test.shape)
+print("scores_test_raw:", scores_test_raw.shape)
+print("emb_test:", emb_test.shape)
+emb_test_files, test_file_list = reshape_to_files(emb_test, meta_test)
+logits_test_files, _ = reshape_to_files(scores_test_raw, meta_test)
+test_site_ids, test_hours = get_file_metadata(meta_test, test_file_list, site_to_idx, CFG["proto_ssm"]["n_sites"])
+emb_test_tensor = torch.tensor(emb_test_files, dtype=torch.float32)
+logits_test_tensor = torch.tensor(logits_test_files, dtype=torch.float32)
+test_site_tensor = torch.tensor(test_site_ids, dtype=torch.long)
+test_hour_tensor = torch.tensor(test_hours, dtype=torch.long)
+model.eval()
+tta_shifts = CFG.get("tta_shifts", [0])
+if len(tta_shifts) > 1:
+    print(f"Running TTA with shifts: {tta_shifts}")
+    proto_scores = temporal_shift_tta(
+        emb_test_files, logits_test_files, model,
+        test_site_ids, test_hours, shifts=tta_shifts
+    )
+else:
+    with torch.no_grad():
+        proto_out, _, h_test = model(emb_test_tensor, logits_test_tensor,
+                                        site_ids=test_site_tensor, hours=test_hour_tensor)
+        proto_scores = proto_out.numpy()
+proto_scores_flat = proto_scores.reshape(-1, N_CLASSES).astype(np.float32)
+print(f"ProtoSSM v4 test scores: {proto_scores_flat.shape}")
+print(f"Score range: {proto_scores_flat.min():.3f} to {proto_scores_flat.max():.3f}")
+test_base_scores, test_prior_scores = fuse_scores_with_tables(
+    scores_test_raw,
+    sites=meta_test["site"].to_numpy(),
+    hours=meta_test["hour_utc"].to_numpy(),
+    tables=final_prior_tables,
+)
+emb_test_scaled = emb_scaler.transform(emb_test)
+Z_TEST = emb_pca.transform(emb_test_scaled).astype(np.float32)
+mlp_scores = test_base_scores.copy()
+alpha_p = float(CFG["frozen_best_probe"]["alpha"])
+mlp_scores = get_vectorized_mlp_scores(
+    Z_TEST, scores_test_raw, test_prior_scores, test_base_scores,
+    probe_models, alpha_p, n_windows=N_WINDOWS, device=DEVICE
+)
+print(f"\nUsing OOF-optimized ensemble weight: {ENSEMBLE_WEIGHT_PROTO:.2f}")
+final_test_scores = (
+    ENSEMBLE_WEIGHT_PROTO * proto_scores_flat +
+    (1.0 - ENSEMBLE_WEIGHT_PROTO) * mlp_scores
+).astype(np.float32)
+if res_model is not None and CORRECTION_WEIGHT > 0:
+    first_pass_test_files, _ = reshape_to_files(final_test_scores, meta_test)
+    first_pass_test_t = torch.tensor(first_pass_test_files, dtype=torch.float32)
+    res_model.eval()
+    with torch.no_grad():
+        test_correction = res_model(
+            emb_test_tensor, first_pass_test_t,
+            site_ids=test_site_tensor, hours=test_hour_tensor
+        ).numpy()
+    test_correction_flat = test_correction.reshape(-1, N_CLASSES).astype(np.float32)
+    print(f"\nResidual correction: mean_abs={np.abs(test_correction_flat).mean():.4f}, "
+            f"max={np.abs(test_correction_flat).max():.4f}")
+    final_test_scores = final_test_scores + CORRECTION_WEIGHT * test_correction_flat
+    print(f"Final scores (after residual): range [{final_test_scores.min():.3f}, {final_test_scores.max():.3f}]")
+else:
+    print("\nResidual correction: SKIPPED")
+print(f"Final scores: {final_test_scores.shape}")
+test_logs = {}
+window_scores = proto_scores.reshape(-1, N_WINDOWS, N_CLASSES).mean(axis=(0, 2))
+test_logs["window_position_scores"] = window_scores.tolist()
+print(f"\nWindow position mean scores: {[f'{s:.3f}' for s in window_scores]}")
+if hasattr(model, 'class_to_family'):
+    taxon_scores = defaultdict(list)
+    idx_to_fam = {v: k for k, v in fam_to_idx.items()}
+    for ci in range(N_CLASSES):
+        fam_idx = class_to_family[ci]
+        fam_name = idx_to_fam.get(fam_idx, f"group_{fam_idx}")
+        taxon_scores[fam_name].append(float(proto_scores_flat[:, ci].mean()))
+    test_logs["taxon_mean_scores"] = {k: float(np.mean(v)) for k, v in taxon_scores.items()}
+    for k, v in sorted(taxon_scores.items(), key=lambda x: -np.mean(x[1]))[:5]:
+        print(f"  {k}: mean_score={np.mean(v):.4f} (n_classes={len(v)})")
+with torch.no_grad():
+    p_norm = F.normalize(model.prototypes, dim=-1)
+    cos_sim = torch.matmul(p_norm, p_norm.T)
+    cos_sim.fill_diagonal_(0)
+    top_sims = cos_sim.max(dim=1)[0].numpy()
+    test_logs["prototype_max_similarity"] = {
+        "mean": float(top_sims.mean()),
+        "max": float(top_sims.max()),
+        "min": float(top_sims.min()),
+    }
+    print(f"\nPrototype nearest-neighbor similarity: mean={top_sims.mean():.3f}, max={top_sims.max():.3f}")
+LOGS["test_inference"] = test_logs
+PER_CLASS_THRESHOLDS = np.full(N_CLASSES, 0.5, dtype=np.float32)
+if MODE == "train" and oof_proto_flat is not None:
+    print("Optimizing per-class thresholds from OOF...")
+    best_thresholds, best_scores = optimize_per_class_thresholds(
+        oof_proto_flat, Y_FULL, n_windows=N_WINDOWS, thresholds=CFG["threshold_grid"]
+    )
+    PER_CLASS_THRESHOLDS = best_thresholds.astype(np.float32)
+    print(f"  Mean threshold: {best_thresholds.mean():.3f}")
+    print(f"  Threshold range: [{best_thresholds.min():.2f}, {best_thresholds.max():.2f}]")
+    print(f"  Mean F1 (proxy): {best_scores.mean():.3f}")
+    high_t = np.where(best_thresholds > 0.6)[0]
+    low_t = np.where(best_thresholds < 0.4)[0]
+    if len(high_t) > 0:
+        print(f"  High threshold classes (>0.6): {len(high_t)}")
+    if len(low_t) > 0:
+        print(f"  Low threshold classes (<0.4): {len(low_t)}")
+else:
+    print("Using default per-class thresholds (0.5) for submit mode")
+temp_cfg = CFG["temperature"]
+T_AVES = temp_cfg["aves"]
+T_TEXTURE = temp_cfg["texture"]
+class_temperatures = np.ones(N_CLASSES, dtype=np.float32) * T_AVES
+for ci, label in enumerate(PRIMARY_LABELS):
+    cn = CLASS_NAME_MAP.get(label, "Aves")
+    if cn in TEXTURE_TAXA:
+        class_temperatures[ci] = T_TEXTURE
+print(f"\nPer-taxon temperature: Aves={T_AVES}, Texture={T_TEXTURE}")
+scaled_scores = final_test_scores / class_temperatures[None, :]
+probs = sigmoid(scaled_scores)
+top_k = CFG.get("file_level_top_k", 0)
+if top_k > 0:
+    print(f"Applying file-level confidence scaling (top_k={top_k})")
+    probs = file_level_confidence_scale(probs, n_windows=N_WINDOWS, top_k=top_k)
+    probs = np.clip(probs, 0.0, 1.0)
+if CFG.get("rank_aware_scale", False):
+    power = CFG.get("rank_aware_power", 0.5)
+    print(f"Applying rank-aware scaling (power={power})")
+    probs = rank_aware_scaling(probs, n_windows=N_WINDOWS, power=power)
+    probs = np.clip(probs, 0.0, 1.0)
+alpha = CFG.get("delta_shift_alpha", 0.0)
+if alpha > 0:
+    print(f"Applying delta shift smoothing (alpha={alpha})")
+    probs = adaptive_delta_smooth(probs, n_windows=N_WINDOWS, base_alpha=alpha)
+    probs = np.clip(probs, 0.0, 1.0)
+print(f"Applying per-class threshold sharpening...")
+probs = apply_per_class_thresholds(probs, PER_CLASS_THRESHOLDS, n_windows=N_WINDOWS)
+submission = pd.DataFrame(probs, columns=PRIMARY_LABELS)
+submission.insert(0, "row_id", meta_test["row_id"].values)
+submission[PRIMARY_LABELS] = submission[PRIMARY_LABELS].astype(np.float32)
+expected_rows = len(test_paths) * N_WINDOWS
+assert len(submission) == expected_rows, f"Expected {expected_rows}, got {len(submission)}"
+assert submission.columns.tolist() == ["row_id"] + PRIMARY_LABELS
+assert not submission.isna().any().any()
+print("Submission shape:", submission.shape)
+print(f"Final score range: {probs.min():.6f} to {probs.max():.6f}")
+print(f"Final mean: {probs.mean():.4f}")
+print(submission.iloc[:3, :8])
+wall_time = time.time() - _WALL_START
+LOGS["wall_time_seconds"] = wall_time
+LOGS["temperature"] = CFG["temperature"]
+LOGS["ensemble_weight_proto"] = ENSEMBLE_WEIGHT_PROTO
+LOGS["n_classes"] = N_CLASSES
+LOGS["n_windows"] = N_WINDOWS
+LOGS["cfg_proto_ssm"] = CFG["proto_ssm"]
+LOGS["cfg_proto_ssm_train"] = {k: v for k, v in CFG["proto_ssm_train"].items() if not isinstance(v, (np.ndarray,))}
+LOGS["v17_improvements"] = [
+    "d_model_256", "n_ssm_layers_3", "cross_attention", "mixup", "focal_loss", "swa",
+    "per_taxon_temperature", "file_level_scaling", "tta", "rank_aware_scaling",
+    "delta_shift_smooth", "per_class_thresholds"
+]
+LOGS["per_class_thresholds"] = PER_CLASS_THRESHOLDS.tolist()
+if MODE == "train":
+    print("=== ProtoSSM v5 Training Summary ===")
+    print(f"Parameters: {model.count_parameters():,}")
+    print(f"d_model: {CFG['proto_ssm']['d_model']}, n_ssm_layers: {CFG['proto_ssm']['n_ssm_layers']}")
+    print(f"Wall time: {wall_time:.1f}s")
+    print(f"OOF CV time: {LOGS.get('oof_time', 0):.1f}s")
+    print(f"Final model training time: {LOGS.get('train_time_final', 0):.1f}s")
+    print(f"Final train loss: {train_history['train_loss'][-1]:.4f}")
+    print(f"Best val loss: {min(train_history['val_loss']):.4f}")
+    print(f"Best val AUC: {max(train_history['val_auc']):.4f}")
+    print(f"\n=== OOF Results ===")
+    print(f"ProtoSSM OOF AUC: {LOGS.get('oof_auc_proto', 0):.4f}")
+    print(f"MLP-only OOF AUC: {LOGS.get('mlp_only_auc', 0):.4f}")
+    print(f"Ensemble OOF AUC: {LOGS.get('ensemble_auc', 0):.4f}")
+    print(f"Optimized ProtoSSM weight: {ENSEMBLE_WEIGHT_PROTO:.2f}")
+    with torch.no_grad():
+        alphas = torch.sigmoid(model.fusion_alpha).numpy()
+        high_proto = (alphas > 0.5).sum()
+        high_perch = (alphas <= 0.5).sum()
+        print(f"\nFusion alpha distribution (final model):")
+        print(f"  ProtoSSM-dominant (alpha>0.5): {high_proto} classes")
+        print(f"  Perch-dominant (alpha<=0.5): {high_perch} classes")
+    print(f"\nPer-class calibration bias stats:")
+    with torch.no_grad():
+        cb = model.class_bias.numpy()
+        print(f"  mean={cb.mean():.4f} std={cb.std():.4f} min={cb.min():.4f} max={cb.max():.4f}")
+    print(f"\nMLP probes: {len(probe_models)} classes")
+    if "per_class_auc_proto" in LOGS and LOGS["per_class_auc_proto"]:
+        sorted_aucs = sorted(LOGS["per_class_auc_proto"].items(), key=lambda x: x[1], reverse=True)
+        print(f"\nTop 10 classes by ProtoSSM OOF AUC:")
+        for label, auc in sorted_aucs[:10]:
+            print(f"  {label}: {auc:.4f}")
+        print(f"\nBottom 10 classes by ProtoSSM OOF AUC:")
+        for label, auc in sorted_aucs[-10:]:
+            print(f"  {label}: {auc:.4f}")
+    print("\nSubmission probability stats:")
+    print(submission.iloc[:, 1:].stack().describe())
+else:
+    print("Submit mode completed.")
+    print(f"ProtoSSM v5 parameters: {model.count_parameters():,}")
+    print(f"Ensemble weight: {ENSEMBLE_WEIGHT_PROTO:.2f}")
+    print(f"Wall time: {wall_time:.1f}s")
+    print(f"V17 improvements: {LOGS['v17_improvements']}")

@@ -71,6 +71,7 @@ MODEL_DIR = REPO_ROOT / "models" / "perch_v2_cpu" / "1"
 DATA_DIR = REPO_ROOT / "data"
 SOUNDSCAPE_DIR = REPO_ROOT / "data" / "train_soundscapes"
 TRAIN_AUDIO_DIR = Path(os.environ.get("TRAIN_AUDIO_DIR", "/mnt/evafs/groups/re-com/mgromadzki/data/train_audio"))
+TRAIN_AUDIO_LIMIT = int(os.environ.get("TRAIN_AUDIO_LIMIT", "0"))
 
 # Fixed run settings.
 BATCH_FILES = 8
@@ -94,7 +95,7 @@ HPARAM_GRID = {
     "weight_decay": [1e-6],
 }
 
-RUN_GRID_SEARCH = True
+RUN_GRID_SEARCH = False
 GRID_RESULTS_CSV: Path | None = REPO_ROOT / "outputs" / "eda" / "perch_onnx_head_ft_frozen_w_audio_grid_results.csv"
 W_TRAIN_MODE = "frozen"
 
@@ -276,8 +277,10 @@ def build_train_audio_truth(data_dir: Path, train_audio_dir: Path) -> pd.DataFra
 
     train_df["label_list"] = train_df.apply(_collect_labels, axis=1)
     train_df = train_df[train_df["label_list"].map(len) > 0].copy()
-    train_df["row_id"] = train_df["filename"].str.replace(".ogg", "", regex=False)
-    return train_df[["row_id", "filename", "label_list"]].reset_index(drop=True)
+    # Keep both stem and basename; basename is used for robust join with meta_audio.filename.
+    train_df["row_id"] = train_df["filename"].map(lambda x: Path(str(x)).stem)
+    train_df["audio_basename"] = train_df["filename"].map(lambda x: Path(str(x)).name)
+    return train_df[["row_id", "filename", "audio_basename", "label_list"]].reset_index(drop=True)
 
 
 def extract_spatial_and_logits(
@@ -566,6 +569,9 @@ def main() -> None:
         raise RuntimeError("No fully-labeled soundscape windows found.")
 
     train_audio_truth = build_train_audio_truth(DATA_DIR, TRAIN_AUDIO_DIR)
+    if TRAIN_AUDIO_LIMIT > 0:
+        train_audio_truth = train_audio_truth.head(TRAIN_AUDIO_LIMIT).copy()
+        print(f"TRAIN_AUDIO_LIMIT active: using first {len(train_audio_truth)} train_audio rows")
 
     active_primary_labels = sorted({lab for labs in soundscape_truth["label_list"] for lab in labs})
     full_label_lists = soundscape_truth["label_list"].tolist()
@@ -645,12 +651,19 @@ def main() -> None:
         read_audio_fn=lambda p: read_audio_fixed_length(p, WINDOW_SAMPLES),
     )
     merged_audio = meta_audio.merge(
-        train_audio_truth[["row_id", "label_list"]],
-        on="row_id",
+        train_audio_truth[["audio_basename", "label_list"]],
+        left_on="filename",
+        right_on="audio_basename",
         how="inner",
     )
     if merged_audio.empty:
-        raise RuntimeError("No aligned rows between ONNX extraction and train_audio labels.")
+        sample_meta = meta_audio["filename"].head(5).tolist()
+        sample_truth = train_audio_truth["audio_basename"].head(5).tolist()
+        raise RuntimeError(
+            "No aligned rows between ONNX extraction and train_audio labels. "
+            f"Example meta_audio filename: {sample_meta}; "
+            f"example train_audio basename: {sample_truth}"
+        )
 
     row_idx_audio = merged_audio.index.to_numpy()
     spatial_audio = spatial_audio_all[row_idx_audio]

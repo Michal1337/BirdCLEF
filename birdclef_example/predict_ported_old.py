@@ -488,8 +488,10 @@ def infer_perch_with_embeddings(paths, batch_files=16, verbose=True, proxy_reduc
                     proxy_score = sub.max(axis=1)
                 elif proxy_reduce == "mean":
                     proxy_score = sub.mean(axis=1)
+                elif proxy_reduce == "median":
+                    proxy_score = np.median(sub, axis=1)
                 else:
-                    raise ValueError("proxy_reduce must be 'max' or 'mean'")
+                    raise ValueError("proxy_reduce must be 'max' or 'mean' or 'median'")
                 scores[batch_row_start:write_row, pos] = proxy_score.astype(np.float32)
 
             if USE_ONNX_PERCH:
@@ -1674,16 +1676,16 @@ CFG = {
     "mode": MODE,
     "verbose": MODE == "train",
     "run_oof_baseline": MODE == "train",
-    "run_probe_check": False,
+    "run_probe_check": True,
     "run_probe_grid": False,
     "batch_files": 16,
-    "proxy_reduce_grid": ["max", "mean"],
+    "proxy_reduce_grid": ["max", "mean", "median"],
     "proxy_reduce": "max",
     "run_proxy_reduce_grid": False,
     "dryrun_n_files": 50 if MODE == "train" else 20,
     "require_full_cache_in_submit": False,
-    "full_cache_input_dir": Path(os.environ.get("PERCH_CACHE_DIR", REPO_ROOT / "data" / "perch_cache")),
-    "full_cache_work_dir": Path(os.environ.get("PERCH_CACHE_DIR", REPO_ROOT / "data" / "perch_cache")),
+    "full_cache_input_dir": Path(os.environ.get("PERCH_CACHE_DIR", REPO_ROOT / "data" / "perch_cache_finetuned")),
+    "full_cache_work_dir": Path(os.environ.get("PERCH_CACHE_DIR", REPO_ROOT / "data" / "perch_cache_finetuned")),
     # V18: updated fusion parameters
     "best_fusion": {
         "lambda_event": 0.45,          # V17: 0.40
@@ -1725,10 +1727,10 @@ CFG = {
     },
     # V18: strengthened MLP probe
     "frozen_best_probe": {
-        "pca_dim": 128,          # V17: 64
-        "min_pos": 5,            # V17: 8
-        "C": 0.75,               # V17: 0.50
-        "alpha": 0.45,           # V17: 0.40
+        "pca_dim": 224,          # V17: 64
+        "min_pos": 3,            # V17: 8
+        "C": 1.8,               # V17: 0.50
+        "alpha": 0.65,           # V17: 0.40
     },
     # V18: strengthened ResidualSSM
     "residual_ssm": {
@@ -1789,15 +1791,15 @@ CFG["tta_shifts"]        = [0, 1, -1, 2, -2]
 CFG["rank_aware_power"]  = 0.4
 CFG["delta_shift_alpha"] = 0.20
 CFG["mlp_params"] = {
-    "hidden_layer_sizes": (256, 128), "activation": "relu",
+    "hidden_layer_sizes": (384, 192), "activation": "relu",
     "max_iter": 500, "early_stopping": True,
     "validation_fraction": 0.15, "n_iter_no_change": 20,
-    "random_state": 42, "learning_rate_init": 5e-4, "alpha": 0.005,
+    "random_state": 42, "learning_rate_init": 8.0e-4, "alpha": 0.0025,
 }
 CFG["frozen_best_probe"] = {
-    "pca_dim": 128, "min_pos": 5, "C": 0.75, "alpha": 0.45
+    "pca_dim": 224, "min_pos": 2, "C": 1.2, "alpha": 0.64
 }
-ONNX_PERCH_PATH = Path(os.environ.get("PERCH_ONNX_PATH", REPO_ROOT / "models" / "perch_onnx" / "perch_v2.onnx"))
+ONNX_PERCH_PATH = Path(os.environ.get("PERCH_ONNX_PATH", REPO_ROOT / "models" / "perch_onnx" / "perch_v2_finetuned.onnx"))
 USE_ONNX_PERCH = ONNX_PERCH_PATH.exists()
 NO_LABEL_INDEX = 0
 MANUAL_SCIENTIFIC_NAME_MAP = {}

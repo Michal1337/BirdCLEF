@@ -94,7 +94,7 @@ HPARAM_GRID = {
     "weight_decay": [1e-6],
 }
 
-RUN_GRID_SEARCH = True
+RUN_GRID_SEARCH = False
 GRID_RESULTS_CSV: Path | None = REPO_ROOT / "outputs" / "eda" / "perch_onnx_head_ft_partial_w_audio_grid_results.csv"
 W_TRAIN_MODE = "partial"
 
@@ -276,8 +276,10 @@ def build_train_audio_truth(data_dir: Path, train_audio_dir: Path) -> pd.DataFra
 
     train_df["label_list"] = train_df.apply(_collect_labels, axis=1)
     train_df = train_df[train_df["label_list"].map(len) > 0].copy()
-    train_df["row_id"] = train_df["filename"].str.replace(".ogg", "", regex=False)
-    return train_df[["row_id", "filename", "label_list"]].reset_index(drop=True)
+    # Keep both stem and basename; basename is used for robust join with meta_audio.filename.
+    train_df["row_id"] = train_df["filename"].map(lambda x: Path(str(x)).stem)
+    train_df["audio_basename"] = train_df["filename"].map(lambda x: Path(str(x)).name)
+    return train_df[["row_id", "filename", "audio_basename", "label_list"]].reset_index(drop=True)
 
 
 def extract_spatial_and_logits(
@@ -289,7 +291,7 @@ def extract_spatial_and_logits(
 ) -> Tuple[pd.DataFrame, np.ndarray, np.ndarray]:
     so = ort.SessionOptions()
     so.intra_op_num_threads = int(os.environ.get("ORT_INTRA_OP_THREADS", "1"))
-    so.inter_op_num_threads = int(os.environ.get("ORT_INTER_OP_THREADS", "1"))
+    so.inter_op_num_threads = int(os.environ.get("ORT_INTER_OP_THREADS", "8"))
     so.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
 
     session = ort.InferenceSession(
@@ -662,12 +664,19 @@ def main() -> None:
         read_audio_fn=lambda p: read_audio_fixed_length(p, WINDOW_SAMPLES),
     )
     merged_audio = meta_audio.merge(
-        train_audio_truth[["row_id", "label_list"]],
-        on="row_id",
+        train_audio_truth[["audio_basename", "label_list"]],
+        left_on="filename",
+        right_on="audio_basename",
         how="inner",
     )
     if merged_audio.empty:
-        raise RuntimeError("No aligned rows between ONNX extraction and train_audio labels.")
+        sample_meta = meta_audio["filename"].head(5).tolist()
+        sample_truth = train_audio_truth["audio_basename"].head(5).tolist()
+        raise RuntimeError(
+            "No aligned rows between ONNX extraction and train_audio labels. "
+            f"Example meta_audio filename: {sample_meta}; "
+            f"example train_audio basename: {sample_truth}"
+        )
 
     row_idx_audio = merged_audio.index.to_numpy()
     spatial_audio = spatial_audio_all[row_idx_audio]

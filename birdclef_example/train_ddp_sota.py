@@ -5,12 +5,13 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import numpy as np
 import pandas as pd
 import timm
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import GroupShuffleSplit
 from torch import nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, WeightedRandomSampler
@@ -27,10 +28,9 @@ from birdclef_example.data import (  # noqa: E402
     parse_primary_labels,
     parse_secondary_labels,
     prepare_soundscape_metadata,
-    prepare_train_audio_metadata,
 )
 from birdclef_example.model import SpecAugment  # noqa: E402
-from birdclef_example.utils import evaluate_model, is_better_score, save_model, set_seed  # noqa: E402
+from birdclef_example.utils import birdclef_roc_auc, is_better_score, save_model, set_seed  # noqa: E402
 
 
 def _get_distributed_context() -> tuple[bool, int, int, int]:
@@ -78,6 +78,93 @@ def build_rank_metadata_shard(metadata: pd.DataFrame, world_size: int, rank: int
     if missing > 0:
         shard = pd.concat([shard, metadata.iloc[:missing].copy()], ignore_index=True)
     return shard.reset_index(drop=True)
+
+
+def build_perch_mapped_label_indices(
+    taxonomy_path: Path,
+    perch_labels_path: Path,
+    label_map: Dict[str, int],
+) -> np.ndarray:
+    taxonomy_df = pd.read_csv(taxonomy_path)
+    taxonomy_df["primary_label"] = taxonomy_df["primary_label"].astype(str)
+    perch_labels_df = (
+        pd.read_csv(perch_labels_path)
+        .reset_index()
+        .rename(columns={"index": "perch_index", "inat2024_fsd50k": "scientific_name"})
+    )
+    perch_labels_df["scientific_name"] = perch_labels_df["scientific_name"].astype(str)
+
+    taxonomy_local = taxonomy_df.copy()
+    taxonomy_local["scientific_name_lookup"] = taxonomy_local["scientific_name"].astype(str)
+    perch_lookup = perch_labels_df.rename(columns={"scientific_name": "scientific_name_lookup"})
+    mapping = taxonomy_local.merge(
+        perch_lookup[["scientific_name_lookup", "perch_index"]],
+        on="scientific_name_lookup",
+        how="left",
+    )
+    no_label_index = len(perch_labels_df)
+    mapping["perch_index"] = mapping["perch_index"].fillna(no_label_index).astype(int)
+
+    mapped_labels = [
+        label
+        for label in label_map.keys()
+        if int(mapping.loc[mapping["primary_label"] == label, "perch_index"].iloc[0]) != no_label_index
+    ]
+    return np.array([label_map[label] for label in mapped_labels], dtype=np.int64)
+
+
+def evaluate_validation_metrics(
+    model: nn.Module,
+    dataloader: DataLoader,
+    criterion,
+    device: torch.device,
+    mapped_label_indices: np.ndarray,
+    use_bf16: bool = False,
+) -> tuple[float, float, float]:
+    model.eval()
+    losses = []
+    all_targets = []
+    all_preds = []
+    amp_enabled = use_bf16 and device.type == "cuda"
+
+    with torch.no_grad():
+        for inputs, targets in dataloader:
+            inputs = inputs.to(device, non_blocking=True)
+            targets = targets.to(device, non_blocking=True)
+            with torch.autocast(
+                device_type=device.type,
+                dtype=torch.bfloat16,
+                enabled=amp_enabled,
+            ):
+                logits = model(inputs)
+                loss = criterion(logits, targets)
+            losses.append(loss.item())
+            all_targets.append(targets.float().cpu())
+            all_preds.append(torch.sigmoid(logits).float().cpu())
+
+    avg_loss = float(np.mean(losses)) if losses else float("nan")
+    if not all_targets:
+        return avg_loss, float("nan"), float("nan")
+
+    target_array = torch.cat(all_targets, dim=0).numpy()
+    pred_array = torch.cat(all_preds, dim=0).numpy()
+
+    try:
+        full_auc = birdclef_roc_auc(target_array, pred_array)
+    except ValueError:
+        full_auc = float("nan")
+
+    if len(mapped_label_indices) > 0:
+        try:
+            mapped_auc = birdclef_roc_auc(
+                target_array[:, mapped_label_indices],
+                pred_array[:, mapped_label_indices],
+            )
+        except ValueError:
+            mapped_auc = float("nan")
+    else:
+        mapped_auc = float("nan")
+    return avg_loss, mapped_auc, full_auc
 
 
 class AudioWaveAugment(nn.Module):
@@ -455,6 +542,7 @@ def run_experiment(
     train_rank_meta: pd.DataFrame,
     val_dataset: Optional[BirdCLEFDataset],
     label_map: Dict[str, int],
+    mapped_label_indices: np.ndarray,
     base_model_config: Dict[str, Any],
     output_dir: Path,
     device: torch.device,
@@ -572,8 +660,10 @@ def run_experiment(
     _print_main(rank, f"Rows per-rank training shard: {train_rank_meta_len}")
     _print_main(rank, f"Validation rows: {val_meta_len}")
     _print_main(rank, f"Num labels: {len(label_map)}")
+    _print_main(rank, f"Mapped validation labels: {len(mapped_label_indices)}")
 
     best_val_auc = float("nan")
+    best_val_full_auc = float("nan")
     best_val_loss = float("inf")
     best_epoch = -1
     history: List[Dict[str, Any]] = []
@@ -601,12 +691,12 @@ def run_experiment(
             eval_model = model.module if isinstance(model, DDP) else model
             if val_loader is None:
                 raise RuntimeError("Validation loader is not initialized on main rank.")
-            # Evaluate with plain BCE for consistent monitoring.
-            val_loss, val_auc = evaluate_model(
+            val_loss, val_mapped_auc, val_full_auc = evaluate_validation_metrics(
                 eval_model,
                 val_loader,
                 torch.nn.BCEWithLogitsLoss(),
                 device,
+                mapped_label_indices=mapped_label_indices,
                 use_bf16=use_bf16,
             )
 
@@ -615,7 +705,9 @@ def run_experiment(
                 "epoch": epoch,
                 "train_loss": avg_train_loss,
                 "val_loss": val_loss,
-                "val_auc": val_auc,
+                "val_mapped_auc": val_mapped_auc,
+                "val_full_auc": val_full_auc,
+                "val_auc": val_mapped_auc,
                 "backbone_name": experiment["backbone_name"],
                 "mixup_alpha": float(experiment["mixup_alpha"]),
                 "mixup_probability": float(experiment["mixup_probability"]),
@@ -627,14 +719,15 @@ def run_experiment(
             history.append(row)
             print(
                 f"{exp_name} | Epoch {epoch:02d} | train_loss={avg_train_loss:.4f} | "
-                f"val_loss={val_loss:.4f} | val_birdclef_roc_auc={val_auc:.4f}"
+                f"val_loss={val_loss:.4f} | val_mapped_auc={val_mapped_auc:.4f} | val_full_auc={val_full_auc:.4f}"
             )
 
             should_save = False
-            if is_better_score(val_auc, best_val_auc):
-                best_val_auc = val_auc
+            if is_better_score(val_mapped_auc, best_val_auc):
+                best_val_auc = val_mapped_auc
+                best_val_full_auc = val_full_auc
                 should_save = True
-            elif pd.isna(val_auc) and val_loss < best_val_loss:
+            elif pd.isna(val_mapped_auc) and val_loss < best_val_loss:
                 should_save = True
 
             if should_save:
@@ -647,7 +740,8 @@ def run_experiment(
                         "label_map": label_map,
                         "model_config": model_config,
                         "epoch": epoch,
-                        "best_val_auc": val_auc,
+                        "best_val_auc": val_mapped_auc,
+                        "best_val_full_auc": val_full_auc,
                         "best_val_loss": val_loss,
                         "fused_adamw": fused_enabled,
                         "experiment": experiment,
@@ -666,6 +760,7 @@ def run_experiment(
         "backbone_name": experiment["backbone_name"],
         "best_epoch": best_epoch,
         "best_val_auc": best_val_auc,
+        "best_val_full_auc": best_val_full_auc,
         "best_val_loss": best_val_loss,
         "mixup_alpha": float(experiment["mixup_alpha"]),
         "mixup_probability": float(experiment["mixup_probability"]),
@@ -713,12 +808,10 @@ def main() -> None:
 
     repo_root = Path(__file__).resolve().parents[1]
     data_dir = repo_root / "data"
-    output_dir = repo_root / "birdclef_example" / "outputs" / "experiments_sota3"
+    output_dir = repo_root / "birdclef_example" / "outputs" / "experiments_sota"
 
-    train_audio_metadata_path = data_dir / "train.csv"
     soundscape_labels_path = data_dir / "train_soundscapes_labels.csv"
     taxonomy_path = data_dir / "taxonomy.csv"
-    train_audio_dir = data_dir / "train_audio"
     train_soundscape_dir = data_dir / "train_soundscapes"
 
     epochs = 15
@@ -734,8 +827,6 @@ def main() -> None:
     use_bf16 = True
     grad_clip_norm = 1.0
 
-    if not train_audio_dir.exists():
-        raise FileNotFoundError(f"Missing directory: {train_audio_dir}")
     if not train_soundscape_dir.exists():
         raise FileNotFoundError(f"Missing directory: {train_soundscape_dir}")
 
@@ -743,26 +834,16 @@ def main() -> None:
     if _is_main_process(rank):
         output_dir.mkdir(parents=True, exist_ok=True)
 
-    train_audio_df = pd.read_csv(train_audio_metadata_path)
     soundscape_df = pd.read_csv(soundscape_labels_path)
 
-    train_audio_meta = prepare_train_audio_metadata(train_audio_df, train_audio_dir)
     soundscape_meta = prepare_soundscape_metadata(soundscape_df, train_soundscape_dir)
 
-    unique_soundscapes = sorted(soundscape_meta["filename"].unique().tolist())
-    soundscape_train_files, soundscape_val_files = train_test_split(
-        unique_soundscapes,
-        test_size=val_split,
-        random_state=seed,
-    )
-    soundscape_train_meta = soundscape_meta[
-        soundscape_meta["filename"].isin(soundscape_train_files)
-    ].reset_index(drop=True)
-    soundscape_val_meta = soundscape_meta[
-        soundscape_meta["filename"].isin(soundscape_val_files)
-    ].reset_index(drop=True)
+    gss = GroupShuffleSplit(n_splits=1, test_size=val_split, random_state=seed)
+    train_idx, val_idx = next(gss.split(soundscape_meta, groups=soundscape_meta["filename"].astype(str)))
+    soundscape_train_meta = soundscape_meta.iloc[train_idx].reset_index(drop=True)
+    soundscape_val_meta = soundscape_meta.iloc[val_idx].reset_index(drop=True)
 
-    train_meta = pd.concat([train_audio_meta, soundscape_train_meta], ignore_index=True)
+    train_meta = soundscape_train_meta.copy()
     val_meta = soundscape_val_meta.copy()
 
     label_source = pd.concat([train_meta, val_meta], ignore_index=True)
@@ -773,7 +854,13 @@ def main() -> None:
             f"Expected {expected_num_classes} classes from taxonomy, got {len(label_map)}."
         )
 
+    perch_labels_path = repo_root / "models" / "perch_v2_cpu" / "1" / "assets" / "labels.csv"
+    if not perch_labels_path.exists():
+        raise FileNotFoundError(f"Missing Perch labels file: {perch_labels_path}")
+    mapped_label_indices = build_perch_mapped_label_indices(taxonomy_path, perch_labels_path, label_map)
+
     train_rank_meta = build_rank_metadata_shard(train_meta, world_size=world_size, rank=rank)
+    _print_main(rank, f"Mapped validation labels: {len(mapped_label_indices)}")
 
     val_dataset = None
     if _is_main_process(rank):
@@ -807,6 +894,7 @@ def main() -> None:
                 train_rank_meta=train_rank_meta,
                 val_dataset=val_dataset,
                 label_map=label_map,
+                mapped_label_indices=mapped_label_indices,
                 base_model_config=base_model_config,
                 output_dir=output_dir,
                 device=device,
