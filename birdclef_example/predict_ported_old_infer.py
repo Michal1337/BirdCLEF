@@ -531,16 +531,10 @@ def infer_perch_with_embeddings(paths, batch_files=16, verbose=True, proxy_reduc
     return meta_df, scores, embeddings
 
 def resolve_full_cache_paths():
-    candidates = []
-
-    candidates.append((
-        BUNDLE_DIR / "full_perch_meta.parquet",
-        BUNDLE_DIR / "full_perch_arrays.npz"
-    ))
-
-    for meta_path, npz_path in candidates:
-        if meta_path.exists() and npz_path.exists():
-            return meta_path, npz_path
+    meta_path = BUNDLE_DIR / "full_perch_meta.parquet"
+    npz_path = BUNDLE_DIR / "full_perch_arrays.npz"
+    if meta_path.exists() and npz_path.exists():
+        return meta_path, npz_path
 
     return None, None
 
@@ -1298,6 +1292,10 @@ if MODE == "submit":
 
     PRIMARY_LABELS = list(bundle["primary_labels"])
     N_CLASSES = int(bundle["n_classes"])
+    if len(PRIMARY_LABELS) != N_CLASSES:
+        raise ValueError(
+            f"Bundle class mismatch: len(primary_labels)={len(PRIMARY_LABELS)} != n_classes={N_CLASSES}"
+        )
     N_WINDOWS = int(bundle.get("n_windows", N_WINDOWS))
     CFG = restore_cfg_paths(bundle.get("cfg", {}))
     CFG["full_cache_input_dir"] = BUNDLE_DIR
@@ -1357,11 +1355,13 @@ if MODE == "submit":
 
     test_paths = sorted((BASE / "test_soundscapes").glob("*.ogg"))
     if len(test_paths) == 0:
-        n_dry = int(CFG.get("dryrun_n_files", 20))
-        print(f"test_soundscapes not found, running dry-run on first {n_dry} train soundscapes")
-        test_paths = sorted((BASE / "train_soundscapes").glob("*.ogg"))[:n_dry]
+        train_fallback_limit = 50
+        print(
+            f"test_soundscapes not found, running inference on first {train_fallback_limit} train_soundscapes files"
+        )
+        test_paths = sorted((BASE / "train_soundscapes").glob("*.ogg"))[:train_fallback_limit]
         if len(test_paths) == 0:
-            raise RuntimeError("No files found in test_soundscapes or train_soundscapes for dry-run inference")
+            raise RuntimeError("No files found in test_soundscapes or train_soundscapes for inference")
 
     meta_test, scores_test_raw, emb_test = infer_perch_with_embeddings(
         test_paths,
@@ -1466,9 +1466,9 @@ if MODE == "submit":
             ).numpy()
         final_test_scores = final_test_scores + CORRECTION_WEIGHT * test_correction.reshape(-1, N_CLASSES).astype(np.float32)
 
-    temp_cfg = CFG["temperature"]
-    T_AVES = temp_cfg["aves"]
-    T_TEXTURE = temp_cfg["texture"]
+    temp_cfg = CFG.get("temperature", {})
+    T_AVES = float(temp_cfg.get("aves", 1.0))
+    T_TEXTURE = float(temp_cfg.get("texture", 1.0))
     class_temperatures = np.ones(N_CLASSES, dtype=np.float32) * T_AVES
     for ci, label in enumerate(PRIMARY_LABELS):
         if CLASS_NAME_MAP.get(label, "Aves") in TEXTURE_TAXA:
@@ -1487,13 +1487,21 @@ if MODE == "submit":
         probs = adaptive_delta_smooth(probs, n_windows=N_WINDOWS, base_alpha=alpha)
         probs = np.clip(probs, 0.0, 1.0)
 
+    # Keep raw probabilities for AUC reporting; threshold shaping is for submission behavior.
+    probs_raw_for_eval = probs.copy()
     probs = apply_per_class_thresholds(probs, PER_CLASS_THRESHOLDS, n_windows=N_WINDOWS)
     submission = pd.DataFrame(probs, columns=PRIMARY_LABELS)
     submission.insert(0, "row_id", meta_test["row_id"].values)
     submission[PRIMARY_LABELS] = submission[PRIMARY_LABELS].astype(np.float32)
+    if submission.shape[1] != (N_CLASSES + 1):
+        raise ValueError(
+            f"Unexpected submission width: got {submission.shape[1]}, expected {N_CLASSES + 1} (row_id + classes)"
+        )
     submission.to_csv("submission.csv", index=False)
     print("Saved submission.csv from portable bundle")
-    print("Submission shape:", submission.shape)
+    print(
+        f"Submission shape: {submission.shape} (includes 1 row_id + {N_CLASSES} class columns)"
+    )
 
     # Train-style evaluation when labels are available (e.g., dry-run on train soundscapes).
     try:
@@ -1524,12 +1532,16 @@ if MODE == "submit":
             ].copy()
 
             sub_eval = submission[submission["row_id"].isin(sc_eval["row_id"])].copy()
+            sub_eval_raw = pd.DataFrame(probs_raw_for_eval, columns=PRIMARY_LABELS)
+            sub_eval_raw.insert(0, "row_id", meta_test["row_id"].values)
+            sub_eval_raw = sub_eval_raw[sub_eval_raw["row_id"].isin(sc_eval["row_id"])].copy()
             n_matched = len(sub_eval)
             if n_matched > 0:
                 label_to_idx_local = {c: i for i, c in enumerate(PRIMARY_LABELS)}
                 row_to_labels = dict(zip(sc_eval["row_id"], sc_eval["label_list"]))
                 y_true = np.zeros((n_matched, N_CLASSES), dtype=np.uint8)
-                y_pred = sub_eval[PRIMARY_LABELS].to_numpy(dtype=np.float32)
+                y_pred_raw = sub_eval_raw[PRIMARY_LABELS].to_numpy(dtype=np.float32)
+                y_pred_post = sub_eval[PRIMARY_LABELS].to_numpy(dtype=np.float32)
 
                 for i, rid in enumerate(sub_eval["row_id"].tolist()):
                     for cls_name in row_to_labels.get(rid, []):
@@ -1538,15 +1550,22 @@ if MODE == "submit":
                             y_true[i, idx] = 1
 
                 if (y_true.sum(axis=0) > 0).any():
-                    auc_window = macro_auc_skip_empty(y_true, y_pred)
-                    print(f"Macro ROC AUC (train-style window-level): {auc_window:.6f} | rows={n_matched}")
+                    auc_window_raw = macro_auc_skip_empty(y_true, y_pred_raw)
+                    auc_window_post = macro_auc_skip_empty(y_true, y_pred_post)
+                    print(f"Macro ROC AUC (train-style window-level, raw probs): {auc_window_raw:.6f} | rows={n_matched}")
+                    print(f"Macro ROC AUC (train-style window-level, post-threshold): {auc_window_post:.6f} | rows={n_matched}")
 
                     if n_matched % N_WINDOWS == 0:
                         y_true_file = y_true.reshape(-1, N_WINDOWS, N_CLASSES).max(axis=1)
-                        y_pred_file = y_pred.reshape(-1, N_WINDOWS, N_CLASSES).max(axis=1)
+                        y_pred_file_raw = y_pred_raw.reshape(-1, N_WINDOWS, N_CLASSES).max(axis=1)
+                        y_pred_file_post = y_pred_post.reshape(-1, N_WINDOWS, N_CLASSES).max(axis=1)
                         if (y_true_file.sum(axis=0) > 0).any():
-                            auc_file = macro_auc_skip_empty(y_true_file, y_pred_file)
-                            print(f"Macro ROC AUC (train-style file-level max): {auc_file:.6f} | files={len(y_true_file)}")
+                            auc_file_raw = macro_auc_skip_empty(y_true_file, y_pred_file_raw)
+                            auc_file_post = macro_auc_skip_empty(y_true_file, y_pred_file_post)
+                            print(f"Macro ROC AUC (train-style file-level max, raw probs): {auc_file_raw:.6f} | files={len(y_true_file)}")
+                            print(f"Macro ROC AUC (train-style file-level max, post-threshold): {auc_file_post:.6f} | files={len(y_true_file)}")
+
+                    print("Note: this infer-side metric is in-sample when run on train soundscapes and is expected to be higher than train-time honest OOF AUC.")
                 else:
                     print("Macro ROC AUC unavailable: matched rows contain no positive labels")
             else:

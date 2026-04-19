@@ -515,27 +515,10 @@ def infer_perch_with_embeddings(paths, batch_files=16, verbose=True, proxy_reduc
     return meta_df, scores, embeddings
 
 def resolve_full_cache_paths():
-    candidates = []
-
-    candidates.append((
-        CFG["full_cache_work_dir"] / "full_perch_meta.parquet",
-        CFG["full_cache_work_dir"] / "full_perch_arrays.npz"
-    ))
-
-    candidates.append((
-        REPO_ROOT / "data" / "perch_cache" / "full_perch_meta.parquet",
-        REPO_ROOT / "data" / "perch_cache" / "full_perch_arrays.npz"
-    ))
-
-    if CFG["full_cache_input_dir"].exists():
-        candidates.append((
-            CFG["full_cache_input_dir"] / "full_perch_meta.parquet",
-            CFG["full_cache_input_dir"] / "full_perch_arrays.npz"
-        ))
-
-    for meta_path, npz_path in candidates:
-        if meta_path.exists() and npz_path.exists():
-            return meta_path, npz_path
+    meta_path = CFG["full_cache_input_dir"] / "full_perch_meta.parquet"
+    npz_path = CFG["full_cache_input_dir"] / "full_perch_arrays.npz"
+    if meta_path.exists() and npz_path.exists():
+        return meta_path, npz_path
 
     return None, None
 
@@ -682,7 +665,8 @@ def build_oof_base_prior(scores_full_raw, meta_full, sc_clean, Y_SC, n_splits=5,
     aligned_indices = [row_id_to_idx[r] for r in meta_full["row_id"]]
     Y_ALIGNED = Y_SC[aligned_indices]
 
-    y_strat = np.argmax(Y_ALIGNED, axis=1)
+    y_row_sum = Y_ALIGNED.sum(axis=1)
+    y_strat = np.where(y_row_sum > 0, np.argmax(Y_ALIGNED, axis=1), -1).astype(np.int32)
     unique_classes, counts = np.unique(y_strat, return_counts=True)
     rare_classes = unique_classes[counts < n_splits]
     y_strat[np.isin(y_strat, rare_classes)] = -1
@@ -892,7 +876,13 @@ def run_oof_embedding_probe(
         tr_idx = np.sort(tr_idx)
         va_idx = np.sort(va_idx)
 
+        train_files = set(meta_df.iloc[tr_idx]["filename"].tolist())
         val_files = set(meta_df.iloc[va_idx]["filename"].tolist())
+        overlap = train_files.intersection(val_files)
+        if overlap:
+            raise RuntimeError(
+                f"Embedding probe fold {fold}: validation contains seen files ({len(overlap)} overlaps); example={next(iter(overlap))}"
+            )
 
         prior_mask = ~sc_clean["filename"].isin(val_files).values
         prior_df_fold = sc_clean.loc[prior_mask].reset_index(drop=True)
@@ -1481,7 +1471,7 @@ def train_proto_ssm_single(model, emb_train, logits_train, labels_train,
 
 def run_proto_ssm_oof(emb_files, logits_files, labels_files,
                       site_ids_all, hours_all,
-                      file_families, file_groups,
+                      file_families, file_names,
                       n_families, class_to_family,
                       cfg=None, verbose=True):
     """Run StratifiedGroupKFold OOF cross-validation for ProtoSSM v4."""
@@ -1496,7 +1486,8 @@ def run_proto_ssm_oof(emb_files, logits_files, labels_files,
     fold_histories = []
     fold_alphas = []
 
-    n_unique_groups = len(set(file_groups))
+    file_names = np.asarray(file_names)
+    n_unique_groups = len(set(file_names.tolist()))
     if n_unique_groups < n_splits:
         print(f"  WARNING: Only {n_unique_groups} groups, reducing n_splits from {n_splits} to {n_unique_groups}")
         n_splits = n_unique_groups
@@ -1512,7 +1503,14 @@ def run_proto_ssm_oof(emb_files, logits_files, labels_files,
     y_strat[np.isin(y_strat, rare_classes)] = -1
 
     sgkf = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=91)
-    for fold_i, (train_idx, val_idx) in enumerate(sgkf.split(emb_files, y_strat, groups=file_groups)):
+    for fold_i, (train_idx, val_idx) in enumerate(sgkf.split(emb_files, y_strat, groups=file_names)):
+        train_files = set(file_names[train_idx].tolist())
+        val_files = set(file_names[val_idx].tolist())
+        overlap = train_files.intersection(val_files)
+        if overlap:
+            raise RuntimeError(
+                f"ProtoSSM OOF fold {fold_i+1}: validation contains seen files ({len(overlap)} overlaps); example={next(iter(overlap))}"
+            )
         if verbose:
             print(f"\n--- Fold {fold_i+1}/{n_splits} (train={len(train_idx)}, val={len(val_idx)}) ---")
 
@@ -2329,8 +2327,8 @@ for EXPERIMENT_PRESET in PRESET_RUN_LIST:
         for ci in active_classes:
             file_families[fi, class_to_family[ci]] = 1.0
     if MODE == "train":
-        file_groups = np.array([f.split("_")[3] if len(f.split("_")) > 3 else f for f in file_list])
-        print(f"File groups for OOF: {len(set(file_groups))} unique groups: {sorted(set(file_groups))}")
+        file_groups = np.array(file_list, dtype=object)
+        print(f"File groups for OOF (full filenames): {len(set(file_groups))} unique groups")
         t0_oof = time.time()
         oof_proto_preds, fold_histories, fold_alphas = run_proto_ssm_oof(
             emb_files, logits_files, labels_files,
