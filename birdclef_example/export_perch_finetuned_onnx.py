@@ -35,7 +35,7 @@ except Exception as exc:
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_BASE_ONNX = REPO_ROOT / "models" / "perch_onnx" / "perch_v2.onnx"
-DEFAULT_OUTPUT_ONNX = REPO_ROOT / "models" / "perch_onnx" / "perch_v2_finetuned_partial.onnx"
+DEFAULT_OUTPUT_ONNX = REPO_ROOT / "models" / "perch_onnx" / "perch_v2_finetuned.onnx"
 HEAD_W_NAME = "jit(infer_fn)/MultiHeadClassifier/MultiHeadClassifier._call_model/heads_protopnet_logits/dot_general6_reshaped_0"
 HEAD_ALPHA_NAME = "arith.constant62"
 HEAD_BIAS_NAME = "arith.constant61"
@@ -50,14 +50,49 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _resolve_head_tensors(state: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    aliases = {
+        "weight": ["weight", "model.weight", "head.weight", "module.weight", "state_dict.weight"],
+        "alpha": ["alpha", "model.alpha", "head.alpha", "module.alpha", "state_dict.alpha"],
+        "bias": ["bias", "model.bias", "head.bias", "module.bias", "state_dict.bias"],
+    }
+
+    resolved: Dict[str, torch.Tensor] = {}
+    for dst_key, candidates in aliases.items():
+        hit = next((k for k in candidates if k in state), None)
+        if hit is None:
+            # Fallback: accept any key that ends with the desired tensor name.
+            # This handles wrappers like "model.head.weight".
+            hit = next((k for k in state if k.endswith(f".{dst_key}") or k == dst_key), None)
+        if hit is not None:
+            resolved[dst_key] = state[hit]
+
+    missing = [k for k in ("weight", "alpha", "bias") if k not in resolved]
+    if missing:
+        sample = ", ".join(list(state.keys())[:12])
+        raise KeyError(
+            f"Checkpoint is missing required head tensors: {missing}. "
+            f"Available keys sample: [{sample}]"
+        )
+    return resolved
+
+
 def _load_checkpoint(checkpoint_path: Path) -> Dict[str, torch.Tensor]:
     data = torch.load(checkpoint_path, map_location="cpu")
     if not isinstance(data, dict):
         raise TypeError(f"Expected checkpoint dict, got {type(data)!r}")
-    missing = [key for key in ("weight", "alpha", "bias") if key not in data]
-    if missing:
-        raise KeyError(f"Checkpoint is missing required keys: {missing}")
-    return data
+
+    # Old format: tensors at top level.
+    if all(k in data for k in ("weight", "alpha", "bias")):
+        return {"weight": data["weight"], "alpha": data["alpha"], "bias": data["bias"]}
+
+    # New format: tensors under state_dict.
+    state_dict = data.get("state_dict")
+    if isinstance(state_dict, dict):
+        return _resolve_head_tensors(state_dict)
+
+    # Last fallback: treat whole dict as a potential state dict.
+    return _resolve_head_tensors(data)
 
 
 def main() -> None:
