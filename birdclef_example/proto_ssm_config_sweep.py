@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import random
 import time
 from pathlib import Path
 from typing import Dict, List, Sequence, Tuple
@@ -643,7 +644,15 @@ def results_to_table(results: List[Dict[str, object]]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+SEED = 1337
+
+
 def main() -> None:
+    random.seed(SEED)
+    np.random.seed(SEED)
+    torch.manual_seed(SEED)
+    torch.cuda.manual_seed_all(SEED)
+
     args = parse_args()
     for p in [args.cache_meta, args.cache_npz, args.sample_submission, args.sound_labels]:
         if not p.exists():

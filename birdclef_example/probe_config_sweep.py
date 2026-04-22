@@ -221,7 +221,7 @@ def train_torch_probes(
     patience = int(cfg.get("patience", 10))
     val_fraction = float(cfg.get("val_fraction", 0.15))
     standardize_features = bool(cfg.get("standardize_features", True))
-    seed = int(cfg.get("seed", 42))
+    seed = int(cfg.get("seed", 1337))
 
     scaler, pca, z = fit_embedding_features(emb, pca_dim)
 
@@ -551,14 +551,16 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="If >0, run only first N configs",
     )
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--seed", type=int, default=1337)
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
+    random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
 
     print("Loading cache arrays...")
     meta_df, scores_raw, emb = load_cache(args.cache_meta, args.cache_npz)

@@ -5,6 +5,7 @@ Order: imports, definitions, configs/init variables, execution.
 # 1) Imports
 import copy
 import json
+import random
 import subprocess, sys, os
 from pathlib import Path
 import os, re, gc, time, warnings
@@ -19,7 +20,6 @@ import re as _re
 import concurrent.futures
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
-from sklearn.neural_network import MLPClassifier
 import torch
 import torch.nn as nn
 from sklearn.isotonic import IsotonicRegression
@@ -335,204 +335,161 @@ def build_sequential_features(scores_col, n_windows=12):
     return prev.reshape(-1), next_.reshape(-1), mean, max_, std
 
 
-def train_mlp_probes(emb, scores_raw, Y, min_pos=5, pca_dim=64, alpha_blend=0.4):
-    """
-    CHANGE 1: Upgraded MLP probe.
-    - pca_dim: 32 → 64  (more embedding information)
-    - hidden:  (32,) → (128, 64)  (more capacity)
-    - max_iter: 100 → 300  (longer training)
-    - min_pos: 8 → 5  (catches more rare species)
-    """
-    # Step 1: Compress embeddings
+class TorchProbeMLP(nn.Module):
+    def __init__(self, in_dim, hidden_dims, dropout):
+        super().__init__()
+        dims = [in_dim] + list(hidden_dims) + [1]
+        layers = []
+        for i in range(len(dims) - 1):
+            layers.append(nn.Linear(dims[i], dims[i + 1]))
+            if i < len(dims) - 2:
+                layers.append(nn.ReLU())
+                if dropout > 0.0:
+                    layers.append(nn.Dropout(dropout))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.net(x).squeeze(-1)
+
+
+def train_torch_probes(emb, scores_raw, Y, cfg):
+    min_pos = int(cfg.get("min_pos", 5))
+    pca_dim = int(cfg.get("pca_dim", 64))
+    max_rows = int(cfg.get("max_rows", 3000))
+    hidden_dims = tuple(cfg.get("hidden_dims", (128, 64)))
+    dropout = float(cfg.get("dropout", 0.1))
+    epochs = int(cfg.get("epochs", 80))
+    batch_size = int(cfg.get("batch_size", 512))
+    lr = float(cfg.get("lr", 1e-3))
+    weight_decay = float(cfg.get("weight_decay", 1e-4))
+    patience = int(cfg.get("patience", 10))
+    val_fraction = float(cfg.get("val_fraction", 0.15))
+    standardize_features = bool(cfg.get("standardize_features", True))
+    seed = int(cfg.get("seed", SEED))
+
     scaler = StandardScaler()
-    emb_s = scaler.fit_transform(emb)
+    emb_s = scaler.fit_transform(emb).astype(np.float32)
     if pca_dim > 0:
-        pca = PCA(n_components=min(pca_dim, emb_s.shape[1] - 1))
-        Z = pca.fit_transform(emb_s).astype(np.float32)
+        n_components = min(int(pca_dim), emb_s.shape[1] - 1)
+        pca = PCA(n_components=n_components)
+        z = pca.fit_transform(emb_s).astype(np.float32)
         print(
-        f"Embedding: {emb.shape} → PCA: {Z.shape}  "
-        f"(variance retained: {pca.explained_variance_ratio_.sum():.2%})"
-    )
+            f"Embedding: {emb.shape} → PCA: {z.shape}  "
+            f"(variance retained: {pca.explained_variance_ratio_.sum():.2%})"
+        )
     else:
         pca = None
-        Z = emb_s.astype(np.float32)
+        z = emb_s
 
     class_weights = build_class_freq_weights(Y, cap=10.0)
-
-    probe_models = {}
     active = np.where(Y.sum(axis=0) >= min_pos)[0]
-    print(
-        f"Training MLP probes for {len(active)} species (>= {min_pos} pos windows)..."
-    )
+    print(f"Training torch probes for {len(active)} species (>= {min_pos} pos windows)...")
 
-    MAX_ROWS = 3000  # slightly higher budget for (128,64) layers
+    rng = np.random.default_rng(seed)
+    device = torch.device("cpu")
+    probe_models = {}
 
-    for ci in tqdm(active, desc="MLP probes"):
-        y = Y[:, ci]
-        if y.sum() == 0 or y.sum() == len(y):
+    for ci in tqdm(active, desc="Torch probes"):
+        yc = Y[:, ci].astype(np.float32)
+        if yc.sum() == 0 or yc.sum() == len(yc):
             continue
 
         prev, next_, mean, max_, std = build_sequential_features(scores_raw[:, ci])
-        X = np.hstack(
-            [
-                Z,
-                scores_raw[:, ci : ci + 1],
-                prev[:, None],
-                next_[:, None],
-                mean[:, None],
-                max_[:, None],
-                std[:, None],
-            ]
-        )
+        x = np.hstack([
+            z,
+            scores_raw[:, ci : ci + 1],
+            prev[:, None], next_[:, None], mean[:, None], max_[:, None], std[:, None],
+        ]).astype(np.float32)
 
-        n_pos = int(y.sum())
-        n_neg = len(y) - n_pos
-        pos_idx = np.where(y == 1)[0]
-
+        n_pos = int(yc.sum())
+        n_neg = len(yc) - n_pos
+        pos_idx = np.where(yc == 1)[0]
         w = float(class_weights[ci])
-        repeat = max(1, int(round(w * n_neg / max(n_pos, 1))))
-        repeat = min(repeat, 8)
-        if n_pos * repeat + len(y) > MAX_ROWS:
-            repeat = max(1, (MAX_ROWS - len(y)) // max(n_pos, 1))
+        repeat = min(max(1, int(round(w * n_neg / max(n_pos, 1)))), 8)
+        if n_pos * repeat + len(yc) > max_rows:
+            repeat = max(1, (max_rows - len(yc)) // max(n_pos, 1))
 
-        X_bal = np.vstack([X, np.tile(X[pos_idx], (repeat, 1))])
-        y_bal = np.concatenate([y, np.ones(n_pos * repeat, dtype=y.dtype)])
+        x_bal = np.vstack([x, np.tile(x[pos_idx], (repeat, 1))]).astype(np.float32)
+        y_bal = np.concatenate([yc, np.ones(n_pos * repeat, dtype=np.float32)])
 
-        clf = MLPClassifier(
-            hidden_layer_sizes=(128, 64),  # CHANGE 1: was (32,)
-            activation="relu",
-            max_iter=300,  # CHANGE 1: was 100
-            early_stopping=True,
-            validation_fraction=0.15,
-            n_iter_no_change=15,  # CHANGE 1: was 10
-            random_state=42,
-            learning_rate_init=5e-4,  # CHANGE 1: was 1e-3 (lower lr for deeper net)
-            alpha=0.005,  # CHANGE 1: was 0.01
-        )
-        clf.fit(X_bal, y_bal)
-        probe_models[ci] = clf
+        n = len(y_bal)
+        n_val = max(1, int(round(n * val_fraction)))
+        perm = rng.permutation(n)
+        va_idx, tr_idx = perm[:n_val], perm[n_val:]
 
-    print(f"Trained {len(probe_models)} MLP probes")
-    return probe_models, scaler, pca, alpha_blend
+        x_tr, y_tr = x_bal[tr_idx], y_bal[tr_idx]
+        x_va, y_va = x_bal[va_idx], y_bal[va_idx]
+
+        if standardize_features:
+            mu = x_tr.mean(axis=0, keepdims=True)
+            sd = x_tr.std(axis=0, keepdims=True)
+            sd = np.where(sd < 1e-6, 1.0, sd)
+            x_tr = (x_tr - mu) / sd
+            x_va = (x_va - mu) / sd
+        else:
+            mu = np.zeros((1, x_bal.shape[1]), dtype=np.float32)
+            sd = np.ones((1, x_bal.shape[1]), dtype=np.float32)
+
+        model = TorchProbeMLP(in_dim=x_bal.shape[1], hidden_dims=hidden_dims, dropout=dropout).to(device)
+        opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+        criterion = nn.BCEWithLogitsLoss()
+
+        x_tr_t = torch.tensor(x_tr, dtype=torch.float32, device=device)
+        y_tr_t = torch.tensor(y_tr, dtype=torch.float32, device=device)
+        x_va_t = torch.tensor(x_va, dtype=torch.float32, device=device)
+        y_va_t = torch.tensor(y_va, dtype=torch.float32, device=device)
+
+        best_val, best_state, wait = float("inf"), None, 0
+        for _ep in range(epochs):
+            model.train()
+            order = torch.randperm(x_tr_t.shape[0], device=device)
+            for start in range(0, x_tr_t.shape[0], batch_size):
+                idx = order[start : start + batch_size]
+                loss = criterion(model(x_tr_t[idx]), y_tr_t[idx])
+                opt.zero_grad()
+                loss.backward()
+                opt.step()
+            model.eval()
+            with torch.no_grad():
+                val_loss = criterion(model(x_va_t), y_va_t).item()
+            if val_loss < best_val:
+                best_val = val_loss
+                best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+                wait = 0
+            else:
+                wait += 1
+                if wait >= patience:
+                    break
+
+        if best_state is not None:
+            model.load_state_dict(best_state)
+        model.eval()
+        probe_models[int(ci)] = {"model": model.cpu(), "mu": mu, "sd": sd}
+
+    print(f"Trained {len(probe_models)} torch probes")
+    return probe_models, scaler, pca
 
 
-def apply_mlp_probes(emb_test, scores_test, probe_models, scaler, pca, alpha_blend=0.4):
-    emb_s = scaler.transform(emb_test)
-    Z_test = pca.transform(emb_s).astype(np.float32) if pca is not None else emb_s.astype(np.float32)
-    result = scores_test.copy()
-    for ci, clf in probe_models.items():
+def predict_torch_probe_logits(emb_test, scores_test, probe_models, scaler, pca):
+    emb_s = scaler.transform(emb_test).astype(np.float32)
+    z_test = pca.transform(emb_s).astype(np.float32) if pca is not None else emb_s
+    probe_logits = scores_test.copy()
+    for ci, payload in probe_models.items():
         prev, next_, mean, max_, std = build_sequential_features(scores_test[:, ci])
-        X_test = np.hstack(
-            [
-                Z_test,
-                scores_test[:, ci : ci + 1],
-                prev[:, None],
-                next_[:, None],
-                mean[:, None],
-                max_[:, None],
-                std[:, None],
-            ]
-        )
-        prob = clf.predict_proba(X_test)[:, 1].astype(np.float32)
-        logit = np.log(prob + 1e-7) - np.log(1 - prob + 1e-7)
-        result[:, ci] = (1 - alpha_blend) * scores_test[:, ci] + alpha_blend * logit
-    return result
+        x_test = np.hstack([
+            z_test,
+            scores_test[:, ci : ci + 1],
+            prev[:, None], next_[:, None], mean[:, None], max_[:, None], std[:, None],
+        ]).astype(np.float32)
+        x_test = (x_test - payload["mu"]) / payload["sd"]
+        with torch.no_grad():
+            logits = payload["model"](torch.tensor(x_test, dtype=torch.float32)).numpy().astype(np.float32)
+        probe_logits[:, ci] = logits
+    return probe_logits
 
 
-class VectorizedMLPProbes(nn.Module):
-    """Stacks all per-class MLP weights into a single batched PyTorch model.
-    Replaces the slow Python for-loop over probe_models at inference time."""
-
-    def __init__(self, probe_models):
-        super().__init__()
-        self.valid_classes = sorted(probe_models.keys())
-        V = len(self.valid_classes)
-        if V == 0:
-            self.weights = nn.ParameterList()
-            self.biases = nn.ParameterList()
-            self.n_layers = 0
-            return
-
-        sample = probe_models[self.valid_classes[0]]
-        self.n_layers = len(sample.coefs_)
-        self.weights = nn.ParameterList()
-        self.biases = nn.ParameterList()
-
-        for layer_idx in range(self.n_layers):
-            W = np.stack(
-                [probe_models[c].coefs_[layer_idx] for c in self.valid_classes], axis=0
-            )  # (V, in, out)
-            b = np.stack(
-                [probe_models[c].intercepts_[layer_idx] for c in self.valid_classes],
-                axis=0,
-            )  # (V, out)
-            self.weights.append(
-                nn.Parameter(torch.tensor(W, dtype=torch.float32), requires_grad=False)
-            )
-            self.biases.append(
-                nn.Parameter(torch.tensor(b, dtype=torch.float32), requires_grad=False)
-            )
-
-    def forward(self, x):
-        # x: (V, N, in_dim)
-        h = x
-        for i in range(self.n_layers):
-            h = torch.bmm(h, self.weights[i]) + self.biases[i].unsqueeze(1)
-            if i < self.n_layers - 1:
-                h = torch.relu(h)
-        return h.squeeze(-1)  # (V, N)
-
-
-def apply_mlp_probes_vectorized(
-    emb_test, scores_test, probe_models, scaler, pca, alpha_blend=0.4
-):
-    """
-    Drop-in replacement for apply_mlp_probes().
-    Uses batched PyTorch matrix multiply instead of a Python for-loop —
-    ~10-50x faster at inference time.
-    """
-    if len(probe_models) == 0:
-        return scores_test.copy()
-
-    emb_s = scaler.transform(emb_test)
-    Z_test = pca.transform(emb_s).astype(np.float32) if pca is not None else emb_s.astype(np.float32)
-
-    valid_classes = sorted(probe_models.keys())
-    V = len(valid_classes)
-    N = len(scores_test)
-
-    # Build sequential features for all classes at once
-    raw = scores_test[:, valid_classes].T  # (V, N)
-    n_files = N // N_WINDOWS
-    raw_view = raw.reshape(V, n_files, N_WINDOWS)
-    prev = np.concatenate([raw_view[:, :, :1], raw_view[:, :, :-1]], axis=2).reshape(
-        V, N
-    )
-    nxt = np.concatenate([raw_view[:, :, 1:], raw_view[:, :, -1:]], axis=2).reshape(
-        V, N
-    )
-    mean = np.repeat(raw_view.mean(axis=2), N_WINDOWS, axis=1)
-    mx = np.repeat(raw_view.max(axis=2), N_WINDOWS, axis=1)
-    std = np.repeat(raw_view.std(axis=2), N_WINDOWS, axis=1)
-
-    # scalar_feats: (V, N, 6)
-    scalar_feats = np.stack([raw, prev, nxt, mean, mx, std], axis=-1).astype(np.float32)
-
-    # Z_test: (N, D) → broadcast to (V, N, D)
-    Z_expanded = np.broadcast_to(Z_test, (V, N, Z_test.shape[1]))
-
-    # X_all: (V, N, D+6)
-    X_all = np.concatenate([Z_expanded.astype(np.float32), scalar_feats], axis=-1)
-
-    vec_probe = VectorizedMLPProbes(probe_models)
-    vec_probe.eval()
-    with torch.no_grad():
-        preds = vec_probe(torch.tensor(X_all)).numpy()  # (V, N)
-
-    result = scores_test.copy()
-    base_valid = scores_test[:, valid_classes]  # (N, V)
-    result[:, valid_classes] = (1.0 - alpha_blend) * base_valid + alpha_blend * preds.T
-    return result
+def blend_probe_logits(base_scores, probe_logits, alpha_blend):
+    return (1.0 - alpha_blend) * base_scores + alpha_blend * probe_logits
 
 
 def calibrate_and_optimize_thresholds(
@@ -1244,7 +1201,7 @@ def train_residual_ssm(
     # Train / val split (file level, no shuffle leakage)
     n_val = max(1, int(n_files * 0.15))
     rng = torch.Generator()
-    rng.manual_seed(42)
+    rng.manual_seed(SEED)
     perm = torch.randperm(n_files, generator=rng).numpy()
     val_i = perm[:n_val]
     train_i = perm[n_val:]
@@ -1432,22 +1389,15 @@ def run_pipeline_oof(emb_full, sc_full, Y_full, meta_full, n_splits=5):
             )
 
         # ── Train MLP on train fold ────────────────────────────────────
-        probe_models, emb_scaler, emb_pca, alpha_blend = train_mlp_probes(
-            emb_tr_f,
-            sc_tr_f,
-            Y_tr_f,
-            min_pos=5,
-            pca_dim=64,
-            alpha_blend=0.4,
+        _mlp_cfg = CFG.get("mlp_params", {})
+        probe_models, emb_scaler, emb_pca = train_torch_probes(
+            emb_tr_f, sc_tr_f, Y_tr_f, _mlp_cfg,
         )
-
-        sc_va_mlp = apply_mlp_probes_vectorized(
-            emb_va_f,
-            sc_va_f,
-            probe_models,
-            emb_scaler,
-            emb_pca,
-            alpha_blend,
+        probe_logits_va = predict_torch_probe_logits(
+            emb_va_f, sc_va_f, probe_models, emb_scaler, emb_pca,
+        )
+        sc_va_mlp = blend_probe_logits(
+            sc_va_f, probe_logits_va, float(_mlp_cfg.get("alpha_blend", 0.15)),
         )
 
         # ── Ensemble + sigmoid ─────────────────────────────────────────
@@ -1501,9 +1451,8 @@ def run_pipeline_oof_fullstack(
     proto_focal_gamma = float(proto_cfg.get("focal_gamma", 0.0))
     proto_use_cosine_restart = bool(proto_cfg.get("use_cosine_restart", False))
     proto_restart_period = int(proto_cfg.get("restart_period", 20))
-    mlp_min_pos = int(CFG.get("mlp_min_pos", 5))
-    mlp_pca_dim = int(CFG.get("mlp_pca_dim", 64))
-    mlp_alpha_blend = float(CFG.get("mlp_alpha_blend", 0.40))
+    mlp_cfg = CFG.get("mlp_params", {})
+    mlp_alpha_blend = float(mlp_cfg.get("alpha_blend", 0.40))
     resid_cfg = CFG.get("residual_ssm", {})
     residual_n_epochs = int(resid_cfg.get("n_epochs", 30))
     residual_patience = int(resid_cfg.get("patience", 8))
@@ -1593,13 +1542,8 @@ def run_pipeline_oof_fullstack(
             restart_period=proto_restart_period,
             verbose=False,
         )
-        probe_models, emb_scaler, emb_pca, alpha_blend = train_mlp_probes(
-            emb_tr_f,
-            sc_tr_f,
-            Y_tr_f,
-            min_pos=mlp_min_pos,
-            pca_dim=mlp_pca_dim,
-            alpha_blend=mlp_alpha_blend,
+        probe_models, emb_scaler, emb_pca = train_torch_probes(
+            emb_tr_f, sc_tr_f, Y_tr_f, mlp_cfg,
         )
 
         # Fold-local priors (no leakage)
@@ -1656,13 +1600,10 @@ def run_pipeline_oof_fullstack(
             tables=prior_tables_fold,
             lambda_prior=lambda_prior,
         )
-        sc_va_mlp = apply_mlp_probes_vectorized(
-            emb_va_f,
+        sc_va_mlp = blend_probe_logits(
             sc_va_prior,
-            probe_models,
-            emb_scaler,
-            emb_pca,
-            alpha_blend,
+            predict_torch_probe_logits(emb_va_f, sc_va_prior, probe_models, emb_scaler, emb_pca),
+            mlp_alpha_blend,
         )
         first_pass_va = ensemble_w * proto_va + (1.0 - ensemble_w) * sc_va_mlp
 
@@ -1715,13 +1656,10 @@ def run_pipeline_oof_fullstack(
             tables=prior_tables_fold,
             lambda_prior=lambda_prior,
         )
-        sc_tr_mlp = apply_mlp_probes_vectorized(
-            emb_tr_f,
+        sc_tr_mlp = blend_probe_logits(
             sc_tr_prior,
-            probe_models,
-            emb_scaler,
-            emb_pca,
-            alpha_blend,
+            predict_torch_probe_logits(emb_tr_f, sc_tr_prior, probe_models, emb_scaler, emb_pca),
+            mlp_alpha_blend,
         )
         first_pass_tr = ensemble_w * proto_tr_flat + (1.0 - ensemble_w) * sc_tr_mlp
 
@@ -1839,20 +1777,22 @@ CFG = {
     "tta_shifts": [0, 1, -1, 2, -2],
     "threshold_grid": [0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70],
 
-    # MLP probes
-    "mlp_min_pos": 3,
-    "mlp_pca_dim": 0,
-    "mlp_alpha_blend": 0.15,
+    # MLP probes (torch)
     "mlp_params": {
-        "hidden_layer_sizes": (384, 192, 96),
-        "activation": "relu",
-        "max_iter": 500 if MODE == "train" else 200,
-        "early_stopping": True,
-        "validation_fraction": 0.15,
-        "n_iter_no_change": 20 if MODE == "train" else 10,
-        "random_state": 42,
-        "learning_rate_init": 6e-4,
-        "alpha": 0.005,
+        "min_pos": 3,
+        "pca_dim": 0,
+        "alpha_blend": 0.15,
+        "hidden_dims": (128, 64),
+        "dropout": 0.1,
+        "epochs": 80,
+        "batch_size": 512,
+        "lr": 1e-3,
+        "weight_decay": 1e-4,
+        "patience": 10,
+        "val_fraction": 0.15,
+        "standardize_features": True,
+        "max_rows": 3000,
+        "seed": 1337,
     },
 
     # proto_ssm config: ultra_attn_d448_s40_noswa_fastlr
@@ -1911,6 +1851,13 @@ baseline_auc = None
 oof_raw = None
 n_sites_cap = 20
 # 4) Execution
+SEED = 1337
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+torch.cuda.manual_seed_all(SEED)
+tf.random.set_seed(SEED)
+
 taxonomy = pd.read_csv("data/taxonomy.csv")
 sample_sub = pd.read_csv("data/sample_submission.csv")
 soundscape_labels = pd.read_csv("data/train_soundscapes_labels.csv")
@@ -1926,7 +1873,7 @@ print(
     f"  n_epochs={CFG['proto_ssm_train']['n_epochs']}  "
     f"patience={CFG['proto_ssm_train']['patience']}  "
     f"oof_n_splits=5  "
-    f"mlp_max_iter={CFG['mlp_params']['max_iter']}"
+    f"mlp_epochs={CFG['mlp_params']['epochs']}"
 )
 print("Config ready")
 print(
