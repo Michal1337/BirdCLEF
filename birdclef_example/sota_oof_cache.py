@@ -872,7 +872,11 @@ def train_light_proto_ssm(
             for fn in fnames
         ],
         dtype=np.int64,
-    )
+    )    
+    
+    torch.manual_seed(SEED)
+    torch.cuda.manual_seed_all(SEED)
+    np.random.seed(SEED)
 
     model = LightProtoSSM(
         d_input=emb_full.shape[1],
@@ -1542,12 +1546,6 @@ def run_pipeline_oof_fullstack(
             restart_period=proto_restart_period,
             verbose=False,
         )
-        probe_models, emb_scaler, emb_pca = train_torch_probes(
-            emb_tr_f, sc_tr_f, Y_tr_f, mlp_cfg,
-        )
-
-        # Fold-local priors (no leakage)
-        prior_tables_fold = build_prior_tables(meta_tr_f[["site", "hour_utc"]], Y_tr_f)
 
         # Validation metadata at file level
         n_va = len(emb_va_f) // N_WINDOWS
@@ -1593,6 +1591,9 @@ def run_pipeline_oof_fullstack(
                 .reshape(-1, N_CLASSES)
             )
 
+        # Fold-local priors (no leakage)
+        prior_tables_fold = build_prior_tables(meta_tr_f[["site", "hour_utc"]], Y_tr_f)
+
         sc_va_prior = apply_prior(
             sc_va_f,
             sites=meta_va_f["site"].to_numpy(),
@@ -1600,11 +1601,25 @@ def run_pipeline_oof_fullstack(
             tables=prior_tables_fold,
             lambda_prior=lambda_prior,
         )
+
+        sc_tr_prior = apply_prior(
+            sc_tr_f,
+            sites=meta_tr_f["site"].to_numpy(),
+            hours=meta_tr_f["hour_utc"].to_numpy(),
+            tables=prior_tables_fold,
+            lambda_prior=lambda_prior,
+        )
+
+        probe_models, emb_scaler, emb_pca = train_torch_probes(
+            emb_tr_f, sc_tr_prior, Y_tr_f, mlp_cfg,
+        )
+
         sc_va_mlp = blend_probe_logits(
             sc_va_prior,
             predict_torch_probe_logits(emb_va_f, sc_va_prior, probe_models, emb_scaler, emb_pca),
             mlp_alpha_blend,
         )
+
         first_pass_va = ensemble_w * proto_va + (1.0 - ensemble_w) * sc_va_mlp
 
         raw_perch_probs_va = sigmoid(sc_va_f)
@@ -1770,8 +1785,8 @@ CFG = {
     "dryrun_n_files": 20 if MODE == "train" else 0,
 
     # ensemble / post-processing
-    "ensemble_w": 0.50,
-    "lambda_prior": 0.40,
+    "ensemble_w": 0.85,
+    "lambda_prior": 0.0,
     "rank_power": 0.40,
     "smooth_alpha": 0.20,
     "tta_shifts": [0, 1, -1, 2, -2],
@@ -1781,7 +1796,7 @@ CFG = {
     "mlp_params": {
         "min_pos": 3,
         "pca_dim": 0,
-        "alpha_blend": 0.15,
+        "alpha_blend": 1,
         "hidden_dims": (128, 64),
         "dropout": 0.1,
         "epochs": 80,
@@ -1797,18 +1812,18 @@ CFG = {
 
     # proto_ssm config: ultra_attn_d448_s40_noswa_fastlr
     "proto_ssm_train": {
-        "n_epochs": 75,
-        "patience": 13,
-        "lr": 5e-4 * 1.35,
-        "n_sites": 24,
-        "d_model": 448,
-        "d_state": 40,
-        "n_ssm_layers": 4,
-        "dropout": 0.28,
-        "meta_dim": 56,
-        "distill_weight": 0.22,
-        "pos_weight_cap": 30.0,
-        "use_swa": False,
+        "n_epochs": 90,
+        "patience": 18,
+        "lr": 3.5e-4,
+        "n_sites": 28,
+        "d_model": 640,
+        "d_state": 64,
+        "n_ssm_layers": 5,
+        "dropout": 0.32,
+        "meta_dim": 72,
+        "distill_weight": 0.30,
+        "pos_weight_cap": 35.0,
+        "use_swa": True,
         "swa_start_frac": 1.1,
         "swa_lr": 0.0,
         "use_cross_attn": True,
@@ -1856,6 +1871,8 @@ random.seed(SEED)
 np.random.seed(SEED)
 torch.manual_seed(SEED)
 torch.cuda.manual_seed_all(SEED)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
 tf.random.set_seed(SEED)
 
 taxonomy = pd.read_csv("data/taxonomy.csv")
