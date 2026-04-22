@@ -711,7 +711,6 @@ class SelectiveSSM(nn.Module):
         self.D = nn.Parameter(torch.ones(d_model))
         self.B_proj = nn.Linear(d_model, d_state, bias=False)
         self.C_proj = nn.Linear(d_model, d_state, bias=False)
-        self.out_proj = nn.Linear(d_model, d_model, bias=False)
 
     def forward(self, x):
         B_sz, T, D = x.shape
@@ -863,6 +862,10 @@ def train_light_proto_ssm(
     scores_full,
     Y_full,
     meta_full,
+    emb_val=None,
+    scores_val=None,
+    y_val=None,
+    meta_val=None,
     n_epochs=40,
     patience=8,
     lr=1e-3,
@@ -879,22 +882,26 @@ def train_light_proto_ssm(
     swa_lr=4e-4,
     use_cross_attn=True,
     cross_attn_heads=2,
+    label_smoothing=0.0,
+    mixup_alpha=0.0,
+    focal_gamma=0.0,
+    use_cosine_restart=False,
+    restart_period=20,
     verbose=False,
 ):
-    """Train LightProtoSSM (CHANGE 4: with cross-attention). ~35s on CPU."""
     n_files = len(emb_full) // N_WINDOWS
     emb_f = emb_full.reshape(n_files, N_WINDOWS, -1)
     log_f = scores_full.reshape(n_files, N_WINDOWS, -1)
     lab_f = Y_full.reshape(n_files, N_WINDOWS, -1).astype(np.float32)
 
     fnames = meta_full["filename"].unique()
-    sites_u = sorted(meta_full["site"].unique())
+    sites_u = sorted(meta_full["site"].dropna().astype(str).unique())
     site2i = {s: i + 1 for i, s in enumerate(sites_u)}
     site_ids = np.array(
         [
             min(
                 site2i.get(
-                    meta_full.loc[meta_full["filename"] == fn, "site"].iloc[0], 0
+                    str(meta_full.loc[meta_full["filename"] == fn, "site"].iloc[0]), 0
                 ),
                 n_sites - 1,
             )
@@ -922,7 +929,7 @@ def train_light_proto_ssm(
         n_ssm_layers=n_ssm_layers,
         use_cross_attn=use_cross_attn,
         cross_attn_heads=cross_attn_heads,
-    )  # CHANGE 4
+    )
     model.init_prototypes(
         torch.tensor(emb_full, dtype=torch.float32),
         torch.tensor(Y_full, dtype=torch.float32),
@@ -935,21 +942,69 @@ def train_light_proto_ssm(
     site_t = torch.tensor(site_ids, dtype=torch.long)
     hour_t = torch.tensor(hour_ids, dtype=torch.long)
 
+    has_val = (
+        emb_val is not None
+        and scores_val is not None
+        and y_val is not None
+        and meta_val is not None
+    )
+    if has_val:
+        n_val_files = len(emb_val) // N_WINDOWS
+        emb_val_t = torch.tensor(
+            emb_val.reshape(n_val_files, N_WINDOWS, -1), dtype=torch.float32
+        )
+        log_val_t = torch.tensor(
+            scores_val.reshape(n_val_files, N_WINDOWS, -1), dtype=torch.float32
+        )
+        fnames_val = meta_val["filename"].unique()
+        site_ids_val = np.array(
+            [
+                min(
+                    site2i.get(
+                        str(meta_val.loc[meta_val["filename"] == fn, "site"].iloc[0]), 0
+                    ),
+                    n_sites - 1,
+                )
+                for fn in fnames_val
+            ],
+            dtype=np.int64,
+        )
+        hour_ids_val = np.array(
+            [
+                int(meta_val.loc[meta_val["filename"] == fn, "hour_utc"].iloc[0]) % 24
+                for fn in fnames_val
+            ],
+            dtype=np.int64,
+        )
+        site_val_t = torch.tensor(site_ids_val, dtype=torch.long)
+        hour_val_t = torch.tensor(hour_ids_val, dtype=torch.long)
+        y_val_flat = y_val.reshape(-1, N_CLASSES)
+
     pos_cnt = lab_t.sum(dim=(0, 1))
     total = lab_t.shape[0] * lab_t.shape[1]
-    pos_weight = ((total - pos_cnt) / (pos_cnt + 1)).clamp(max=pos_weight_cap)
+    pos_weight = ((total - pos_cnt) / (pos_cnt + 1.0)).clamp(max=float(pos_weight_cap))
+
+    if label_smoothing > 0:
+        lab_t_s = lab_t * (1 - label_smoothing) + label_smoothing * 0.5
+    else:
+        lab_t_s = lab_t
 
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-3)
-    sched = torch.optim.lr_scheduler.OneCycleLR(
-        opt,
-        max_lr=lr,
-        epochs=n_epochs,
-        steps_per_epoch=1,
-        pct_start=0.1,
-        anneal_strategy="cos",
-    )
+    if use_cosine_restart:
+        sched = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            opt, T_0=restart_period, eta_min=lr * 0.01
+        )
+    else:
+        sched = torch.optim.lr_scheduler.OneCycleLR(
+            opt,
+            max_lr=lr,
+            epochs=n_epochs,
+            steps_per_epoch=1,
+            pct_start=0.1,
+            anneal_strategy="cos",
+        )
 
-    best_loss, best_state, wait = float("inf"), None, 0
+    best_metric, best_state, wait = float("-inf"), None, 0
     if use_swa:
         swa_model = torch.optim.swa_utils.AveragedModel(model)
         swa_start = int(n_epochs * swa_start_frac)
@@ -959,12 +1014,28 @@ def train_light_proto_ssm(
         swa_start = n_epochs + 1
         swa_sched = None
 
+    def _loss_fn(logits, targets, pw):
+        bce = F.binary_cross_entropy_with_logits(
+            logits, targets, pos_weight=pw, reduction="none"
+        )
+        if focal_gamma > 0:
+            pt = torch.exp(-bce)
+            return ((1 - pt) ** focal_gamma * bce).mean()
+        return bce.mean()
+
     for ep in range(n_epochs):
         model.train()
-        out = model(emb_t, log_t, site_ids=site_t, hours=hour_t)
-        loss = F.binary_cross_entropy_with_logits(
-            out, lab_t, pos_weight=pos_weight[None, None, :]
-        ) + distill_weight * F.mse_loss(out, log_t)
+        if mixup_alpha > 0:
+            lam = float(np.random.beta(mixup_alpha, mixup_alpha))
+            idx = torch.randperm(emb_t.shape[0])
+            e_in = lam * emb_t + (1 - lam) * emb_t[idx]
+            l_in = lam * log_t + (1 - lam) * log_t[idx]
+            lab_in = lam * lab_t_s + (1 - lam) * lab_t_s[idx]
+        else:
+            e_in, l_in, lab_in = emb_t, log_t, lab_t_s
+
+        out = model(e_in, l_in, site_ids=site_t, hours=hour_t)
+        loss = _loss_fn(out, lab_in, pos_weight[None, None, :]) + distill_weight * F.mse_loss(out, l_in)
         opt.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -976,18 +1047,28 @@ def train_light_proto_ssm(
         else:
             sched.step()
 
-        if loss.item() < best_loss:
-            best_loss = loss.item()
+        if has_val:
+            model.eval()
+            with torch.no_grad():
+                out_val = model(emb_val_t, log_val_t, site_ids=site_val_t, hours=hour_val_t)
+            val_probs = 1.0 / (
+                1.0 + np.exp(-np.clip(out_val.numpy().reshape(-1, N_CLASSES), -30, 30))
+            )
+            monitor = float(macro_auc(y_val_flat, val_probs))
+        else:
+            monitor = -float(loss.item())
+
+        if monitor > best_metric:
+            best_metric = monitor
             best_state = {k: v.clone() for k, v in model.state_dict().items()}
             wait = 0
         else:
             wait += 1
         if wait >= patience:
             if verbose:
-                print(f"  Early stop ep {ep+1}")
+                print(f"  Early stop ep {ep + 1}")
             break
 
-    # Use SWA model for inference if we reached swa_start
     if use_swa and ep >= swa_start:
         torch.optim.swa_utils.update_bn(emb_t.unsqueeze(0), swa_model)
         model = swa_model
@@ -996,7 +1077,8 @@ def train_light_proto_ssm(
     model.eval()
     with torch.no_grad():
         out = model(emb_t, log_t, site_ids=site_t, hours=hour_t)
-    print(f"LightProtoSSM trained — best loss={best_loss:.4f}")
+    metric_label = f"val_auc={best_metric:.4f}" if has_val else f"best_loss={-best_metric:.4f}"
+    print(f"LightProtoSSM trained — {metric_label}")
     return model, site2i
 
 
@@ -1245,6 +1327,7 @@ def run_pipeline_oof(emb_full, sc_full, Y_full, meta_full, n_splits=5):
     """
     file_meta = meta_full.drop_duplicates("filename").reset_index(drop=True)
     proto_cfg = CFG.get("proto_ssm_train", {})
+    proto_n_sites = int(proto_cfg.get("n_sites", 20))
 
     gkf = GroupKFold(n_splits=n_splits)
     oof_probs = np.zeros((len(sc_full), N_CLASSES), dtype=np.float32)
@@ -1265,6 +1348,7 @@ def run_pipeline_oof(emb_full, sc_full, Y_full, meta_full, n_splits=5):
 
         emb_va_f = emb_full[va_mask]
         sc_va_f = sc_full[va_mask]
+        Y_va_f = Y_full[va_mask]
         meta_va_f = meta_full[va_mask].reset_index(drop=True)
 
         # ── Train ProtoSSM on train fold ───────────────────────────────
@@ -1273,10 +1357,14 @@ def run_pipeline_oof(emb_full, sc_full, Y_full, meta_full, n_splits=5):
             sc_tr_f,
             Y_tr_f,
             meta_tr_f,
+            emb_val=emb_va_f,
+            scores_val=sc_va_f,
+            y_val=Y_va_f,
+            meta_val=meta_va_f,
             n_epochs=int(proto_cfg.get("n_epochs", 40)),
             patience=int(proto_cfg.get("patience", 8)),
             lr=float(proto_cfg.get("lr", 1e-3)),
-            n_sites=int(proto_cfg.get("n_sites", 20)),
+            n_sites=proto_n_sites,
             d_model=int(proto_cfg.get("d_model", 128)),
             d_state=int(proto_cfg.get("d_state", 16)),
             n_ssm_layers=int(proto_cfg.get("n_ssm_layers", 2)),
@@ -1289,6 +1377,11 @@ def run_pipeline_oof(emb_full, sc_full, Y_full, meta_full, n_splits=5):
             swa_lr=float(proto_cfg.get("swa_lr", 4e-4)),
             use_cross_attn=bool(proto_cfg.get("use_cross_attn", True)),
             cross_attn_heads=int(proto_cfg.get("cross_attn_heads", 2)),
+            label_smoothing=float(proto_cfg.get("label_smoothing", 0.0)),
+            mixup_alpha=float(proto_cfg.get("mixup_alpha", 0.0)),
+            focal_gamma=float(proto_cfg.get("focal_gamma", 0.0)),
+            use_cosine_restart=bool(proto_cfg.get("use_cosine_restart", False)),
+            restart_period=int(proto_cfg.get("restart_period", 20)),
             verbose=False,
         )
 
@@ -1301,10 +1394,10 @@ def run_pipeline_oof(emb_full, sc_full, Y_full, meta_full, n_splits=5):
             [
                 min(
                     site2i.get(
-                        meta_va_f.loc[meta_va_f["filename"] == fn, "site"].iloc[0],
+                        str(meta_va_f.loc[meta_va_f["filename"] == fn, "site"].iloc[0]),
                         0,
                     ),
-                    19,
+                    proto_n_sites - 1,
                 )
                 for fn in va_fn_list
             ],
@@ -1385,7 +1478,6 @@ def run_pipeline_oof_fullstack(
     """
     n_splits = 5
     ensemble_w = float(CFG.get("ensemble_w", 0.50))
-    correction_weight = float(CFG.get("correction_weight", 0.30))
     lambda_prior = float(CFG.get("lambda_prior", 0.40))
     proto_cfg = CFG.get("proto_ssm_train", {})
     proto_n_epochs = int(proto_cfg.get("n_epochs", 40))
@@ -1404,12 +1496,19 @@ def run_pipeline_oof_fullstack(
     proto_swa_lr = float(proto_cfg.get("swa_lr", 4e-4))
     proto_use_cross_attn = bool(proto_cfg.get("use_cross_attn", True))
     proto_cross_attn_heads = int(proto_cfg.get("cross_attn_heads", 2))
+    proto_label_smoothing = float(proto_cfg.get("label_smoothing", 0.0))
+    proto_mixup_alpha = float(proto_cfg.get("mixup_alpha", 0.0))
+    proto_focal_gamma = float(proto_cfg.get("focal_gamma", 0.0))
+    proto_use_cosine_restart = bool(proto_cfg.get("use_cosine_restart", False))
+    proto_restart_period = int(proto_cfg.get("restart_period", 20))
     mlp_min_pos = int(CFG.get("mlp_min_pos", 5))
     mlp_pca_dim = int(CFG.get("mlp_pca_dim", 64))
     mlp_alpha_blend = float(CFG.get("mlp_alpha_blend", 0.40))
-    residual_n_epochs = int(CFG.get("residual_n_epochs", 30))
-    residual_patience = int(CFG.get("residual_patience", 8))
-    residual_lr = float(CFG.get("residual_lr", 1e-3))
+    resid_cfg = CFG.get("residual_ssm", {})
+    residual_n_epochs = int(resid_cfg.get("n_epochs", 30))
+    residual_patience = int(resid_cfg.get("patience", 8))
+    residual_lr = float(resid_cfg.get("lr", 1e-3))
+    correction_weight = float(resid_cfg.get("correction_weight", 0.30))
     rank_power = float(CFG.get("rank_power", 0.40))
     smooth_alpha = float(CFG.get("smooth_alpha", 0.20))
     tta_shifts = [int(x) for x in CFG.get("tta_shifts", [0, 1, -1, 2, -2])]
@@ -1458,6 +1557,7 @@ def run_pipeline_oof_fullstack(
 
         emb_va_f = emb_full[va_mask]
         sc_va_f = sc_full[va_mask]
+        Y_va_f = Y_full[va_mask]
         meta_va_f = meta_full[va_mask].reset_index(drop=True)
 
         # Train fold models
@@ -1466,6 +1566,10 @@ def run_pipeline_oof_fullstack(
             sc_tr_f,
             Y_tr_f,
             meta_tr_f,
+            emb_val=emb_va_f,
+            scores_val=sc_va_f,
+            y_val=Y_va_f,
+            meta_val=meta_va_f,
             n_epochs=proto_n_epochs,
             patience=proto_patience,
             lr=proto_lr,
@@ -1482,6 +1586,11 @@ def run_pipeline_oof_fullstack(
             swa_lr=proto_swa_lr,
             use_cross_attn=proto_use_cross_attn,
             cross_attn_heads=proto_cross_attn_heads,
+            label_smoothing=proto_label_smoothing,
+            mixup_alpha=proto_mixup_alpha,
+            focal_gamma=proto_focal_gamma,
+            use_cosine_restart=proto_use_cosine_restart,
+            restart_period=proto_restart_period,
             verbose=False,
         )
         probe_models, emb_scaler, emb_pca, alpha_blend = train_mlp_probes(
@@ -1503,10 +1612,10 @@ def run_pipeline_oof_fullstack(
             [
                 min(
                     site2i.get(
-                        meta_va_f.loc[meta_va_f["filename"] == fn, "site"].iloc[0],
+                        str(meta_va_f.loc[meta_va_f["filename"] == fn, "site"].iloc[0]),
                         0,
                     ),
-                    19,
+                    proto_n_sites - 1,
                 )
                 for fn in va_fn_list
             ],
@@ -1572,10 +1681,10 @@ def run_pipeline_oof_fullstack(
             [
                 min(
                     site2i.get(
-                        meta_tr_f.loc[meta_tr_f["filename"] == fn, "site"].iloc[0],
+                        str(meta_tr_f.loc[meta_tr_f["filename"] == fn, "site"].iloc[0]),
                         0,
                     ),
-                    19,
+                    proto_n_sites - 1,
                 )
                 for fn in tr_fn_list
             ],
@@ -1717,83 +1826,23 @@ CFG = {
     # inference
     "batch_files": 16,
 
-    # local CV
-    "oof_n_splits": 5 if MODE == "train" else 3,
+    # train-only flags
+    "run_oof": MODE == "train",
+    "verbose": MODE == "train",
+    "dryrun_n_files": 20 if MODE == "train" else 0,
 
-    # full-stack sweep defaults
+    # ensemble / post-processing
     "ensemble_w": 0.50,
-    "correction_weight": 0.30,
     "lambda_prior": 0.40,
-    "proto_n_epochs": 40,
-    "proto_patience": 8,
-    "proto_lr": 1e-3,
-    "proto_n_sites": 20,
-    "mlp_min_pos": 3,
-    "mlp_pca_dim": 0,
-    "mlp_alpha_blend": 0.15,
-    "residual_n_epochs": 30,
-    "residual_patience": 8,
-    "residual_lr": 1e-3,
     "rank_power": 0.40,
     "smooth_alpha": 0.20,
     "tta_shifts": [0, 1, -1, 2, -2],
     "threshold_grid": [0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70],
 
-    # dry-run
-    "dryrun_n_files": 20 if MODE == "train" else 0,
-
-    # train-only flags
-    "run_oof": MODE == "train",
-    "verbose": MODE == "train",
-
-    # V18 proto_ssm (ultra_attn + override applied)
-    "proto_ssm_train": {
-        "n_epochs": 75,
-        "lr": 5e-4 * 1.35,  # override applied
-        "weight_decay": 1e-3,
-        "val_ratio": 0.15,
-        "patience": max(6, 15 - 2),  # override applied → 13
-        "pos_weight_cap": 30.0,
-        "distill_weight": 0.22,
-        "proto_margin": 0.15,
-        "label_smoothing": 0.03,
-        "oof_n_splits": 5 if MODE == "train" else 3,
-        "mixup_alpha": 0.4,
-        "focal_gamma": 2.5,
-
-        # SWA disabled by override
-        "swa_start_frac": 1.1,
-        "swa_lr": 0.0,
-        "use_swa": False,
-
-        # architecture (ultra_attn)
-        "d_model": 448,
-        "d_state": 40,
-        "n_ssm_layers": 4,
-        "dropout": 0.28,
-        "meta_dim": 56,
-        "n_sites": 24,
-        "use_cross_attn": True,
-        "cross_attn_heads": 8,
-
-        # scheduler
-        "use_cosine_restart": True,
-        "restart_period": 20,
-    },
-
-    # residual SSM
-    "residual_ssm": {
-        "d_model": 128,
-        "d_state": 16,
-        "n_ssm_layers": 2,
-        "dropout": 0.1,
-        "correction_weight": 0.35,
-        "n_epochs": 40 if MODE == "train" else 20,
-        "lr": 8e-4,
-        "patience": 12 if MODE == "train" else 6,
-    },
-
-    # MLP
+    # MLP probes
+    "mlp_min_pos": 3,
+    "mlp_pca_dim": 0,
+    "mlp_alpha_blend": 0.15,
     "mlp_params": {
         "hidden_layer_sizes": (384, 192, 96),
         "activation": "relu",
@@ -1804,6 +1853,38 @@ CFG = {
         "random_state": 42,
         "learning_rate_init": 6e-4,
         "alpha": 0.005,
+    },
+
+    # proto_ssm config: ultra_attn_d448_s40_noswa_fastlr
+    "proto_ssm_train": {
+        "n_epochs": 75,
+        "patience": 13,
+        "lr": 5e-4 * 1.35,
+        "n_sites": 24,
+        "d_model": 448,
+        "d_state": 40,
+        "n_ssm_layers": 4,
+        "dropout": 0.28,
+        "meta_dim": 56,
+        "distill_weight": 0.22,
+        "pos_weight_cap": 30.0,
+        "use_swa": False,
+        "swa_start_frac": 1.1,
+        "swa_lr": 0.0,
+        "use_cross_attn": True,
+        "cross_attn_heads": 8,
+    },
+
+    # residual SSM
+    "residual_ssm": {
+        "d_model": 128,
+        "d_state": 16,
+        "n_ssm_layers": 2,
+        "dropout": 0.1,
+        "n_epochs": 30,
+        "patience": 8,
+        "lr": 1e-3,
+        "correction_weight": 0.30,
     },
 }
 INPUT_ROOT = Path("/kaggle/input")
