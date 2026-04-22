@@ -346,12 +346,16 @@ def train_mlp_probes(emb, scores_raw, Y, min_pos=5, pca_dim=64, alpha_blend=0.4)
     # Step 1: Compress embeddings
     scaler = StandardScaler()
     emb_s = scaler.fit_transform(emb)
-    pca = PCA(n_components=min(pca_dim, emb_s.shape[1] - 1))
-    Z = pca.fit_transform(emb_s).astype(np.float32)
-    print(
+    if pca_dim > 0:
+        pca = PCA(n_components=min(pca_dim, emb_s.shape[1] - 1))
+        Z = pca.fit_transform(emb_s).astype(np.float32)
+        print(
         f"Embedding: {emb.shape} → PCA: {Z.shape}  "
         f"(variance retained: {pca.explained_variance_ratio_.sum():.2%})"
     )
+    else:
+        pca = None
+        Z = emb_s.astype(np.float32)
 
     class_weights = build_class_freq_weights(Y, cap=10.0)
 
@@ -414,7 +418,7 @@ def train_mlp_probes(emb, scores_raw, Y, min_pos=5, pca_dim=64, alpha_blend=0.4)
 
 def apply_mlp_probes(emb_test, scores_test, probe_models, scaler, pca, alpha_blend=0.4):
     emb_s = scaler.transform(emb_test)
-    Z_test = pca.transform(emb_s).astype(np.float32)
+    Z_test = pca.transform(emb_s).astype(np.float32) if pca is not None else emb_s.astype(np.float32)
     result = scores_test.copy()
     for ci, clf in probe_models.items():
         prev, next_, mean, max_, std = build_sequential_features(scores_test[:, ci])
@@ -491,7 +495,7 @@ def apply_mlp_probes_vectorized(
         return scores_test.copy()
 
     emb_s = scaler.transform(emb_test)
-    Z_test = pca.transform(emb_s).astype(np.float32)
+    Z_test = pca.transform(emb_s).astype(np.float32) if pca is not None else emb_s.astype(np.float32)
 
     valid_classes = sorted(probe_models.keys())
     V = len(valid_classes)
@@ -1712,9 +1716,11 @@ MODE = "train"  # ← change to "train" for local CV
 CFG = {
     # inference
     "batch_files": 16,
+
     # local CV
     "oof_n_splits": 5 if MODE == "train" else 3,
-    # full-stack sweep defaults (can be overridden by OOF_SWEEP_CONFIGS)
+
+    # full-stack sweep defaults
     "ensemble_w": 0.50,
     "correction_weight": 0.30,
     "lambda_prior": 0.40,
@@ -1722,9 +1728,9 @@ CFG = {
     "proto_patience": 8,
     "proto_lr": 1e-3,
     "proto_n_sites": 20,
-    "mlp_min_pos": 5,
-    "mlp_pca_dim": 64,
-    "mlp_alpha_blend": 0.40,
+    "mlp_min_pos": 3,
+    "mlp_pca_dim": 0,
+    "mlp_alpha_blend": 0.15,
     "residual_n_epochs": 30,
     "residual_patience": 8,
     "residual_lr": 1e-3,
@@ -1732,39 +1738,50 @@ CFG = {
     "smooth_alpha": 0.20,
     "tta_shifts": [0, 1, -1, 2, -2],
     "threshold_grid": [0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70],
+
     # dry-run
     "dryrun_n_files": 20 if MODE == "train" else 0,
+
     # train-only flags
     "run_oof": MODE == "train",
     "verbose": MODE == "train",
-    # V18 proto_ssm
+
+    # V18 proto_ssm (ultra_attn + override applied)
     "proto_ssm_train": {
-        "n_epochs": 80 if MODE == "train" else 40,
-        "lr": 6.75e-4,
+        "n_epochs": 75,
+        "lr": 5e-4 * 1.35,  # override applied
         "weight_decay": 1e-3,
         "val_ratio": 0.15,
-        "patience": 14 if MODE == "train" else 8,
+        "patience": max(6, 15 - 2),  # override applied → 13
         "pos_weight_cap": 30.0,
-        "distill_weight": 0.25,
+        "distill_weight": 0.22,
         "proto_margin": 0.15,
         "label_smoothing": 0.03,
         "oof_n_splits": 5 if MODE == "train" else 3,
         "mixup_alpha": 0.4,
         "focal_gamma": 2.5,
+
+        # SWA disabled by override
         "swa_start_frac": 1.1,
         "swa_lr": 0.0,
         "use_swa": False,
-        "d_model": 512,
-        "d_state": 48,
+
+        # architecture (ultra_attn)
+        "d_model": 448,
+        "d_state": 40,
         "n_ssm_layers": 4,
-        "dropout": 0.3,
-        "meta_dim": 64,
+        "dropout": 0.28,
+        "meta_dim": 56,
         "n_sites": 24,
         "use_cross_attn": True,
         "cross_attn_heads": 8,
+
+        # scheduler
         "use_cosine_restart": True,
         "restart_period": 20,
     },
+
+    # residual SSM
     "residual_ssm": {
         "d_model": 128,
         "d_state": 16,
@@ -1775,15 +1792,17 @@ CFG = {
         "lr": 8e-4,
         "patience": 12 if MODE == "train" else 6,
     },
+
+    # MLP
     "mlp_params": {
-        "hidden_layer_sizes": (256, 128),
+        "hidden_layer_sizes": (384, 192, 96),
         "activation": "relu",
         "max_iter": 500 if MODE == "train" else 200,
         "early_stopping": True,
         "validation_fraction": 0.15,
         "n_iter_no_change": 20 if MODE == "train" else 10,
         "random_state": 42,
-        "learning_rate_init": 5e-4,
+        "learning_rate_init": 6e-4,
         "alpha": 0.005,
     },
 }
@@ -1951,16 +1970,6 @@ n_event = (temperatures > 1.0).sum()
 print(
     f"✅ Temperatures: {n_event} event species (T=1.10), {n_texture} texture species (T=0.95)"
 )
-print(
-    "✅ CHANGE 1: Upgraded MLP probe (pca_dim=64, hidden=(128,64), max_iter=300, min_pos=5)"
-)
-print("✅ Vectorized MLP probe inference defined")
-print("✅ CHANGE 2: Isotonic calibration + per-class threshold optimization defined")
-print("✅ Rank-aware scaling defined")
-print("✅ Adaptive delta smoothing defined")
-print("✅ CHANGE 4: LightProtoSSM with cross-attention (2 heads) defined")
-print("✅ CHANGE 3: TTA with 5 circular shifts defined")
-print("✅ ResidualSSM defined (~439K params, ~20s training)")
 if CFG["run_oof"]:
     print("Running honest OOF evaluation on training data…")
     baseline_auc, oof_raw = honest_oof_auc(
@@ -1978,7 +1987,7 @@ if CFG["run_oof"]:
     )
     base_cfg = copy.deepcopy(CFG)
     sweep_results = []
-    sweep_dir = BASE / "outputs" / "sweep4"
+    sweep_dir = BASE / "outputs" / "sweep5"
     sweep_out_path = sweep_dir / "oof_fullstack_sweep_results.json"
     sweep_csv_path = sweep_dir / "oof_fullstack_sweep_results.csv"
     sweep_dir.mkdir(parents=True, exist_ok=True)
