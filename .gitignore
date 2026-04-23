@@ -1,5 +1,7 @@
 data/
+models/
 !birdclef/data
+!birdclef/models
 .vscode
 .ipynb_checkpoints
 outputs
@@ -8,4 +10,3 @@ __pycache__
 *.pt
 *.npz
 *.csv
-models
