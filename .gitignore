@@ -1,4 +1,5 @@
 data/
+!birdclef/data
 .vscode
 .ipynb_checkpoints
 outputs
