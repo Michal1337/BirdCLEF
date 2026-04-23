@@ -1,10 +1,16 @@
-"""Converted from sota.ipynb.
-Order: imports, definitions, configs/init variables, execution.
+"""Finetuned-cache variant of sota_oof_two_pass_ssm_advanced_pp.py.
+
+Identical pipeline (notebook configs, in-sample + fold-safe OOF, sweep,
+combined metrics CSV) — only the Perch feature cache differs: this loads
+the finetuned cache from data/perch_cache_finetuned/, which already
+covers species that the base Perch model misses, so the genus-proxy map
+only needs to fill the remainder.
 """
 
 # 1) Imports
+import copy
+import json
 import subprocess, sys, os
-import random
 from pathlib import Path
 import os, re, gc, time, warnings
 import numpy as np
@@ -24,6 +30,10 @@ import torch.nn as nn
 from sklearn.isotonic import IsotonicRegression
 import torch.nn.functional as F
 import onnxruntime as ort
+try:
+    from birdclef_example.oof_sweep_configs import OOF_SWEEP_CONFIGS
+except ModuleNotFoundError:
+    from oof_sweep_configs import OOF_SWEEP_CONFIGS
 
 # 2) Definitions
 
@@ -64,43 +74,6 @@ def read_60s(path):
     return y
 
 
-class RandomPerchSpatialHead(nn.Module):
-    def __init__(self, n_classes, emb_dim=1536, eps=1e-5):
-        super().__init__()
-        self.weight = nn.Parameter(torch.empty(emb_dim, n_classes * 4))
-        self.alpha = nn.Parameter(torch.empty(1, n_classes, 4))
-        self.bias = nn.Parameter(torch.zeros(1, n_classes))
-        self.eps = float(eps)
-        self.n_classes = int(n_classes)
-        nn.init.xavier_uniform_(self.weight)
-        nn.init.normal_(self.alpha, mean=0.0, std=0.05)
-        nn.init.zeros_(self.bias)
-
-    def forward(self, spatial_embedding):
-        denom = torch.sqrt(
-            (spatial_embedding * spatial_embedding).sum(dim=-1, keepdim=True) + self.eps
-        )
-        x = spatial_embedding / denom
-        z = torch.matmul(x, self.weight)
-        z = z.view(z.shape[0], 16, 4, self.n_classes, 4)
-        z = torch.amax(z, dim=(1, 2))
-        return (z * self.alpha).sum(dim=2) + self.bias
-
-
-def load_finetuned_head(checkpoint_path, n_classes):
-    ckpt = torch.load(checkpoint_path, map_location="cpu")
-    if "state_dict" in ckpt:
-        state_dict = ckpt["state_dict"]
-    elif "fold_states" in ckpt and len(ckpt["fold_states"]) > 0:
-        state_dict = ckpt["fold_states"][0]
-    else:
-        state_dict = ckpt
-    model = RandomPerchSpatialHead(n_classes=n_classes)
-    model.load_state_dict(state_dict)
-    model.eval()
-    return model
-
-
 def run_perch(paths, batch_files=16, verbose=True):
     paths = [Path(p) for p in paths]
     n_rows = len(paths) * N_WINDOWS
@@ -120,7 +93,6 @@ def run_perch(paths, batch_files=16, verbose=True):
     )
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as io_executor:
-        # Prefetch first batch
         next_paths = paths[0:batch_files]
         future_audio = [io_executor.submit(read_60s, p) for p in next_paths]
 
@@ -129,7 +101,6 @@ def run_perch(paths, batch_files=16, verbose=True):
             batch_n = len(batch_paths)
             batch_audio = [f.result() for f in future_audio]
 
-            # Prefetch next batch immediately
             next_start = start + batch_files
             if next_start < len(paths):
                 next_paths = paths[next_start : next_start + batch_files]
@@ -151,11 +122,9 @@ def run_perch(paths, batch_files=16, verbose=True):
                 hours[wr : wr + N_WINDOWS] = meta["hour_utc"]
                 wr += N_WINDOWS
 
-            # ── ONNX base Perch inference ──────────────────────────────
             outs = ONNX_SESSION.run(None, {ONNX_INPUT_NAME: x})
             logits = outs[ONNX_OUT_MAP["label"]].astype(np.float32)
             emb = outs[ONNX_OUT_MAP["embedding"]].astype(np.float32)
-            spatial_emb = outs[ONNX_OUT_MAP["spatial_embedding"]].astype(np.float32)
 
             scores[br:wr, MAPPED_POS] = logits[:, MAPPED_BC_IDX]
             embs[br:wr] = emb
@@ -164,18 +133,7 @@ def run_perch(paths, batch_files=16, verbose=True):
                 bc_arr = np.array(bc_idxs, dtype=np.int32)
                 scores[br:wr, pos_idx] = logits[:, bc_arr].max(axis=1)
 
-            # ── Finetuned head for no-signal classes ───────────────────
-            if FINETUNED_HEAD is not None and len(NO_SIGNAL_POS) > 0:
-                with torch.no_grad():
-                    no_sig_logits = (
-                        FINETUNED_HEAD(torch.from_numpy(spatial_emb).float())
-                        .cpu()
-                        .numpy()
-                        .astype(np.float32)
-                    )
-                scores[br:wr, NO_SIGNAL_POS] = no_sig_logits
-
-            del x, logits, emb, spatial_emb, batch_audio
+            del x, logits, emb, batch_audio
             gc.collect()
 
     meta_df = pd.DataFrame(
@@ -185,21 +143,11 @@ def run_perch(paths, batch_files=16, verbose=True):
 
 
 def macro_auc(y_true, y_score):
-    """
-    Exact replica of the competition metric:
-    macro-averaged ROC-AUC, skipping classes with no positive labels.
-    This is the ONLY number you should track locally.
-    """
     keep = y_true.sum(axis=0) > 0
     return roc_auc_score(y_true[:, keep], y_score[:, keep], average="macro")
 
 
 def honest_oof_auc(scores, Y, meta_df, n_splits=5, label="scores"):
-    """
-    GroupKFold by filename — files never split across folds.
-    This is the only correct way to estimate LB performance locally.
-    Leaking a file across train/val inflates AUC by ~0.01–0.03.
-    """
     groups = meta_df["filename"].to_numpy()
     gkf = GroupKFold(n_splits=n_splits)
     oof = np.zeros_like(scores, dtype=np.float32)
@@ -213,43 +161,20 @@ def honest_oof_auc(scores, Y, meta_df, n_splits=5, label="scores"):
 
 
 def smooth_predictions(probs, n_windows=12, alpha=0.3):
-    """
-    For each file's 12 windows, blend each window with its neighbors.
-
-    new[t] = (1 - alpha) * old[t] + 0.5*alpha * (old[t-1] + old[t+1])
-
-    alpha=0: no smoothing (your current baseline)
-    alpha=0.3: moderate smoothing (good starting point)
-
-    Shape: (n_files * 12, n_classes) → same shape output
-    """
     N, C = probs.shape
     assert N % n_windows == 0, f"Expected multiple of {n_windows}, got {N}"
 
-    # Reshape to (n_files, 12, 234) so we can work file-by-file
     view = probs.reshape(-1, n_windows, C).copy()
-
-    # Shift left and right (with edge padding = repeat boundary)
-    prev_w = np.concatenate([view[:, :1, :], view[:, :-1, :]], axis=1)  # t-1
-    next_w = np.concatenate([view[:, 1:, :], view[:, -1:, :]], axis=1)  # t+1
-
+    prev_w = np.concatenate([view[:, :1, :], view[:, :-1, :]], axis=1)
+    next_w = np.concatenate([view[:, 1:, :], view[:, -1:, :]], axis=1)
     smoothed = (1 - alpha) * view + 0.5 * alpha * (prev_w + next_w)
-
     return smoothed.reshape(N, C)
 
 
 def build_prior_tables(sc_df, Y_labels):
-    """
-    Build site-level and hour-level species frequency tables.
-
-    These answer: "How often is species X observed at site S at hour H?"
-
-    We use these as a soft prior: add them to raw Perch logits.
-    """
     sc_df = sc_df.reset_index(drop=True)
-    global_p = Y_labels.mean(axis=0).astype(np.float32)  # overall frequency
+    global_p = Y_labels.mean(axis=0).astype(np.float32)
 
-    # ── Site-level frequencies ──────────────────────────────────────────
     site_keys = sorted(sc_df["site"].dropna().astype(str).unique())
     site_to_i = {k: i for i, k in enumerate(site_keys)}
     site_p = np.zeros((len(site_keys), Y_labels.shape[1]), dtype=np.float32)
@@ -261,7 +186,6 @@ def build_prior_tables(sc_df, Y_labels):
         site_n[i] = mask.sum()
         site_p[i] = Y_labels[mask].mean(axis=0)
 
-    # ── Hour-level frequencies ──────────────────────────────────────────
     hour_keys = sorted(sc_df["hour_utc"].dropna().astype(int).unique())
     hour_to_i = {h: i for i, h in enumerate(hour_keys)}
     hour_p = np.zeros((len(hour_keys), Y_labels.shape[1]), dtype=np.float32)
@@ -284,34 +208,29 @@ def build_prior_tables(sc_df, Y_labels):
     }
 
 
-def apply_prior(scores, sites, hours, tables):
-    lambda_prior = float(CFG["lambda_prior"])
+def apply_prior(scores, sites, hours, tables, lambda_prior=0.4):
     eps = 1e-4
     n = len(scores)
     out = scores.copy()
 
-    # Start from global average
-    p = np.tile(tables["global_p"], (n, 1))  # (n, 234)
+    p = np.tile(tables["global_p"], (n, 1))
 
-    # Override with hour-level estimate (if enough data)
     for i, h in enumerate(hours):
         h = int(h)
         if h in tables["hour_to_i"]:
             j = tables["hour_to_i"][h]
             nh = tables["hour_n"][j]
-            w = nh / (nh + 8.0)  # shrink toward global if little data
+            w = nh / (nh + 8.0)
             p[i] = w * tables["hour_p"][j] + (1 - w) * tables["global_p"]
 
-    # Override with site-level estimate (if enough data)
     for i, s in enumerate(sites):
         s = str(s)
         if s in tables["site_to_i"]:
             j = tables["site_to_i"][s]
             ns = tables["site_n"][j]
-            w = ns / (ns + 8.0)  # same shrinkage logic
+            w = ns / (ns + 8.0)
             p[i] = w * tables["site_p"][j] + (1 - w) * p[i]
 
-    # Convert prior probability to logit and add
     p = np.clip(p, eps, 1 - eps)
     logit_prior = np.log(p) - np.log1p(-p)
     out += lambda_prior * logit_prior
@@ -320,31 +239,15 @@ def apply_prior(scores, sites, hours, tables):
 
 
 def file_confidence_scale(probs, n_windows=12, top_k=2, power=0.4):
-    """
-    Scale each window's predictions by how confident the file is overall.
-
-    Steps:
-    1. For each file, find the top-k highest scores across all 12 windows
-    2. Compute their mean → "file confidence"
-    3. Multiply every window's scores by (file_confidence ** power)
-
-    power=0: no effect (baseline)
-    power=0.4: moderate suppression of uncertain files
-
-    Why top-k and not max?
-    Max is noisy (one lucky spike). Top-2 mean is more robust.
-    """
     N, C = probs.shape
     assert N % n_windows == 0
 
-    view = probs.reshape(-1, n_windows, C)  # (n_files, 12, 234)
-    sorted_v = np.sort(view, axis=1)  # sort across time
-    top_k_mean = sorted_v[:, -top_k:, :].mean(
-        axis=1, keepdims=True
-    )  # (n_files, 1, 234)
+    view = probs.reshape(-1, n_windows, C)
+    sorted_v = np.sort(view, axis=1)
+    top_k_mean = sorted_v[:, -top_k:, :].mean(axis=1, keepdims=True)
 
-    scale = np.power(top_k_mean, power)  # (n_files, 1, 234)
-    scaled = view * scale  # broadcast across 12 windows
+    scale = np.power(top_k_mean, power)
+    scaled = view * scale
 
     return scaled.reshape(N, C)
 
@@ -371,33 +274,16 @@ def build_sequential_features(scores_col, n_windows=12):
     return prev.reshape(-1), next_.reshape(-1), mean, max_, std
 
 
-def train_mlp_probes(emb, scores_raw, Y):
-    mlp_cfg = CFG["mlp_params"]
-    min_pos = int(mlp_cfg["min_pos"])
-    pca_dim = int(mlp_cfg["pca_dim"])
-    alpha_blend = float(mlp_cfg["alpha_blend"])
-    hidden_dims = tuple(mlp_cfg["hidden_dims"])
-    max_iter = int(mlp_cfg["epochs"])
-    lr = float(mlp_cfg["lr"])
-    weight_decay = float(mlp_cfg["weight_decay"])
-    n_iter_no_change = int(mlp_cfg["patience"])
-    val_fraction = float(mlp_cfg["val_fraction"])
-    max_rows = int(mlp_cfg["max_rows"])
-    seed = int(mlp_cfg["seed"])
-
+def train_mlp_probes(emb, scores_raw, Y, min_pos=5, pca_dim=64, alpha_blend=0.4):
+    """Train per-class MLP probes using mlp_params from CFG."""
     scaler = StandardScaler()
     emb_s = scaler.fit_transform(emb)
-    if pca_dim > 0:
-        pca = PCA(n_components=min(pca_dim, emb_s.shape[1] - 1), random_state=seed)
-        Z = pca.fit_transform(emb_s).astype(np.float32)
-        print(
-            f"Embedding: {emb.shape} → PCA: {Z.shape}  "
-            f"(variance retained: {pca.explained_variance_ratio_.sum():.2%})"
-        )
-    else:
-        pca = None
-        Z = emb_s.astype(np.float32)
-        print(f"Embedding: {emb.shape} → no PCA (pca_dim=0)")
+    pca = PCA(n_components=min(pca_dim, emb_s.shape[1] - 1))
+    Z = pca.fit_transform(emb_s).astype(np.float32)
+    print(
+        f"Embedding: {emb.shape} → PCA: {Z.shape}  "
+        f"(variance retained: {pca.explained_variance_ratio_.sum():.2%})"
+    )
 
     class_weights = build_class_freq_weights(Y, cap=10.0)
 
@@ -406,6 +292,9 @@ def train_mlp_probes(emb, scores_raw, Y):
     print(
         f"Training MLP probes for {len(active)} species (>= {min_pos} pos windows)..."
     )
+
+    MAX_ROWS = 3000
+    mlp_params = CFG["mlp_params"]
 
     for ci in tqdm(active, desc="MLP probes"):
         y = Y[:, ci]
@@ -432,23 +321,13 @@ def train_mlp_probes(emb, scores_raw, Y):
         w = float(class_weights[ci])
         repeat = max(1, int(round(w * n_neg / max(n_pos, 1))))
         repeat = min(repeat, 8)
-        if n_pos * repeat + len(y) > max_rows:
-            repeat = max(1, (max_rows - len(y)) // max(n_pos, 1))
+        if n_pos * repeat + len(y) > MAX_ROWS:
+            repeat = max(1, (MAX_ROWS - len(y)) // max(n_pos, 1))
 
         X_bal = np.vstack([X, np.tile(X[pos_idx], (repeat, 1))])
         y_bal = np.concatenate([y, np.ones(n_pos * repeat, dtype=y.dtype)])
 
-        clf = MLPClassifier(
-            hidden_layer_sizes=hidden_dims,
-            activation="relu",
-            max_iter=max_iter,
-            early_stopping=True,
-            validation_fraction=val_fraction,
-            n_iter_no_change=n_iter_no_change,
-            random_state=seed,
-            learning_rate_init=lr,
-            alpha=weight_decay,
-        )
+        clf = MLPClassifier(**mlp_params)
         clf.fit(X_bal, y_bal)
         probe_models[ci] = clf
 
@@ -458,7 +337,7 @@ def train_mlp_probes(emb, scores_raw, Y):
 
 def apply_mlp_probes(emb_test, scores_test, probe_models, scaler, pca, alpha_blend=0.4):
     emb_s = scaler.transform(emb_test)
-    Z_test = pca.transform(emb_s).astype(np.float32) if pca is not None else emb_s.astype(np.float32)
+    Z_test = pca.transform(emb_s).astype(np.float32)
     result = scores_test.copy()
     for ci, clf in probe_models.items():
         prev, next_, mean, max_, std = build_sequential_features(scores_test[:, ci])
@@ -480,8 +359,7 @@ def apply_mlp_probes(emb_test, scores_test, probe_models, scaler, pca, alpha_ble
 
 
 class VectorizedMLPProbes(nn.Module):
-    """Stacks all per-class MLP weights into a single batched PyTorch model.
-    Replaces the slow Python for-loop over probe_models at inference time."""
+    """Stacks all per-class MLP weights into a single batched PyTorch model."""
 
     def __init__(self, probe_models):
         super().__init__()
@@ -501,11 +379,11 @@ class VectorizedMLPProbes(nn.Module):
         for layer_idx in range(self.n_layers):
             W = np.stack(
                 [probe_models[c].coefs_[layer_idx] for c in self.valid_classes], axis=0
-            )  # (V, in, out)
+            )
             b = np.stack(
                 [probe_models[c].intercepts_[layer_idx] for c in self.valid_classes],
                 axis=0,
-            )  # (V, out)
+            )
             self.weights.append(
                 nn.Parameter(torch.tensor(W, dtype=torch.float32), requires_grad=False)
             )
@@ -514,35 +392,28 @@ class VectorizedMLPProbes(nn.Module):
             )
 
     def forward(self, x):
-        # x: (V, N, in_dim)
         h = x
         for i in range(self.n_layers):
             h = torch.bmm(h, self.weights[i]) + self.biases[i].unsqueeze(1)
             if i < self.n_layers - 1:
                 h = torch.relu(h)
-        return h.squeeze(-1)  # (V, N)
+        return h.squeeze(-1)
 
 
 def apply_mlp_probes_vectorized(
     emb_test, scores_test, probe_models, scaler, pca, alpha_blend=0.4
 ):
-    """
-    Drop-in replacement for apply_mlp_probes().
-    Uses batched PyTorch matrix multiply instead of a Python for-loop —
-    ~10-50x faster at inference time.
-    """
     if len(probe_models) == 0:
         return scores_test.copy()
 
     emb_s = scaler.transform(emb_test)
-    Z_test = pca.transform(emb_s).astype(np.float32) if pca is not None else emb_s.astype(np.float32)
+    Z_test = pca.transform(emb_s).astype(np.float32)
 
     valid_classes = sorted(probe_models.keys())
     V = len(valid_classes)
     N = len(scores_test)
 
-    # Build sequential features for all classes at once
-    raw = scores_test[:, valid_classes].T  # (V, N)
+    raw = scores_test[:, valid_classes].T
     n_files = N // N_WINDOWS
     raw_view = raw.reshape(V, n_files, N_WINDOWS)
     prev = np.concatenate([raw_view[:, :, :1], raw_view[:, :, :-1]], axis=2).reshape(
@@ -555,28 +426,29 @@ def apply_mlp_probes_vectorized(
     mx = np.repeat(raw_view.max(axis=2), N_WINDOWS, axis=1)
     std = np.repeat(raw_view.std(axis=2), N_WINDOWS, axis=1)
 
-    # scalar_feats: (V, N, 6)
     scalar_feats = np.stack([raw, prev, nxt, mean, mx, std], axis=-1).astype(np.float32)
 
-    # Z_test: (N, D) → broadcast to (V, N, D)
     Z_expanded = np.broadcast_to(Z_test, (V, N, Z_test.shape[1]))
 
-    # X_all: (V, N, D+6)
     X_all = np.concatenate([Z_expanded.astype(np.float32), scalar_feats], axis=-1)
 
     vec_probe = VectorizedMLPProbes(probe_models)
     vec_probe.eval()
     with torch.no_grad():
-        preds = vec_probe(torch.tensor(X_all)).numpy()  # (V, N)
+        preds = vec_probe(torch.tensor(X_all)).numpy()
 
     result = scores_test.copy()
-    base_valid = scores_test[:, valid_classes]  # (N, V)
+    base_valid = scores_test[:, valid_classes]
     result[:, valid_classes] = (1.0 - alpha_blend) * base_valid + alpha_blend * preds.T
     return result
 
 
-def calibrate_and_optimize_thresholds(oof_probs, Y_FULL, n_windows=12):
-    threshold_grid = CFG["threshold_grid"]
+def calibrate_and_optimize_thresholds(
+    oof_probs, Y_FULL, threshold_grid=None, n_windows=12
+):
+    if threshold_grid is None:
+        threshold_grid = [0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70]
+
     n_samples, n_cls = oof_probs.shape
     thresholds = np.full(n_cls, 0.5, dtype=np.float32)
     n_files = n_samples // n_windows
@@ -617,11 +489,6 @@ def calibrate_and_optimize_thresholds(oof_probs, Y_FULL, n_windows=12):
 
 
 def apply_per_class_thresholds(scores, thresholds):
-    """
-    Sharpens probabilities around the per-class threshold:
-    - above threshold → push toward 1
-    - below threshold → push toward 0
-    """
     C = scores.shape[1]
     assert C == len(thresholds)
     scaled = np.copy(scores)
@@ -633,49 +500,36 @@ def apply_per_class_thresholds(scores, thresholds):
     return np.clip(scaled, 0.0, 1.0)
 
 
-def rank_aware_scaling(probs, n_windows=12):
-    power = float(CFG["rank_power"])
+def rank_aware_scaling(probs, n_windows=12, power=0.4):
     N, C = probs.shape
     assert N % n_windows == 0, f"Expected multiple of {n_windows}, got {N}"
 
-    view = probs.reshape(-1, n_windows, C)  # (n_files, 12, 234)
-    file_max = view.max(axis=1, keepdims=True)  # (n_files, 1, 234)
-
-    scale = np.power(file_max, power)  # (n_files, 1, 234)
-    scaled = view * scale  # broadcast to all 12 windows
-
+    view = probs.reshape(-1, n_windows, C)
+    file_max = view.max(axis=1, keepdims=True)
+    scale = np.power(file_max, power)
+    scaled = view * scale
     return scaled.reshape(N, C)
 
 
-def adaptive_delta_smooth(probs, n_windows=12):
-    base_alpha = float(CFG["smooth_alpha"])
+def adaptive_delta_smooth(probs, n_windows=12, base_alpha=0.20):
     N, C = probs.shape
     assert N % n_windows == 0, f"Expected multiple of {n_windows}, got {N}"
 
     result = probs.copy()
-    view = probs.reshape(-1, n_windows, C)  # (n_files, 12, 234) original
-    out = result.reshape(-1, n_windows, C)  # (n_files, 12, 234) to modify
+    view = probs.reshape(-1, n_windows, C)
+    out = result.reshape(-1, n_windows, C)
 
     for t in range(n_windows):
+        conf = view[:, t, :].max(axis=-1, keepdims=True)
+        alpha = base_alpha * (1.0 - conf)
 
-        # Confidence at this window = max prob across all species
-        # Shape: (n_files, 1) — one confidence value per file per window
-        conf = view[:, t, :].max(axis=-1, keepdims=True)  # (n_files, 1)
-
-        # Adaptive alpha — low confidence = more smoothing
-        alpha = base_alpha * (1.0 - conf)  # (n_files, 1)
-
-        # Neighbor average with edge padding
         if t == 0:
-            # First window: left neighbor = itself
             neighbor_avg = (view[:, t, :] + view[:, t + 1, :]) / 2.0
         elif t == n_windows - 1:
-            # Last window: right neighbor = itself
             neighbor_avg = (view[:, t - 1, :] + view[:, t, :]) / 2.0
         else:
             neighbor_avg = (view[:, t - 1, :] + view[:, t + 1, :]) / 2.0
 
-        # Blend: confident windows barely change, uncertain ones smooth more
         out[:, t, :] = (1.0 - alpha) * view[:, t, :] + alpha * neighbor_avg
 
     return result
@@ -724,12 +578,6 @@ class SelectiveSSM(nn.Module):
 
 
 class LightProtoSSM(nn.Module):
-    """
-    CHANGE 4: LightProtoSSM with cross-attention between SSM layers.
-    d_model=128, 2 SSM layers + 2-head cross-attention (CPU friendly).
-    Trains in ~35–45s on 59 files.
-    """
-
     def __init__(
         self,
         d_input=1536,
@@ -737,7 +585,6 @@ class LightProtoSSM(nn.Module):
         d_state=16,
         n_classes=234,
         n_windows=12,
-        n_ssm_layers=2,
         dropout=0.15,
         n_sites=20,
         meta_dim=16,
@@ -747,7 +594,6 @@ class LightProtoSSM(nn.Module):
         super().__init__()
         self.n_classes = n_classes
         self.n_windows = n_windows
-        self.n_ssm_layers = n_ssm_layers
         self.use_cross_attn = use_cross_attn
 
         self.input_proj = nn.Sequential(
@@ -761,18 +607,12 @@ class LightProtoSSM(nn.Module):
         self.hour_emb = nn.Embedding(24, meta_dim)
         self.meta_proj = nn.Linear(2 * meta_dim, d_model)
 
-        self.ssm_fwd = nn.ModuleList(
-            [SelectiveSSM(d_model, d_state) for _ in range(n_ssm_layers)]
-        )
-        self.ssm_bwd = nn.ModuleList(
-            [SelectiveSSM(d_model, d_state) for _ in range(n_ssm_layers)]
-        )
+        self.ssm_fwd = nn.ModuleList([SelectiveSSM(d_model, d_state) for _ in range(2)])
+        self.ssm_bwd = nn.ModuleList([SelectiveSSM(d_model, d_state) for _ in range(2)])
         self.ssm_merge = nn.ModuleList(
-            [nn.Linear(2 * d_model, d_model) for _ in range(n_ssm_layers)]
+            [nn.Linear(2 * d_model, d_model) for _ in range(2)]
         )
-        self.ssm_norm = nn.ModuleList(
-            [nn.LayerNorm(d_model) for _ in range(n_ssm_layers)]
-        )
+        self.ssm_norm = nn.ModuleList([nn.LayerNorm(d_model) for _ in range(2)])
         self.drop = nn.Dropout(dropout)
 
         if use_cross_attn:
@@ -784,12 +624,10 @@ class LightProtoSSM(nn.Module):
                         dropout=dropout,
                         batch_first=True,
                     )
-                    for _ in range(n_ssm_layers)
+                    for _ in range(2)
                 ]
             )
-            self.cross_norm = nn.ModuleList(
-                [nn.LayerNorm(d_model) for _ in range(n_ssm_layers)]
-            )
+            self.cross_norm = nn.ModuleList([nn.LayerNorm(d_model) for _ in range(2)])
 
         self.prototypes = nn.Parameter(torch.randn(n_classes, d_model) * 0.02)
         self.proto_temp = nn.Parameter(torch.tensor(5.0))
@@ -822,7 +660,6 @@ class LightProtoSSM(nn.Module):
             h = self.drop(merge(torch.cat([h_f, h_b], dim=-1)))
             h = norm(h + res)
 
-            # CHANGE 4: cross-attention between SSM layers
             if self.use_cross_attn:
                 attn_out, _ = self.cross_attn[i](h, h, h)
                 h = self.cross_norm[i](h + attn_out)
@@ -844,24 +681,18 @@ class LightProtoSSM(nn.Module):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
 
-def train_light_proto_ssm(emb_full, scores_full, Y_full, meta_full, verbose=False):
-    proto_cfg = CFG["proto_ssm_train"]
-    n_epochs = int(proto_cfg["n_epochs"])
-    patience = int(proto_cfg["patience"])
-    lr = float(proto_cfg["lr"])
-    n_sites = int(proto_cfg["n_sites"])
-    d_model = int(proto_cfg["d_model"])
-    d_state = int(proto_cfg["d_state"])
-    n_ssm_layers = int(proto_cfg["n_ssm_layers"])
-    dropout = float(proto_cfg["dropout"])
-    meta_dim = int(proto_cfg["meta_dim"])
-    distill_weight = float(proto_cfg["distill_weight"])
-    pos_weight_cap = float(proto_cfg["pos_weight_cap"])
-    use_swa = bool(proto_cfg["use_swa"])
-    swa_start_frac = float(proto_cfg["swa_start_frac"])
-    swa_lr = float(proto_cfg["swa_lr"])
-    use_cross_attn = bool(proto_cfg["use_cross_attn"])
-    cross_attn_heads = int(proto_cfg["cross_attn_heads"])
+def train_light_proto_ssm(
+    emb_full,
+    scores_full,
+    Y_full,
+    meta_full,
+    n_epochs=40,
+    patience=8,
+    lr=1e-3,
+    n_sites=20,
+    verbose=False,
+):
+    """Train LightProtoSSM with cross-attention. ~35s on CPU."""
     n_files = len(emb_full) // N_WINDOWS
     emb_f = emb_full.reshape(n_files, N_WINDOWS, -1)
     log_f = scores_full.reshape(n_files, N_WINDOWS, -1)
@@ -891,17 +722,7 @@ def train_light_proto_ssm(emb_full, scores_full, Y_full, meta_full, verbose=Fals
     )
 
     model = LightProtoSSM(
-        d_input=emb_full.shape[1],
-        d_model=d_model,
-        d_state=d_state,
-        n_classes=N_CLASSES,
-        n_windows=N_WINDOWS,
-        n_ssm_layers=n_ssm_layers,
-        dropout=dropout,
-        n_sites=n_sites,
-        meta_dim=meta_dim,
-        use_cross_attn=use_cross_attn,
-        cross_attn_heads=cross_attn_heads,
+        n_classes=N_CLASSES, n_sites=n_sites, use_cross_attn=True, cross_attn_heads=2
     )
     model.init_prototypes(
         torch.tensor(emb_full, dtype=torch.float32),
@@ -917,9 +738,15 @@ def train_light_proto_ssm(emb_full, scores_full, Y_full, meta_full, verbose=Fals
 
     pos_cnt = lab_t.sum(dim=(0, 1))
     total = lab_t.shape[0] * lab_t.shape[1]
-    pos_weight = ((total - pos_cnt) / (pos_cnt + 1)).clamp(max=pos_weight_cap)
+    pos_weight = ((total - pos_cnt) / (pos_cnt + 1)).clamp(
+        max=float(CFG["proto_ssm_train"]["pos_weight_cap"])
+    )
 
-    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-3)
+    opt = torch.optim.AdamW(
+        model.parameters(),
+        lr=lr,
+        weight_decay=float(CFG["proto_ssm_train"]["weight_decay"]),
+    )
     sched = torch.optim.lr_scheduler.OneCycleLR(
         opt,
         max_lr=lr,
@@ -930,25 +757,25 @@ def train_light_proto_ssm(emb_full, scores_full, Y_full, meta_full, verbose=Fals
     )
 
     best_loss, best_state, wait = float("inf"), None, 0
-    swa_model = torch.optim.swa_utils.AveragedModel(model) if use_swa else None
-    swa_start = int(n_epochs * swa_start_frac) if use_swa else n_epochs + 1
-    swa_sched = (
-        torch.optim.swa_utils.SWALR(opt, swa_lr=swa_lr) if use_swa else None
+    swa_model = torch.optim.swa_utils.AveragedModel(model)
+    swa_start = int(n_epochs * float(CFG["proto_ssm_train"]["swa_start_frac"]))
+    swa_sched = torch.optim.swa_utils.SWALR(
+        opt, swa_lr=float(CFG["proto_ssm_train"]["swa_lr"])
     )
+    distill_w = float(CFG["proto_ssm_train"]["distill_weight"])
 
-    ep = -1
     for ep in range(n_epochs):
         model.train()
         out = model(emb_t, log_t, site_ids=site_t, hours=hour_t)
         loss = F.binary_cross_entropy_with_logits(
             out, lab_t, pos_weight=pos_weight[None, None, :]
-        ) + distill_weight * F.mse_loss(out, log_t)
+        ) + distill_w * F.mse_loss(out, log_t)
         opt.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
 
-        if use_swa and ep >= swa_start:
+        if ep >= swa_start:
             swa_model.update_parameters(model)
             swa_sched.step()
         else:
@@ -965,7 +792,7 @@ def train_light_proto_ssm(emb_full, scores_full, Y_full, meta_full, verbose=Fals
                 print(f"  Early stop ep {ep+1}")
             break
 
-    if use_swa and ep >= swa_start:
+    if ep >= swa_start:
         torch.optim.swa_utils.update_bn(emb_t.unsqueeze(0), swa_model)
         model = swa_model
     else:
@@ -977,8 +804,10 @@ def train_light_proto_ssm(emb_full, scores_full, Y_full, meta_full, verbose=Fals
     return model, site2i
 
 
-def run_tta_proto(proto_model, emb_files, sc_files, site_t, hour_t):
-    shifts = [int(x) for x in CFG["tta_shifts"]]
+def run_tta_proto(
+    proto_model, emb_files, sc_files, site_t, hour_t, shifts=[0, 1, -1, 2, -2]
+):
+    """TTA by circular-shifting 12-window sequences."""
     proto_model.eval()
     all_preds = []
 
@@ -996,29 +825,16 @@ def run_tta_proto(proto_model, emb_files, sc_files, site_t, hour_t):
         with torch.no_grad():
             out = proto_model(
                 e_shifted, s_shifted, site_ids=site_t, hours=hour_t
-            ).numpy()  # (n_files, 12, 234)
+            ).numpy()
 
         if shift != 0:
-            out = np.roll(out, -shift, axis=1)  # undo shift
-
+            out = np.roll(out, -shift, axis=1)
         all_preds.append(out)
 
-    return np.mean(all_preds, axis=0)  # (n_files, 12, 234)
+    return np.mean(all_preds, axis=0)
 
 
 class ResidualSSM(nn.Module):
-    """
-    Lightweight second-pass model that learns to correct
-    systematic errors from the first-pass ensemble.
-
-    Input:  embeddings + first-pass scores (concatenated)
-    Output: additive correction to first-pass scores
-
-    Key design: output head initialized to zero
-    so corrections start small and only grow if helpful.
-    ~25s training on 59 files.
-    """
-
     def __init__(
         self,
         d_input=1536,
@@ -1053,7 +869,6 @@ class ResidualSSM(nn.Module):
         self.ssm_drop = nn.Dropout(dropout)
 
         self.output_head = nn.Linear(d_model, n_classes)
-        # Zero init — corrections start at zero, only grow if helpful
         nn.init.zeros_(self.output_head.weight)
         nn.init.zeros_(self.output_head.bias)
 
@@ -1082,39 +897,45 @@ class ResidualSSM(nn.Module):
         h = self.ssm_drop(self.ssm_merge(torch.cat([h_f, h_b], dim=-1)))
         h = self.ssm_norm(h + res)
 
-        return self.output_head(h)  # (B, T, n_classes)
+        return self.output_head(h)
 
     def count_parameters(self):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
 
 def train_residual_ssm(
-    emb_full, first_pass_flat, Y_full, site_ids, hour_ids, verbose=False,
+    emb_full,
+    first_pass_flat,
+    Y_full,
+    site_ids,
+    hour_ids,
+    n_epochs=30,
+    patience=8,
+    lr=1e-3,
+    correction_weight=0.30,
+    verbose=False,
 ):
-    resid_cfg = CFG["residual_ssm"]
-    n_classes = N_CLASSES
-    n_windows = N_WINDOWS
-    d_model = int(resid_cfg["d_model"])
-    d_state = int(resid_cfg["d_state"])
-    dropout = float(resid_cfg["dropout"])
-    n_sites = int(resid_cfg.get("n_sites", 20))
-    meta_dim = int(resid_cfg.get("meta_dim", 8))
-    n_epochs = int(resid_cfg["n_epochs"])
-    patience = int(resid_cfg["patience"])
-    lr = float(resid_cfg["lr"])
-    correction_weight = float(resid_cfg["correction_weight"])
-    n_files = len(emb_full) // n_windows
-    emb_f = emb_full.reshape(n_files, n_windows, -1)
-    fp_f = first_pass_flat.reshape(n_files, n_windows, -1)
-    lab_f = Y_full.reshape(n_files, n_windows, -1).astype(np.float32)
-    fp_prob = sigmoid(fp_f)
-    residuals = (lab_f - fp_prob).astype(np.float32)
+    """Train ResidualSSM. Honours residual_ssm.{d_model,d_state,dropout} from CFG."""
+    n_files = len(emb_full) // N_WINDOWS
+    emb_f = emb_full.reshape(n_files, N_WINDOWS, -1)
+    fp_f = first_pass_flat.reshape(n_files, N_WINDOWS, -1)
+    lab_f = Y_full.reshape(n_files, N_WINDOWS, -1).astype(np.float32)
+
+    fp_prob = 1.0 / (1.0 + np.exp(-np.clip(fp_f, -30, 30)))
+    residuals = lab_f - fp_prob
+
+    print(
+        f"Residuals: mean={residuals.mean():.4f}  "
+        f"std={residuals.std():.4f}  "
+        f"abs_mean={np.abs(residuals).mean():.4f}"
+    )
 
     n_val = max(1, int(n_files * 0.15))
-    gen = torch.Generator()
-    gen.manual_seed(SEED)
-    perm = torch.randperm(n_files, generator=gen).numpy()
-    val_i, train_i = perm[:n_val], perm[n_val:]
+    rng = torch.Generator()
+    rng.manual_seed(42)
+    perm = torch.randperm(n_files, generator=rng).numpy()
+    val_i = perm[:n_val]
+    train_i = perm[n_val:]
 
     emb_t = torch.tensor(emb_f, dtype=torch.float32)
     fp_t = torch.tensor(fp_f, dtype=torch.float32)
@@ -1122,74 +943,113 @@ def train_residual_ssm(
     site_t = torch.tensor(site_ids, dtype=torch.long)
     hour_t = torch.tensor(hour_ids, dtype=torch.long)
 
-    torch.manual_seed(SEED)
+    res_cfg = CFG["residual_ssm"]
     model = ResidualSSM(
-        d_input=emb_full.shape[1],
-        d_scores=n_classes,
-        d_model=d_model,
-        d_state=d_state,
-        n_classes=n_classes,
-        n_windows=n_windows,
-        dropout=dropout,
-        n_sites=n_sites,
-        meta_dim=meta_dim,
+        n_classes=N_CLASSES,
+        d_model=int(res_cfg.get("d_model", 64)),
+        d_state=int(res_cfg.get("d_state", 8)),
+        dropout=float(res_cfg.get("dropout", 0.1)),
     )
     print(f"ResidualSSM params: {model.count_parameters():,}")
 
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-3)
     sched = torch.optim.lr_scheduler.OneCycleLR(
-        opt, max_lr=lr, epochs=n_epochs, steps_per_epoch=1,
-        pct_start=0.1, anneal_strategy="cos",
+        opt,
+        max_lr=lr,
+        epochs=n_epochs,
+        steps_per_epoch=1,
+        pct_start=0.1,
+        anneal_strategy="cos",
     )
+
     best_loss, best_state, wait = float("inf"), None, 0
 
     for ep in range(n_epochs):
         model.train()
-        loss = F.mse_loss(
-            model(emb_t[train_i], fp_t[train_i],
-                  site_ids=site_t[train_i], hours=hour_t[train_i]),
-            res_t[train_i],
+        corr = model(
+            emb_t[train_i],
+            fp_t[train_i],
+            site_ids=site_t[train_i],
+            hours=hour_t[train_i],
         )
-        opt.zero_grad(); loss.backward()
+        loss = F.mse_loss(corr, res_t[train_i])
+        opt.zero_grad()
+        loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        opt.step(); sched.step()
+        opt.step()
+        sched.step()
 
         model.eval()
         with torch.no_grad():
-            val_loss = F.mse_loss(
-                model(emb_t[val_i], fp_t[val_i],
-                      site_ids=site_t[val_i], hours=hour_t[val_i]),
-                res_t[val_i],
-            ).item()
+            val_corr = model(
+                emb_t[val_i], fp_t[val_i], site_ids=site_t[val_i], hours=hour_t[val_i]
+            )
+            val_loss = F.mse_loss(val_corr, res_t[val_i])
 
-        if val_loss < best_loss:
-            best_loss = val_loss
+        if val_loss.item() < best_loss:
+            best_loss = val_loss.item()
             best_state = {k: v.clone() for k, v in model.state_dict().items()}
             wait = 0
         else:
             wait += 1
         if wait >= patience:
             if verbose:
-                print(f"  Early stop ep {ep + 1}")
+                print(f"  Early stop ep {ep+1}")
             break
 
     model.load_state_dict(best_state)
+    print(f"ResidualSSM trained — best val MSE={best_loss:.6f}")
+
     model.eval()
-    if verbose:
-        print(f"  ResidualSSM best val MSE={best_loss:.6f}")
+    with torch.no_grad():
+        all_corr = model(emb_t, fp_t, site_ids=site_t, hours=hour_t).numpy()
+    print(
+        f"Correction magnitude: "
+        f"mean_abs={np.abs(all_corr).mean():.4f}  "
+        f"max={np.abs(all_corr).max():.4f}"
+    )
+
     return model, correction_weight
 
 
+def sigmoid(x):
+    return 1.0 / (1.0 + np.exp(-np.clip(x, -30, 30)))
+
+
+def _cfg_proto_train_kwargs():
+    """Extract proto-SSM training kwargs honouring sweep overrides on flat CFG keys."""
+    base = CFG["proto_ssm_train"]
+    return dict(
+        n_epochs=int(CFG.get("proto_n_epochs", base["n_epochs"])),
+        patience=int(CFG.get("proto_patience", base["patience"])),
+        lr=float(CFG.get("proto_lr", base["lr"])),
+        n_sites=int(CFG.get("proto_n_sites", 20)),
+    )
+
+
+def _cfg_residual_train_kwargs():
+    base = CFG["residual_ssm"]
+    return dict(
+        n_epochs=int(CFG.get("residual_n_epochs", base["n_epochs"])),
+        patience=int(CFG.get("residual_patience", base["patience"])),
+        lr=float(CFG.get("residual_lr", base["lr"])),
+        correction_weight=float(
+            CFG.get("correction_weight", base["correction_weight"])
+        ),
+    )
+
+
 def run_pipeline_oof(emb_full, sc_full, Y_full, meta_full, n_splits=5):
-    """
-    Proper full-pipeline OOF.
-    Trains ProtoSSM + MLP on K-1 folds, predicts on held-out fold.
-    ~3-4 min total on CPU. Use this instead of the raw-Perch OOF.
-    """
+    """Proper full-pipeline OOF (ProtoSSM + MLP only) — matches notebook Cell 23."""
     file_meta = meta_full.drop_duplicates("filename").reset_index(drop=True)
 
     gkf = GroupKFold(n_splits=n_splits)
     oof_probs = np.zeros((len(sc_full), N_CLASSES), dtype=np.float32)
+
+    proto_kw = _cfg_proto_train_kwargs()
+    mlp_min_pos = int(CFG.get("mlp_min_pos", 5))
+    mlp_pca_dim = int(CFG.get("mlp_pca_dim", 64))
+    mlp_alpha_blend = float(CFG.get("mlp_alpha_blend", 0.4))
 
     for fold, (tr_f, va_f) in enumerate(
         gkf.split(file_meta, groups=file_meta["filename"]), 1
@@ -1209,16 +1069,17 @@ def run_pipeline_oof(emb_full, sc_full, Y_full, meta_full, n_splits=5):
         sc_va_f = sc_full[va_mask]
         meta_va_f = meta_full[va_mask].reset_index(drop=True)
 
-        # ── Train ProtoSSM on train fold ───────────────────────────────
         proto_model, site2i = train_light_proto_ssm(
-            emb_tr_f, sc_tr_f, Y_tr_f, meta_tr_f, verbose=False,
+            emb_tr_f,
+            sc_tr_f,
+            Y_tr_f,
+            meta_tr_f,
+            verbose=False,
+            **proto_kw,
         )
 
-        # ── ProtoSSM predict on val fold ───────────────────────────────
         n_va = len(emb_va_f) // N_WINDOWS
-
         va_fn_list = meta_va_f.drop_duplicates("filename")["filename"].tolist()
-
         va_site_ids = np.array(
             [
                 min(
@@ -1232,7 +1093,6 @@ def run_pipeline_oof(emb_full, sc_full, Y_full, meta_full, n_splits=5):
             ],
             dtype=np.int64,
         )
-
         va_hour_ids = np.array(
             [
                 int(meta_va_f.loc[meta_va_f["filename"] == fn, "hour_utc"].iloc[0]) % 24
@@ -1260,9 +1120,13 @@ def run_pipeline_oof(emb_full, sc_full, Y_full, meta_full, n_splits=5):
                 .reshape(-1, N_CLASSES)
             )
 
-        # ── Train MLP on train fold ────────────────────────────────────
         probe_models, emb_scaler, emb_pca, alpha_blend = train_mlp_probes(
-            emb_tr_f, sc_tr_f, Y_tr_f,
+            emb_tr_f,
+            sc_tr_f,
+            Y_tr_f,
+            min_pos=mlp_min_pos,
+            pca_dim=mlp_pca_dim,
+            alpha_blend=mlp_alpha_blend,
         )
 
         sc_va_mlp = apply_mlp_probes_vectorized(
@@ -1274,9 +1138,9 @@ def run_pipeline_oof(emb_full, sc_full, Y_full, meta_full, n_splits=5):
             alpha_blend,
         )
 
-        # ── Ensemble + sigmoid ─────────────────────────────────────────
-        first_pass = 0.5 * proto_va + 0.5 * sc_va_mlp
-        probs_va = 1.0 / (1.0 + np.exp(-np.clip(first_pass, -30, 30)))
+        ensemble_w = float(CFG.get("ensemble_w", 0.5))
+        first_pass = ensemble_w * proto_va + (1.0 - ensemble_w) * sc_va_mlp
+        probs_va = sigmoid(first_pass)
         oof_probs[va_mask] = probs_va
 
         fold_auc = macro_auc(Y_full[va_mask], probs_va)
@@ -1289,79 +1153,575 @@ def run_pipeline_oof(emb_full, sc_full, Y_full, meta_full, n_splits=5):
     return overall, oof_probs
 
 
-def sigmoid(x):
-    return 1.0 / (1.0 + np.exp(-np.clip(x, -30, 30)))
+def run_pipeline_in_sample_fullstack(
+    emb_full,
+    sc_full,
+    Y_full,
+    meta_full,
+    temperatures,
+):
+    """In-sample full-stack evaluation (no folds) — directly mirrors the notebook
+    submit pipeline (Cell 25), but predicts on the same training data used for
+    fitting. Useful as an upper-bound sanity check; expect optimistic numbers.
+    Records per-stage macro-AUC just like run_pipeline_oof_fullstack and writes
+    them to outputs/sweep/in_sample_stage_metrics_<cfg>.json.
+    """
+    ensemble_w = float(CFG.get("ensemble_w", 0.50))
+    lambda_prior = float(CFG.get("lambda_prior", 0.40))
+    mlp_min_pos = int(CFG.get("mlp_min_pos", 5))
+    mlp_pca_dim = int(CFG.get("mlp_pca_dim", 64))
+    mlp_alpha_blend = float(CFG.get("mlp_alpha_blend", 0.40))
+    file_conf_top_k = int(CFG.get("file_conf_top_k", 2))
+    file_conf_power = float(CFG.get("file_conf_power", 0.40))
+    rank_power = float(CFG.get("rank_power", 0.40))
+    smooth_alpha = float(CFG.get("smooth_alpha", 0.20))
+    tta_shifts = [int(x) for x in CFG.get("tta_shifts", [0, 1, -1, 2, -2])]
+    threshold_grid = CFG.get(
+        "threshold_grid",
+        [0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70],
+    )
+    proto_kw = _cfg_proto_train_kwargs()
+    res_kw = _cfg_residual_train_kwargs()
+
+    cfg_name = str(CFG.get("name", "unnamed"))
+    safe_cfg_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", cfg_name)
+    metrics_out_path = (
+        BASE / "outputs" / "sweep" / f"in_sample_stage_metrics_{safe_cfg_name}.json"
+    )
+    metrics_out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    stage_order = [
+        "raw_perch",
+        "proto_only",
+        "prior_only",
+        "prior_mlp",
+        "first_pass",
+        "residual_plus_temp",
+        "post_file_conf",
+        "post_rank",
+        "post_smooth",
+        "final_after_threshold",
+    ]
+
+    # ── Train all components on the full training set ─────────────────────────
+    proto_model, site2i = train_light_proto_ssm(
+        emb_full,
+        sc_full,
+        Y_full,
+        meta_full,
+        verbose=False,
+        **proto_kw,
+    )
+    probe_models, emb_scaler, emb_pca, alpha_blend = train_mlp_probes(
+        emb_full,
+        sc_full,
+        Y_full,
+        min_pos=mlp_min_pos,
+        pca_dim=mlp_pca_dim,
+        alpha_blend=mlp_alpha_blend,
+    )
+    prior_tables = build_prior_tables(meta_full[["site", "hour_utc"]], Y_full)
+
+    # ── Build per-file site/hour ids (matches notebook submit branch) ─────────
+    n_files = len(emb_full) // N_WINDOWS
+    emb_seq = emb_full.reshape(n_files, N_WINDOWS, -1)
+    sc_seq = sc_full.reshape(n_files, N_WINDOWS, -1)
+
+    fn_list = meta_full.drop_duplicates("filename")["filename"].tolist()
+    site_ids = np.array(
+        [
+            min(
+                site2i.get(
+                    meta_full.loc[meta_full["filename"] == fn, "site"].iloc[0], 0
+                ),
+                n_sites_cap - 1,
+            )
+            for fn in fn_list
+        ],
+        dtype=np.int64,
+    )
+    hour_ids = np.array(
+        [
+            int(meta_full.loc[meta_full["filename"] == fn, "hour_utc"].iloc[0]) % 24
+            for fn in fn_list
+        ],
+        dtype=np.int64,
+    )
+    site_t = torch.tensor(site_ids, dtype=torch.long)
+    hour_t = torch.tensor(hour_ids, dtype=torch.long)
+
+    # ── ProtoSSM in-sample predictions with TTA (matches submit branch) ───────
+    proto_out = run_tta_proto(
+        proto_model, emb_seq, sc_seq, site_t=site_t, hour_t=hour_t, shifts=tta_shifts
+    )
+    proto_flat = proto_out.reshape(-1, N_CLASSES).astype(np.float32)
+
+    sc_prior = apply_prior(
+        sc_full,
+        sites=meta_full["site"].to_numpy(),
+        hours=meta_full["hour_utc"].to_numpy(),
+        tables=prior_tables,
+        lambda_prior=lambda_prior,
+    )
+    sc_mlp = apply_mlp_probes_vectorized(
+        emb_full, sc_prior, probe_models, emb_scaler, emb_pca, alpha_blend
+    )
+    first_pass = ensemble_w * proto_flat + (1.0 - ensemble_w) * sc_mlp
+
+    raw_perch_probs = sigmoid(sc_full)
+    proto_probs = sigmoid(proto_flat)
+    prior_only_probs = sigmoid(sc_prior)
+    prior_mlp_probs = sigmoid(sc_mlp)
+    first_pass_probs = sigmoid(first_pass)
+
+    # ── Calibrate per-class thresholds on in-sample first-pass probs ──────────
+    thresholds = calibrate_and_optimize_thresholds(
+        oof_probs=first_pass_probs,
+        Y_FULL=Y_full,
+        threshold_grid=threshold_grid,
+        n_windows=N_WINDOWS,
+    )
+
+    # ── Train ResidualSSM and apply correction in-sample ──────────────────────
+    res_model, corr_w = train_residual_ssm(
+        emb_full=emb_full,
+        first_pass_flat=first_pass,
+        Y_full=Y_full,
+        site_ids=site_ids,
+        hour_ids=hour_ids,
+        verbose=False,
+        **res_kw,
+    )
+
+    first_pass_seq = first_pass.reshape(n_files, N_WINDOWS, -1)
+    res_model.eval()
+    with torch.no_grad():
+        correction = res_model(
+            torch.tensor(emb_seq, dtype=torch.float32),
+            torch.tensor(first_pass_seq, dtype=torch.float32),
+            site_ids=site_t,
+            hours=hour_t,
+        ).numpy()
+    correction_flat = correction.reshape(-1, N_CLASSES).astype(np.float32)
+
+    final_scores = first_pass + corr_w * correction_flat
+    final_scores = final_scores / temperatures[None, :]
+    residual_plus_temp_probs = sigmoid(final_scores)
+
+    post_file_conf_probs = file_confidence_scale(
+        residual_plus_temp_probs,
+        n_windows=N_WINDOWS,
+        top_k=file_conf_top_k,
+        power=file_conf_power,
+    )
+    post_rank_probs = rank_aware_scaling(
+        post_file_conf_probs, n_windows=N_WINDOWS, power=rank_power
+    )
+    post_smooth_probs = adaptive_delta_smooth(
+        post_rank_probs, n_windows=N_WINDOWS, base_alpha=smooth_alpha
+    )
+    post_smooth_probs = np.clip(post_smooth_probs, 0.0, 1.0)
+    final_probs = apply_per_class_thresholds(post_smooth_probs, thresholds)
+
+    stage_probs = {
+        "raw_perch": raw_perch_probs,
+        "proto_only": proto_probs,
+        "prior_only": prior_only_probs,
+        "prior_mlp": prior_mlp_probs,
+        "first_pass": first_pass_probs,
+        "residual_plus_temp": residual_plus_temp_probs,
+        "post_file_conf": post_file_conf_probs,
+        "post_rank": post_rank_probs,
+        "post_smooth": post_smooth_probs,
+        "final_after_threshold": final_probs,
+    }
+    global_stage_metrics_raw = {
+        stage_name: float(macro_auc(Y_full, stage_probs[stage_name]))
+        for stage_name in stage_order
+    }
+    global_stage_metrics = {
+        stage_name: round(metric_val, 4)
+        for stage_name, metric_val in global_stage_metrics_raw.items()
+    }
+    overall = global_stage_metrics_raw["final_after_threshold"]
+
+    payload = {
+        "config_name": cfg_name,
+        "mode": "in_sample_no_folds",
+        "stage_order": stage_order,
+        "global_metrics": global_stage_metrics,
+    }
+    with metrics_out_path.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+
+    print(f"\nIn-sample full-stack AUC: {overall:.6f}")
+    print(f"Saved in-sample stage metrics: {metrics_out_path}")
+    return overall, final_probs, global_stage_metrics, str(metrics_out_path)
+
+
+def run_pipeline_oof_fullstack(
+    emb_full,
+    sc_full,
+    Y_full,
+    meta_full,
+    temperatures,
+):
+    """Fold-safe OOF mirroring the notebook submit pipeline (Cell 25):
+    ProtoSSM + prior + MLP + residual + temperature + file_conf + rank + smooth + threshold.
+    Per-stage OOF macro-AUC is recorded and persisted to JSON.
+    """
+    n_splits = int(CFG.get("oof_n_splits", 5))
+    ensemble_w = float(CFG.get("ensemble_w", 0.50))
+    lambda_prior = float(CFG.get("lambda_prior", 0.40))
+    mlp_min_pos = int(CFG.get("mlp_min_pos", 5))
+    mlp_pca_dim = int(CFG.get("mlp_pca_dim", 64))
+    mlp_alpha_blend = float(CFG.get("mlp_alpha_blend", 0.40))
+    file_conf_top_k = int(CFG.get("file_conf_top_k", 2))
+    file_conf_power = float(CFG.get("file_conf_power", 0.40))
+    rank_power = float(CFG.get("rank_power", 0.40))
+    smooth_alpha = float(CFG.get("smooth_alpha", 0.20))
+    tta_shifts = [int(x) for x in CFG.get("tta_shifts", [0, 1, -1, 2, -2])]
+    threshold_grid = CFG.get(
+        "threshold_grid",
+        [0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70],
+    )
+    proto_kw = _cfg_proto_train_kwargs()
+    res_kw = _cfg_residual_train_kwargs()
+
+    cfg_name = str(CFG.get("name", "unnamed"))
+    safe_cfg_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", cfg_name)
+    metrics_out_path = (
+        BASE / "outputs" / "sweep" / f"oof_fullstack_stage_metrics_{safe_cfg_name}.json"
+    )
+    metrics_out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    file_meta = meta_full.drop_duplicates("filename").reset_index(drop=True)
+    gkf = GroupKFold(n_splits=n_splits)
+    stage_order = [
+        "raw_perch",
+        "proto_only",
+        "prior_only",
+        "prior_mlp",
+        "first_pass",
+        "residual_plus_temp",
+        "post_file_conf",
+        "post_rank",
+        "post_smooth",
+        "final_after_threshold",
+    ]
+    stage_oof = {
+        stage_name: np.zeros((len(sc_full), N_CLASSES), dtype=np.float32)
+        for stage_name in stage_order
+    }
+
+    for fold, (tr_f, va_f) in enumerate(
+        gkf.split(file_meta, groups=file_meta["filename"]), 1
+    ):
+        tr_fnames = set(file_meta.iloc[tr_f]["filename"])
+        va_fnames = set(file_meta.iloc[va_f]["filename"])
+
+        tr_mask = meta_full["filename"].isin(tr_fnames).values
+        va_mask = meta_full["filename"].isin(va_fnames).values
+
+        emb_tr_f = emb_full[tr_mask]
+        sc_tr_f = sc_full[tr_mask]
+        Y_tr_f = Y_full[tr_mask]
+        meta_tr_f = meta_full[tr_mask].reset_index(drop=True)
+
+        emb_va_f = emb_full[va_mask]
+        sc_va_f = sc_full[va_mask]
+        meta_va_f = meta_full[va_mask].reset_index(drop=True)
+
+        proto_model, site2i = train_light_proto_ssm(
+            emb_tr_f,
+            sc_tr_f,
+            Y_tr_f,
+            meta_tr_f,
+            verbose=False,
+            **proto_kw,
+        )
+        probe_models, emb_scaler, emb_pca, alpha_blend = train_mlp_probes(
+            emb_tr_f,
+            sc_tr_f,
+            Y_tr_f,
+            min_pos=mlp_min_pos,
+            pca_dim=mlp_pca_dim,
+            alpha_blend=mlp_alpha_blend,
+        )
+
+        prior_tables_fold = build_prior_tables(meta_tr_f[["site", "hour_utc"]], Y_tr_f)
+
+        n_va = len(emb_va_f) // N_WINDOWS
+        va_fn_list = meta_va_f.drop_duplicates("filename")["filename"].tolist()
+        va_site_ids = np.array(
+            [
+                min(
+                    site2i.get(
+                        meta_va_f.loc[meta_va_f["filename"] == fn, "site"].iloc[0],
+                        0,
+                    ),
+                    19,
+                )
+                for fn in va_fn_list
+            ],
+            dtype=np.int64,
+        )
+        va_hour_ids = np.array(
+            [
+                int(meta_va_f.loc[meta_va_f["filename"] == fn, "hour_utc"].iloc[0]) % 24
+                for fn in va_fn_list
+            ],
+            dtype=np.int64,
+        )
+
+        proto_model.eval()
+        with torch.no_grad():
+            proto_va = (
+                proto_model(
+                    torch.tensor(
+                        emb_va_f.reshape(n_va, N_WINDOWS, -1),
+                        dtype=torch.float32,
+                    ),
+                    torch.tensor(
+                        sc_va_f.reshape(n_va, N_WINDOWS, -1),
+                        dtype=torch.float32,
+                    ),
+                    site_ids=torch.tensor(va_site_ids, dtype=torch.long),
+                    hours=torch.tensor(va_hour_ids, dtype=torch.long),
+                )
+                .numpy()
+                .reshape(-1, N_CLASSES)
+            )
+
+        sc_va_prior = apply_prior(
+            sc_va_f,
+            sites=meta_va_f["site"].to_numpy(),
+            hours=meta_va_f["hour_utc"].to_numpy(),
+            tables=prior_tables_fold,
+            lambda_prior=lambda_prior,
+        )
+        sc_va_mlp = apply_mlp_probes_vectorized(
+            emb_va_f,
+            sc_va_prior,
+            probe_models,
+            emb_scaler,
+            emb_pca,
+            alpha_blend,
+        )
+        first_pass_va = ensemble_w * proto_va + (1.0 - ensemble_w) * sc_va_mlp
+
+        raw_perch_probs_va = sigmoid(sc_va_f)
+        proto_probs_va = sigmoid(proto_va)
+        prior_only_probs_va = sigmoid(sc_va_prior)
+        prior_mlp_probs_va = sigmoid(sc_va_mlp)
+        first_pass_probs_va = sigmoid(first_pass_va)
+
+        n_tr = len(emb_tr_f) // N_WINDOWS
+        emb_tr_seq = emb_tr_f.reshape(n_tr, N_WINDOWS, -1)
+        sc_tr_seq = sc_tr_f.reshape(n_tr, N_WINDOWS, -1)
+        tr_fn_list = meta_tr_f.drop_duplicates("filename")["filename"].tolist()
+        tr_site_ids = np.array(
+            [
+                min(
+                    site2i.get(
+                        meta_tr_f.loc[meta_tr_f["filename"] == fn, "site"].iloc[0],
+                        0,
+                    ),
+                    19,
+                )
+                for fn in tr_fn_list
+            ],
+            dtype=np.int64,
+        )
+        tr_hour_ids = np.array(
+            [
+                int(meta_tr_f.loc[meta_tr_f["filename"] == fn, "hour_utc"].iloc[0]) % 24
+                for fn in tr_fn_list
+            ],
+            dtype=np.int64,
+        )
+
+        proto_tr_out = run_tta_proto(
+            proto_model,
+            emb_tr_seq,
+            sc_tr_seq,
+            site_t=torch.tensor(tr_site_ids, dtype=torch.long),
+            hour_t=torch.tensor(tr_hour_ids, dtype=torch.long),
+            shifts=tta_shifts,
+        )
+        proto_tr_flat = proto_tr_out.reshape(-1, N_CLASSES).astype(np.float32)
+
+        sc_tr_prior = apply_prior(
+            sc_tr_f,
+            sites=meta_tr_f["site"].to_numpy(),
+            hours=meta_tr_f["hour_utc"].to_numpy(),
+            tables=prior_tables_fold,
+            lambda_prior=lambda_prior,
+        )
+        sc_tr_mlp = apply_mlp_probes_vectorized(
+            emb_tr_f,
+            sc_tr_prior,
+            probe_models,
+            emb_scaler,
+            emb_pca,
+            alpha_blend,
+        )
+        first_pass_tr = ensemble_w * proto_tr_flat + (1.0 - ensemble_w) * sc_tr_mlp
+
+        thresholds_fold = calibrate_and_optimize_thresholds(
+            oof_probs=sigmoid(first_pass_tr),
+            Y_FULL=Y_tr_f,
+            threshold_grid=threshold_grid,
+            n_windows=N_WINDOWS,
+        )
+
+        res_model, fold_corr_w = train_residual_ssm(
+            emb_full=emb_tr_f,
+            first_pass_flat=first_pass_tr,
+            Y_full=Y_tr_f,
+            site_ids=tr_site_ids,
+            hour_ids=tr_hour_ids,
+            verbose=False,
+            **res_kw,
+        )
+
+        first_pass_va_seq = first_pass_va.reshape(n_va, N_WINDOWS, -1)
+        res_model.eval()
+        with torch.no_grad():
+            va_correction = res_model(
+                torch.tensor(emb_va_f.reshape(n_va, N_WINDOWS, -1), dtype=torch.float32),
+                torch.tensor(first_pass_va_seq, dtype=torch.float32),
+                site_ids=torch.tensor(va_site_ids, dtype=torch.long),
+                hours=torch.tensor(va_hour_ids, dtype=torch.long),
+            ).numpy()
+        va_corr_flat = va_correction.reshape(-1, N_CLASSES).astype(np.float32)
+
+        final_scores_va = first_pass_va + fold_corr_w * va_corr_flat
+        final_scores_va = final_scores_va / temperatures[None, :]
+        residual_plus_temp_probs_va = sigmoid(final_scores_va)
+
+        post_file_conf_probs_va = file_confidence_scale(
+            residual_plus_temp_probs_va,
+            n_windows=N_WINDOWS,
+            top_k=file_conf_top_k,
+            power=file_conf_power,
+        )
+        post_rank_probs_va = rank_aware_scaling(
+            post_file_conf_probs_va,
+            n_windows=N_WINDOWS,
+            power=rank_power,
+        )
+        post_smooth_probs_va = adaptive_delta_smooth(
+            post_rank_probs_va,
+            n_windows=N_WINDOWS,
+            base_alpha=smooth_alpha,
+        )
+        post_smooth_probs_va = np.clip(post_smooth_probs_va, 0.0, 1.0)
+        final_probs_va = apply_per_class_thresholds(post_smooth_probs_va, thresholds_fold)
+
+        stage_probs_va = {
+            "raw_perch": raw_perch_probs_va,
+            "proto_only": proto_probs_va,
+            "prior_only": prior_only_probs_va,
+            "prior_mlp": prior_mlp_probs_va,
+            "first_pass": first_pass_probs_va,
+            "residual_plus_temp": residual_plus_temp_probs_va,
+            "post_file_conf": post_file_conf_probs_va,
+            "post_rank": post_rank_probs_va,
+            "post_smooth": post_smooth_probs_va,
+            "final_after_threshold": final_probs_va,
+        }
+        for stage_name, stage_probs in stage_probs_va.items():
+            stage_oof[stage_name][va_mask] = stage_probs
+        fold_auc = float(macro_auc(Y_full[va_mask], final_probs_va))
+        print(
+            f"  Fold {fold}/{n_splits}  val files={len(va_fnames)}  full-stack AUC={fold_auc:.6f}"
+        )
+
+    global_stage_metrics_raw = {
+        stage_name: float(macro_auc(Y_full, stage_oof[stage_name]))
+        for stage_name in stage_order
+    }
+    global_stage_metrics = {
+        stage_name: round(metric_val, 4)
+        for stage_name, metric_val in global_stage_metrics_raw.items()
+    }
+    oof_probs = stage_oof["final_after_threshold"]
+    overall = global_stage_metrics_raw["final_after_threshold"]
+
+    payload = {
+        "config_name": cfg_name,
+        "total_folds": int(n_splits),
+        "stage_order": stage_order,
+        "global_metrics": global_stage_metrics,
+    }
+    with metrics_out_path.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+
+    print(f"\nFull-stack OOF AUC: {overall:.6f}")
+    print(f"Saved stage metrics: {metrics_out_path}")
+    return overall, oof_probs, global_stage_metrics, str(metrics_out_path)
 
 
 # 3) Configs And Init Variables
-MODE = "submit"  # ← change to "train" for local CV
+MODE = "train"  # "train" runs OOF + sweep; "submit" skips them
 CFG = {
-    # inference
     "batch_files": 16,
-
-    # train-only flags
+    "oof_n_splits": 5 if MODE == "train" else 3,
+    "dryrun_n_files": 20 if MODE == "train" else 0,
     "run_oof": MODE == "train",
     "verbose": MODE == "train",
-    "dryrun_n_files": 20 if MODE == "train" else 0,
-
-    # ensemble / post-processing
-    "ensemble_w": 0.85,
-    "lambda_prior": 0.0,
-    "rank_power": 0.80,
-    "smooth_alpha": 0.15,
-    "tta_shifts": [0, 1, -1, 2, -2],
-    "threshold_grid": [0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70],
-
-    # MLP probes (torch)
-    "mlp_params": {
-        "min_pos": 3,
-        "pca_dim": 0,
-        "alpha_blend": 1,
-        "hidden_dims": (128, 64),
-        "dropout": 0.1,
-        "epochs": 80,
-        "batch_size": 512,
-        "lr": 1e-3,
-        "weight_decay": 1e-4,
-        "patience": 10,
-        "val_fraction": 0.15,
-        "standardize_features": True,
-        "max_rows": 3000,
-        "seed": 1337,
-    },
-
-    # proto_ssm config: ultra_attn_d448_s40_noswa_fastlr
     "proto_ssm_train": {
-        "n_epochs": 90,
-        "patience": 18,
-        "lr": 3.5e-4,
-        "n_sites": 28,
-        "d_model": 640,
-        "d_state": 64,
-        "n_ssm_layers": 5,
-        "dropout": 0.32,
-        "meta_dim": 72,
-        "distill_weight": 0.30,
-        "pos_weight_cap": 35.0,
-        "use_swa": True,
-        "swa_start_frac": 1.1,
-        "swa_lr": 0.0,
-        "use_cross_attn": True,
-        "cross_attn_heads": 8,
+        "n_epochs": 80 if MODE == "train" else 40,
+        "lr": 8e-4,
+        "weight_decay": 1e-3,
+        "val_ratio": 0.15,
+        "patience": 20 if MODE == "train" else 8,
+        "pos_weight_cap": 25.0,
+        "distill_weight": 0.15,
+        "proto_margin": 0.15,
+        "label_smoothing": 0.03,
+        "oof_n_splits": 5 if MODE == "train" else 3,
+        "mixup_alpha": 0.4,
+        "focal_gamma": 2.5,
+        "swa_start_frac": 0.65,
+        "swa_lr": 4e-4,
+        "use_cosine_restart": True,
+        "restart_period": 20,
     },
-
-    # residual SSM
     "residual_ssm": {
-        "d_model": 48,
+        "d_model": 128,
         "d_state": 16,
         "n_ssm_layers": 2,
         "dropout": 0.1,
-        "meta_dim": 12,
-        "n_epochs": 70,
-        "patience": 18,
+        "correction_weight": 0.35,
+        "n_epochs": 40 if MODE == "train" else 20,
         "lr": 8e-4,
-        "correction_weight": 0.25,
+        "patience": 12 if MODE == "train" else 6,
     },
+    "mlp_params": {
+        "hidden_layer_sizes": (256, 128),
+        "activation": "relu",
+        "max_iter": 500 if MODE == "train" else 200,
+        "early_stopping": True,
+        "validation_fraction": 0.15,
+        "n_iter_no_change": 20 if MODE == "train" else 10,
+        "random_state": 42,
+        "learning_rate_init": 5e-4,
+        "alpha": 0.005,
+    },
+    # full-stack sweep defaults (overridable from OOF_SWEEP_CONFIGS)
+    "ensemble_w": 0.50,
+    "lambda_prior": 0.40,
+    "mlp_min_pos": 5,
+    "mlp_pca_dim": 64,
+    "mlp_alpha_blend": 0.40,
+    "file_conf_top_k": 2,
+    "file_conf_power": 0.40,
+    "rank_power": 0.40,
+    "smooth_alpha": 0.20,
+    "tta_shifts": [0, 1, -1, 2, -2],
+    "threshold_grid": [0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70],
 }
 INPUT_ROOT = Path("/kaggle/input")
 ONNX_WHL = Path(
@@ -1370,7 +1730,6 @@ ONNX_WHL = Path(
 BASE = Path(".")
 MODEL_DIR = BASE / "models" / "perch_v2_cpu" / "1"
 ONNX_PERCH_PATH = BASE / "models" / "perch_onnx" / "perch_v2.onnx"
-FINETUNED_CHECKPOINT = BASE / "outputs" / "experiments_ft" / "no_stage2_cfg2.pt"
 CACHE_META = BASE / "data" / "perch_cache_finetuned" / "full_perch_meta.parquet"
 CACHE_NPZ = BASE / "data" / "perch_cache_finetuned" / "full_perch_arrays.npz"
 
@@ -1378,25 +1737,17 @@ SR = 32_000
 WINDOW_SEC = 5
 WINDOW_SAMPLES = SR * WINDOW_SEC
 FILE_SAMPLES = 60 * SR
-N_WINDOWS = 12  # 12 × 5s = 60s per file
+N_WINDOWS = 12
 FNAME_RE = re.compile(r"BC2026_(?:Train|Test)_(\d+)_(S\d+)_(\d{8})_(\d{6})\.ogg")
 TEXTURE_TAXA = {"Amphibia", "Insecta"}
-proxy_map = {}  # label_idx -> list of bc_indices
+proxy_map = {}  # label_idx -> list of bc_indices; finetuned cache already fills the remainder
 PROXY_TAXA = {"Amphibia", "Insecta", "Aves"}
-TEXTURE_TAXA = {"Amphibia", "Insecta"}  # continuous callers
+TEXTURE_TAXA = {"Amphibia", "Insecta"}
 baseline_auc = None
 oof_raw = None
 n_sites_cap = 20
-# 4) Execution
-SEED = 1337
-random.seed(SEED)
-np.random.seed(SEED)
-torch.manual_seed(SEED)
-torch.cuda.manual_seed_all(SEED)
-torch.backends.cudnn.deterministic = True
-torch.backends.cudnn.benchmark = False
-tf.random.set_seed(SEED)
 
+# 4) Execution
 taxonomy = pd.read_csv("data/taxonomy.csv")
 sample_sub = pd.read_csv("data/sample_submission.csv")
 soundscape_labels = pd.read_csv("data/train_soundscapes_labels.csv")
@@ -1407,25 +1758,14 @@ print("MODE =", MODE)
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 warnings.filterwarnings("ignore")
 _WALL_START = time.time()
-print("✅ CFG loaded")
+print("✅ V18 CFG loaded")
 print(
-    f"  proto: n_epochs={CFG['proto_ssm_train']['n_epochs']}  "
+    f"  n_epochs={CFG['proto_ssm_train']['n_epochs']}  "
     f"patience={CFG['proto_ssm_train']['patience']}  "
-    f"lr={CFG['proto_ssm_train']['lr']:.2e}  "
-    f"d_model={CFG['proto_ssm_train']['d_model']}  "
-    f"d_state={CFG['proto_ssm_train']['d_state']}"
+    f"oof_n_splits={CFG['proto_ssm_train']['oof_n_splits']}  "
+    f"mlp_max_iter={CFG['mlp_params']['max_iter']}"
 )
-print(
-    f"  residual: n_epochs={CFG['residual_ssm']['n_epochs']}  "
-    f"patience={CFG['residual_ssm']['patience']}  "
-    f"lr={CFG['residual_ssm']['lr']:.2e}  "
-    f"corr_w={CFG['residual_ssm']['correction_weight']:.2f}"
-)
-print(
-    f"  prior={float(CFG['lambda_prior']):.2f}  "
-    f"ensemble_w={float(CFG['ensemble_w']):.2f}  "
-    f"mlp_blend={float(CFG['mlp_params']['alpha_blend']):.2f}"
-)
+print("Config ready")
 print(
     f"  run_oof={CFG['run_oof']}  verbose={CFG['verbose']}  dryrun={CFG['dryrun_n_files']}"
 )
@@ -1500,7 +1840,6 @@ for _, row in unmapped_df.iterrows():
     target = row["primary_label"]
     sci = str(row["scientific_name"])
     genus = sci.split()[0]
-    # Find all Perch labels from the same genus
     hits = bc_labels[
         bc_labels["scientific_name"]
         .astype(str)
@@ -1515,9 +1854,8 @@ proxy_map = {
 }
 print(f"Unmapped species total:        {len(UNMAPPED_POS)}")
 print(f"Species with genus proxy:      {len(proxy_map)}")
-print(f"Species still without signal:  {len(UNMAPPED_POS) - len(proxy_map)}")
+print(f"Species covered by finetuned cache: {len(UNMAPPED_POS) - len(proxy_map)}")
 print("\nProxy targets:")
-
 for idx, bc_idxs in list(proxy_map.items())[:8]:
     label = PRIMARY_LABELS[idx]
     cls = CLASS_NAME_MAP.get(label, "?")
@@ -1540,24 +1878,16 @@ temperatures = np.ones(N_CLASSES, dtype=np.float32)
 for ci, label in enumerate(PRIMARY_LABELS):
     cls = CLASS_NAME_MAP.get(label, "Aves")
     if cls in TEXTURE_TAXA:
-        temperatures[ci] = 0.95  # frogs/insects: slightly sharper
+        temperatures[ci] = 0.95
     else:
-        temperatures[ci] = 1.10  # birds: slightly softer
+        temperatures[ci] = 1.10
 n_texture = (temperatures < 1.0).sum()
 n_event = (temperatures > 1.0).sum()
 print(
     f"✅ Temperatures: {n_event} event species (T=1.10), {n_texture} texture species (T=0.95)"
 )
-print(
-    "✅ CHANGE 1: Upgraded MLP probe (pca_dim=64, hidden=(128,64), max_iter=300, min_pos=5)"
-)
-print("✅ Vectorized MLP probe inference defined")
-print("✅ CHANGE 2: Isotonic calibration + per-class threshold optimization defined")
-print("✅ Rank-aware scaling defined")
-print("✅ Adaptive delta smoothing defined")
-print("✅ CHANGE 4: LightProtoSSM with cross-attention (2 heads) defined")
-print("✅ CHANGE 3: TTA with 5 circular shifts defined")
-print("✅ ResidualSSM defined (~439K params, ~20s training)")
+print("✅ Two-pass SSM advanced PP pipeline defined")
+
 if CFG["run_oof"]:
     print("Running honest OOF evaluation on training data…")
     baseline_auc, oof_raw = honest_oof_auc(
@@ -1566,187 +1896,177 @@ if CFG["run_oof"]:
     print(f"\nBaseline OOF AUC: {baseline_auc:.6f}  ← your starting point")
 else:
     print("Submit mode: skipping OOF evaluation")
+
 if CFG["run_oof"]:
-    pipeline_auc, oof_pipeline = run_pipeline_oof(
-        emb_tr,
-        sc_tr,
-        Y_FULL_aligned,
-        meta_tr,
-        n_splits=5,
+    if not OOF_SWEEP_CONFIGS:
+        raise ValueError("OOF_SWEEP_CONFIGS is empty. Add at least one config preset.")
+
+    print(
+        f"Running full-stack sweep (in-sample + fold-safe OOF) over {len(OOF_SWEEP_CONFIGS)} configs…"
     )
+    base_cfg = copy.deepcopy(CFG)
+    sweep_results = []
+    sweep_dir = BASE / "outputs" / "sweep2"
+    sweep_out_path = sweep_dir / "oof_fullstack_sweep_results.json"
+    sweep_csv_path = sweep_dir / "oof_fullstack_sweep_results.csv"
+    combined_csv_path = sweep_dir / "in_sample_and_oof_sweep_results.csv"
+    sweep_dir.mkdir(parents=True, exist_ok=True)
 
-t0 = time.time()
-proto_model, site2i_tr = train_light_proto_ssm(
-    emb_tr, sc_tr, Y_FULL_aligned, meta_tr, verbose=False,
-)
-print(f"ProtoSSM training: {time.time()-t0:.1f}s")
-proto_cfg = CFG["proto_ssm_train"]
-n_tr_files = len(sc_tr) // N_WINDOWS
-emb_tr_f = emb_tr.reshape(n_tr_files, N_WINDOWS, -1)
-sc_tr_f = sc_tr.reshape(n_tr_files, N_WINDOWS, -1)
-tr_fnames = meta_tr.drop_duplicates("filename")["filename"].tolist()
-tr_site_ids = np.array(
-    [
-        min(
-            site2i_tr.get(meta_tr.loc[meta_tr["filename"] == fn, "site"].iloc[0], 0),
-            int(proto_cfg["n_sites"]) - 1,
+    def round_metrics_dict(metrics_dict):
+        return {k: round(float(v), 4) for k, v in metrics_dict.items()}
+
+    def prepare_sweep_results_for_export(ranked_results):
+        export_rows = []
+        for result in ranked_results:
+            row = copy.deepcopy(result)
+            row["metric"] = round(float(result.get("metric", 0.0)), 4)
+            row["stage_metrics"] = round_metrics_dict(result.get("stage_metrics", {}))
+            row["in_sample_metric"] = round(
+                float(result.get("in_sample_metric", 0.0)), 4
+            )
+            row["in_sample_stage_metrics"] = round_metrics_dict(
+                result.get("in_sample_stage_metrics", {})
+            )
+            export_rows.append(row)
+        return export_rows
+
+    def write_sweep_results_csv(ranked_results, csv_path):
+        rows = []
+        for rank, result in enumerate(ranked_results, 1):
+            row = {
+                "rank": int(rank),
+                "config_name": str(result.get("config_name", "")),
+                "metric": round(float(result.get("metric", 0.0)), 4),
+                "stage_metrics_path": str(result.get("stage_metrics_path", "")),
+            }
+            for stage_name, stage_val in result.get("stage_metrics", {}).items():
+                row[f"metric_{stage_name}"] = round(float(stage_val), 4)
+            rows.append(row)
+        pd.DataFrame(rows).to_csv(csv_path, index=False, float_format="%.4f")
+
+    def write_combined_results_csv(ranked_results, csv_path):
+        """One row per config with both in-sample and OOF stage metrics side-by-side."""
+        rows = []
+        for rank, result in enumerate(ranked_results, 1):
+            row = {
+                "rank": int(rank),
+                "config_name": str(result.get("config_name", "")),
+                "oof_metric": round(float(result.get("metric", 0.0)), 4),
+                "in_sample_metric": round(
+                    float(result.get("in_sample_metric", 0.0)), 4
+                ),
+                "oof_stage_metrics_path": str(result.get("stage_metrics_path", "")),
+                "in_sample_stage_metrics_path": str(
+                    result.get("in_sample_stage_metrics_path", "")
+                ),
+            }
+            for stage_name, stage_val in result.get("stage_metrics", {}).items():
+                row[f"oof_{stage_name}"] = round(float(stage_val), 4)
+            for stage_name, stage_val in result.get(
+                "in_sample_stage_metrics", {}
+            ).items():
+                row[f"in_sample_{stage_name}"] = round(float(stage_val), 4)
+            rows.append(row)
+        pd.DataFrame(rows).to_csv(csv_path, index=False, float_format="%.4f")
+
+    sweep_iter = tqdm(
+        OOF_SWEEP_CONFIGS,
+        total=len(OOF_SWEEP_CONFIGS),
+        desc="OOF sweep",
+    )
+    for run_idx, sweep_cfg in enumerate(sweep_iter, 1):
+        CFG = copy.deepcopy(base_cfg)
+        CFG.update(sweep_cfg)
+
+        cfg_name = str(CFG.get("name", f"cfg_{run_idx:02d}"))
+        sweep_iter.set_postfix_str(cfg_name)
+        print(f"\n[{run_idx}/{len(OOF_SWEEP_CONFIGS)}] {cfg_name}")
+
+        # ── In-sample (no folds) — runs first so the OOF result wins the print order
+        print(f"\n[{cfg_name}] In-sample (no-folds) full-stack…")
+        (
+            in_sample_auc,
+            _,
+            in_sample_stage_metrics,
+            in_sample_metrics_path,
+        ) = run_pipeline_in_sample_fullstack(
+            emb_tr,
+            sc_tr,
+            Y_FULL_aligned,
+            meta_tr,
+            temperatures=temperatures,
         )
-        for fn in tr_fnames
-    ],
-    dtype=np.int64,
-)
-tr_hour_ids = np.array(
-    [
-        int(meta_tr.loc[meta_tr["filename"] == fn, "hour_utc"].iloc[0]) % 24
-        for fn in tr_fnames
-    ],
-    dtype=np.int64,
-)
-proto_tr_out = run_tta_proto(
-    proto_model,
-    emb_tr_f,
-    sc_tr_f,
-    site_t=torch.tensor(tr_site_ids, dtype=torch.long),
-    hour_t=torch.tensor(tr_hour_ids, dtype=torch.long),
-)
 
-probe_models, emb_scaler, emb_pca, alpha_blend = train_mlp_probes(
-    emb=emb_tr, scores_raw=sc_tr, Y=Y_FULL_aligned,
-)
-prior_tables = build_prior_tables(sc, Y_SC)
-sc_tr_prior = apply_prior(
-    sc_tr,
-    sites=meta_tr["site"].to_numpy(),
-    hours=meta_tr["hour_utc"].to_numpy(),
-    tables=prior_tables,
-)
-sc_tr_mlp = apply_mlp_probes_vectorized(
-    emb_tr,
-    sc_tr_prior,
-    probe_models,
-    emb_scaler,
-    emb_pca,
-    alpha_blend,
-)
+        # ── Fold-safe OOF
+        print(f"\n[{cfg_name}] Fold-safe OOF full-stack…")
+        pipeline_auc, _, stage_metrics, stage_metrics_path = run_pipeline_oof_fullstack(
+            emb_tr,
+            sc_tr,
+            Y_FULL_aligned,
+            meta_tr,
+            temperatures=temperatures,
+        )
+        print(
+            f"Completed {cfg_name}: in_sample={in_sample_auc:.6f}  oof={pipeline_auc:.6f}"
+        )
 
-proto_tr_flat = proto_tr_out.reshape(-1, N_CLASSES).astype(np.float32)
-_ew = float(CFG["ensemble_w"])
-first_pass_tr = _ew * proto_tr_flat + (1.0 - _ew) * sc_tr_mlp
-train_probs_for_calib = sigmoid(first_pass_tr)
-PER_CLASS_THRESHOLDS = calibrate_and_optimize_thresholds(
-    oof_probs=train_probs_for_calib,
-    Y_FULL=Y_FULL_aligned,
-    n_windows=N_WINDOWS,
-)
-t0 = time.time()
-res_model, correction_weight = train_residual_ssm(
-    emb_full=emb_tr,
-    first_pass_flat=first_pass_tr,
-    Y_full=Y_FULL_aligned,
-    site_ids=tr_site_ids,
-    hour_ids=tr_hour_ids,
-    verbose=False,
-)
-print(f"ResidualSSM training: {time.time()-t0:.1f}s")
+        sweep_results.append(
+            {
+                "config_name": cfg_name,
+                "metric": float(pipeline_auc),
+                "config": copy.deepcopy(CFG),
+                "stage_metrics": stage_metrics,
+                "stage_metrics_path": stage_metrics_path,
+                "in_sample_metric": float(in_sample_auc),
+                "in_sample_stage_metrics": in_sample_stage_metrics,
+                "in_sample_stage_metrics_path": in_sample_metrics_path,
+            }
+        )
 
+        partial_results = sorted(
+            sweep_results,
+            key=lambda r: r["metric"],
+            reverse=True,
+        )
+        partial_results_export = prepare_sweep_results_for_export(partial_results)
+        with sweep_out_path.open("w", encoding="utf-8") as f:
+            json.dump(partial_results_export, f, indent=2)
+        write_sweep_results_csv(partial_results_export, sweep_csv_path)
+        write_combined_results_csv(partial_results_export, combined_csv_path)
+        print(
+            f"Saved interim sweep results ({len(partial_results)}/{len(OOF_SWEEP_CONFIGS)}): "
+            f"{sweep_out_path}, {sweep_csv_path}, {combined_csv_path}"
+        )
 
-del emb_tr, sc_tr, emb_tr_f, sc_tr_f
-del proto_tr_out, proto_tr_flat
-del sc_tr_prior, sc_tr_mlp
-del first_pass_tr, train_probs_for_calib
-del Y_FULL_aligned, tr_site_ids, tr_hour_ids, tr_fnames
-del meta_tr
-del sc, Y_SC, Y_FULL, full_rows, full_files, windows_per_file
-del soundscape_labels, _arr
-gc.collect()
+    full_cfg_results = sorted(
+        sweep_results,
+        key=lambda r: r["metric"],
+        reverse=True,
+    )
+    full_cfg_results_export = prepare_sweep_results_for_export(full_cfg_results)
+    with sweep_out_path.open("w", encoding="utf-8") as f:
+        json.dump(full_cfg_results_export, f, indent=2)
+    write_sweep_results_csv(full_cfg_results_export, sweep_csv_path)
+    write_combined_results_csv(full_cfg_results_export, combined_csv_path)
 
+    CFG = copy.deepcopy(base_cfg)
 
-if not test_paths:
-    n = CFG["dryrun_n_files"] or 20
-    print(f"No hidden test — dry-run on {n} train files")
-    test_paths = sorted(Path("/kaggle/input/competitions/birdclef-2026/train_soundscapes").glob("*.ogg"))
+    print("\nSweep summary (best OOF first):")
+    for row in full_cfg_results:
+        print(
+            f"{row['config_name']}: oof={row['metric']:.6f}  "
+            f"in_sample={row['in_sample_metric']:.6f}"
+        )
+
+    best_row = full_cfg_results[0]
+    print(
+        f"\nBest config (by OOF): {best_row['config_name']}  "
+        f"oof={best_row['metric']:.6f}  in_sample={best_row['in_sample_metric']:.6f}"
+    )
+    print(f"Saved sweep results: {sweep_out_path}")
+    print(f"Saved OOF CSV: {sweep_csv_path}")
+    print(f"Saved combined in-sample + OOF CSV: {combined_csv_path}")
 else:
-    print(f"Hidden test files: {len(test_paths)}")
-meta_te, sc_te, emb_te = run_perch(
-    test_paths, CFG["batch_files"], verbose=CFG["verbose"]
-)
-print(f"Test scores: {sc_te.shape}")
+    print("Submit mode: skipping OOF sweep")
 
-n_test_files = len(sc_te) // N_WINDOWS
-emb_te_f = emb_te.reshape(n_test_files, N_WINDOWS, -1)
-sc_te_f = sc_te.reshape(n_test_files, N_WINDOWS, -1)
-test_fnames = meta_te.drop_duplicates("filename")["filename"].tolist()
-test_site_ids = np.array(
-    [
-        min(
-            site2i_tr.get(meta_te.loc[meta_te["filename"] == fn, "site"].iloc[0], 0),
-            int(proto_cfg["n_sites"]) - 1,
-        )
-        for fn in test_fnames
-    ],
-    dtype=np.int64,
-)
-test_hour_ids = np.array(
-    [
-        int(meta_te.loc[meta_te["filename"] == fn, "hour_utc"].iloc[0]) % 24
-        for fn in test_fnames
-    ],
-    dtype=np.int64,
-)
-proto_model.eval()
-with torch.no_grad():
-    proto_out = proto_model(
-        torch.tensor(emb_te_f, dtype=torch.float32),
-        torch.tensor(sc_te_f, dtype=torch.float32),
-        site_ids=torch.tensor(test_site_ids, dtype=torch.long),
-        hours=torch.tensor(test_hour_ids, dtype=torch.long),
-    ).numpy()
-proto_scores_flat = proto_out.reshape(-1, N_CLASSES).astype(np.float32)
-
-sc_te_adjusted = apply_prior(
-    sc_te,
-    sites=meta_te["site"].to_numpy(),
-    hours=meta_te["hour_utc"].to_numpy(),
-    tables=prior_tables,
-)
-
-sc_te_adjusted = apply_mlp_probes_vectorized(
-    emb_te,
-    sc_te_adjusted,
-    probe_models,
-    emb_scaler,
-    emb_pca,
-    alpha_blend,
-)
-
-first_pass_flat = _ew * proto_scores_flat + (1.0 - _ew) * sc_te_adjusted
-first_pass_te_f = first_pass_flat.reshape(n_test_files, N_WINDOWS, -1)
-res_model.eval()
-with torch.no_grad():
-    test_correction = res_model(
-        torch.tensor(emb_te_f, dtype=torch.float32),
-        torch.tensor(first_pass_te_f, dtype=torch.float32),
-        site_ids=torch.tensor(test_site_ids, dtype=torch.long),
-        hours=torch.tensor(test_hour_ids, dtype=torch.long),
-    ).numpy()
-correction_flat = test_correction.reshape(-1, N_CLASSES).astype(np.float32)
-final_scores = first_pass_flat + correction_weight * correction_flat
-print(
-    f"Correction applied — "
-    f"mean_abs={np.abs(correction_flat).mean():.4f}  "
-    f"score range [{final_scores.min():.3f}, {final_scores.max():.3f}]"
-)
-final_scores = final_scores / temperatures[None, :]
-probs = sigmoid(final_scores)
-probs = rank_aware_scaling(probs, n_windows=N_WINDOWS)
-probs = adaptive_delta_smooth(probs, n_windows=N_WINDOWS)
-probs = np.clip(probs, 0.0, 1.0)
-probs = apply_per_class_thresholds(probs, PER_CLASS_THRESHOLDS)
-sub = pd.DataFrame(probs.astype(np.float32), columns=PRIMARY_LABELS)
-sub.insert(0, "row_id", meta_te["row_id"].values)
-assert list(sub.columns) == ["row_id"] + PRIMARY_LABELS
-assert len(sub) == len(test_paths) * N_WINDOWS
-assert not sub.isna().any().any()
-sub.to_csv("submission.csv", index=False)
-print(f"\nsubmission.csv saved — shape {sub.shape}")
 print(f"Total wall time: {(time.time() - _WALL_START)/60:.1f} min")

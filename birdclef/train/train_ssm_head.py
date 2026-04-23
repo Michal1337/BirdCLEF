@@ -1,0 +1,489 @@
+"""Perch + SSM head trainer (site×date fold-safe).
+
+Uses the regenerated Perch cache + fold assignment parquet. Exposes
+`run_pipeline(cfg, ...)` that trains/evaluates one config over CV folds AND
+on the V-anchor. Suitable for direct use by the sweep runner.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict
+
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn.functional as F
+from sklearn.decomposition import PCA
+from sklearn.neural_network import MLPClassifier
+from sklearn.preprocessing import StandardScaler
+
+from birdclef.config.paths import (
+    FOLDS_PQ,
+    N_WINDOWS,
+    PERCH_LABELS,
+    PERCH_META,
+    PERCH_NPZ,
+)
+from birdclef.data.soundscapes import primary_labels
+from birdclef.data.splits import load_v_anchor
+from birdclef.eval.metrics import compute_stage_metrics, split_rare_frequent
+from birdclef.models.losses import build_loss
+from birdclef.models.ssm import (
+    LightProtoSSM,
+    ResidualSSM,
+    ResidualSSMConfig,
+    SSMHeadConfig,
+)
+from birdclef.postproc.boost import hard_soundscape_boost, file_confidence_scale, rank_aware_scaling
+from birdclef.postproc.calibration import (
+    apply_per_class_thresholds,
+    build_prior_tables,
+    calibrate_and_optimize_thresholds,
+    logit_prior_shift,
+)
+from birdclef.postproc.smoothing import adaptive_delta_smooth, gaussian_smooth
+
+
+def sigmoid_np(x: np.ndarray) -> np.ndarray:
+    return 1.0 / (1.0 + np.exp(-np.clip(x, -30, 30)))
+
+
+@dataclass
+class PerchCache:
+    meta: pd.DataFrame       # one row per 5 s window
+    scores: np.ndarray       # (N, C) Perch logits mapped to BirdCLEF classes
+    emb: np.ndarray          # (N, 1536) embeddings
+    Y: np.ndarray            # (N, C) uint8, zeros for unlabeled rows
+    labeled_mask: np.ndarray # (N,) bool
+
+
+def load_perch_cache() -> PerchCache:
+    meta = pd.read_parquet(PERCH_META)
+    arr = np.load(PERCH_NPZ)
+    scores = arr["scores_full_raw"].astype(np.float32)
+    emb = arr["emb_full"].astype(np.float32)
+    Y = np.load(PERCH_LABELS)
+    labeled = meta["is_labeled"].astype(bool).to_numpy()
+    return PerchCache(meta=meta, scores=scores, emb=emb, Y=Y, labeled_mask=labeled)
+
+
+def _site2i(meta: pd.DataFrame, cap: int) -> dict:
+    sites = sorted(meta["site"].dropna().astype(str).unique())
+    return {s: min(i + 1, cap - 1) for i, s in enumerate(sites)}
+
+
+def _site_hour_ids(meta_files: pd.DataFrame, site2i: dict, cap: int):
+    sids = np.array([min(site2i.get(s, 0), cap - 1) for s in meta_files["site"].tolist()], dtype=np.int64)
+    hids = np.array([int(h) % 24 for h in meta_files["hour_utc"].tolist()], dtype=np.int64)
+    return sids, hids
+
+
+def _train_proto_ssm(
+    emb: np.ndarray, scores: np.ndarray, Y: np.ndarray, meta_files: pd.DataFrame,
+    cfg: dict,
+) -> LightProtoSSM:
+    n_classes = Y.shape[1]
+    cap = int(cfg["n_sites_cap"])
+    model = LightProtoSSM(SSMHeadConfig(
+        d_input=emb.shape[1], n_classes=n_classes, n_windows=N_WINDOWS,
+        n_sites=cap, use_cross_attn=True, cross_attn_heads=2,
+    ))
+    model.init_prototypes(
+        torch.tensor(emb, dtype=torch.float32),
+        torch.tensor(Y, dtype=torch.float32),
+    )
+    site2i = _site2i(meta_files, cap)
+    site_ids, hour_ids = _site_hour_ids(meta_files, site2i, cap)
+
+    n_files = emb.shape[0] // N_WINDOWS
+    emb_t = torch.tensor(emb.reshape(n_files, N_WINDOWS, -1), dtype=torch.float32)
+    sc_t = torch.tensor(scores.reshape(n_files, N_WINDOWS, -1), dtype=torch.float32)
+    lab_t = torch.tensor(Y.reshape(n_files, N_WINDOWS, -1).astype(np.float32))
+    site_t = torch.tensor(site_ids, dtype=torch.long)
+    hour_t = torch.tensor(hour_ids, dtype=torch.long)
+
+    loss_kind = cfg["loss"]
+    if loss_kind == "focal_bce":
+        loss_fn = build_loss("focal_bce",
+                             alpha=float(cfg["focal_alpha"]),
+                             gamma=float(cfg["focal_gamma"]),
+                             label_smoothing=float(cfg["label_smoothing"]))
+    elif loss_kind == "bce_focal_mean":
+        loss_fn = build_loss("bce_focal_mean",
+                             focal_gamma=float(cfg["focal_gamma"]),
+                             focal_alpha=float(cfg["focal_alpha"]),
+                             label_smoothing=float(cfg["label_smoothing"]))
+    else:
+        pos_w = np.minimum(
+            (Y.shape[0] - Y.sum(axis=0)) / (Y.sum(axis=0) + 1),
+            float(cfg["proto_pos_weight_cap"]),
+        ).astype(np.float32)
+        loss_fn = build_loss("bce_posw",
+                             pos_weight=torch.tensor(pos_w),
+                             label_smoothing=float(cfg["label_smoothing"]))
+
+    opt = torch.optim.AdamW(model.parameters(), lr=float(cfg["proto_lr"]), weight_decay=1e-3)
+    n_epochs = int(cfg["proto_n_epochs"])
+    sched = torch.optim.lr_scheduler.OneCycleLR(
+        opt, max_lr=float(cfg["proto_lr"]), epochs=n_epochs, steps_per_epoch=1,
+        pct_start=0.1, anneal_strategy="cos",
+    )
+    swa = torch.optim.swa_utils.AveragedModel(model)
+    swa_start = int(n_epochs * float(cfg["proto_swa_start_frac"]))
+    swa_sched = torch.optim.swa_utils.SWALR(opt, swa_lr=float(cfg["proto_swa_lr"]))
+    distill_w = float(cfg["proto_distill_weight"])
+
+    best_loss, best_state, wait = float("inf"), None, 0
+    for ep in range(n_epochs):
+        model.train()
+        out = model(emb_t, sc_t, site_ids=site_t, hours=hour_t)
+        loss = loss_fn(out, lab_t)
+        if distill_w > 0:
+            loss = loss + distill_w * F.mse_loss(out, sc_t)
+        opt.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        opt.step()
+        if ep >= swa_start:
+            swa.update_parameters(model)
+            swa_sched.step()
+        else:
+            sched.step()
+        if loss.item() < best_loss:
+            best_loss = loss.item()
+            best_state = {k: v.clone() for k, v in model.state_dict().items()}
+            wait = 0
+        else:
+            wait += 1
+            if wait >= int(cfg["proto_patience"]):
+                break
+    if ep >= swa_start:
+        torch.optim.swa_utils.update_bn(emb_t.unsqueeze(0), swa)
+        model = swa
+    elif best_state is not None:
+        model.load_state_dict(best_state)
+    model.eval()
+    return model
+
+
+def _predict_proto(
+    model, emb: np.ndarray, scores: np.ndarray, meta_files: pd.DataFrame,
+    cfg: dict,
+) -> np.ndarray:
+    cap = int(cfg["n_sites_cap"])
+    site2i = _site2i(meta_files, cap)
+    site_ids, hour_ids = _site_hour_ids(meta_files, site2i, cap)
+    n_files = emb.shape[0] // N_WINDOWS
+    emb_t = torch.tensor(emb.reshape(n_files, N_WINDOWS, -1), dtype=torch.float32)
+    sc_t = torch.tensor(scores.reshape(n_files, N_WINDOWS, -1), dtype=torch.float32)
+    site_t = torch.tensor(site_ids, dtype=torch.long)
+    hour_t = torch.tensor(hour_ids, dtype=torch.long)
+    if cfg["tta"] == "window_roll":
+        shifts = tuple(int(x) for x in cfg["tta_shifts"])
+        outs = []
+        with torch.no_grad():
+            for s in shifts:
+                if s == 0:
+                    e = emb_t; sc = sc_t
+                else:
+                    e = torch.roll(emb_t, s, dims=1); sc = torch.roll(sc_t, s, dims=1)
+                o = model(e, sc, site_ids=site_t, hours=hour_t).numpy()
+                if s != 0:
+                    o = np.roll(o, -s, axis=1)
+                outs.append(o)
+        return np.mean(outs, axis=0).reshape(-1, scores.shape[1])
+    # waveform_shift fallback — this stage only has frozen Perch embeddings,
+    # so we do a single pass. Real waveform-shift TTA lives in the inference
+    # template where raw audio is available and Perch runs >1 time.
+    with torch.no_grad():
+        o = model(emb_t, sc_t, site_ids=site_t, hours=hour_t).numpy()
+    return o.reshape(-1, scores.shape[1])
+
+
+def _train_mlp_probes(
+    emb: np.ndarray, scores: np.ndarray, Y: np.ndarray, cfg: dict
+):
+    scaler = StandardScaler().fit(emb)
+    emb_s = scaler.transform(emb)
+    pca_dim = min(int(cfg["mlp_pca_dim"]), emb_s.shape[1] - 1)
+    pca = PCA(n_components=pca_dim).fit(emb_s)
+    Z = pca.transform(emb_s).astype(np.float32)
+    active = np.where(Y.sum(axis=0) >= int(cfg["mlp_min_pos"]))[0]
+    models = {}
+    max_rows = 3000
+    for ci in active:
+        y = Y[:, ci]
+        if y.sum() == 0 or y.sum() == len(y):
+            continue
+        sc_col = scores[:, ci]
+        prev = np.concatenate([sc_col.reshape(-1, N_WINDOWS)[:, :1], sc_col.reshape(-1, N_WINDOWS)[:, :-1]], axis=1).reshape(-1)
+        nxt = np.concatenate([sc_col.reshape(-1, N_WINDOWS)[:, 1:], sc_col.reshape(-1, N_WINDOWS)[:, -1:]], axis=1).reshape(-1)
+        mean = np.repeat(sc_col.reshape(-1, N_WINDOWS).mean(axis=1), N_WINDOWS)
+        mx = np.repeat(sc_col.reshape(-1, N_WINDOWS).max(axis=1), N_WINDOWS)
+        std = np.repeat(sc_col.reshape(-1, N_WINDOWS).std(axis=1), N_WINDOWS)
+        X = np.hstack([Z, sc_col[:, None], prev[:, None], nxt[:, None], mean[:, None], mx[:, None], std[:, None]])
+        n_pos = int(y.sum())
+        n_neg = len(y) - n_pos
+        repeat = max(1, int(round(n_neg / max(n_pos, 1))))
+        repeat = min(repeat, 8)
+        if n_pos * repeat + len(y) > max_rows:
+            repeat = max(1, (max_rows - len(y)) // max(n_pos, 1))
+        pos_idx = np.where(y == 1)[0]
+        X_bal = np.vstack([X, np.tile(X[pos_idx], (repeat, 1))])
+        y_bal = np.concatenate([y, np.ones(n_pos * repeat, dtype=y.dtype)])
+        clf = MLPClassifier(hidden_layer_sizes=(256, 128), activation="relu",
+                            max_iter=500, early_stopping=True, validation_fraction=0.15,
+                            n_iter_no_change=20, learning_rate_init=5e-4, alpha=0.005,
+                            random_state=42)
+        clf.fit(X_bal, y_bal)
+        models[int(ci)] = clf
+    return models, scaler, pca
+
+
+def _apply_mlp_probes(emb, scores, models, scaler, pca, alpha_blend):
+    emb_s = scaler.transform(emb)
+    Z = pca.transform(emb_s).astype(np.float32)
+    out = scores.copy()
+    for ci, clf in models.items():
+        sc_col = scores[:, ci]
+        prev = np.concatenate([sc_col.reshape(-1, N_WINDOWS)[:, :1], sc_col.reshape(-1, N_WINDOWS)[:, :-1]], axis=1).reshape(-1)
+        nxt = np.concatenate([sc_col.reshape(-1, N_WINDOWS)[:, 1:], sc_col.reshape(-1, N_WINDOWS)[:, -1:]], axis=1).reshape(-1)
+        mean = np.repeat(sc_col.reshape(-1, N_WINDOWS).mean(axis=1), N_WINDOWS)
+        mx = np.repeat(sc_col.reshape(-1, N_WINDOWS).max(axis=1), N_WINDOWS)
+        std = np.repeat(sc_col.reshape(-1, N_WINDOWS).std(axis=1), N_WINDOWS)
+        X = np.hstack([Z, sc_col[:, None], prev[:, None], nxt[:, None], mean[:, None], mx[:, None], std[:, None]])
+        prob = clf.predict_proba(X)[:, 1].astype(np.float32)
+        logit = np.log(prob + 1e-7) - np.log(1 - prob + 1e-7)
+        out[:, ci] = (1 - alpha_blend) * scores[:, ci] + alpha_blend * logit
+    return out
+
+
+def _train_residual(
+    emb, first_pass_flat, Y, site_ids, hour_ids, cfg
+):
+    n_classes = Y.shape[1]
+    n_files = emb.shape[0] // N_WINDOWS
+    emb_f = emb.reshape(n_files, N_WINDOWS, -1)
+    fp_f = first_pass_flat.reshape(n_files, N_WINDOWS, -1)
+    lab_f = Y.reshape(n_files, N_WINDOWS, -1).astype(np.float32)
+    fp_prob = sigmoid_np(fp_f)
+    residuals = lab_f - fp_prob
+
+    # 3-fold internal mini-CV (no leakage) — train/val split for early stopping.
+    rng = torch.Generator(); rng.manual_seed(42)
+    perm = torch.randperm(n_files, generator=rng).numpy()
+    n_val = max(1, int(0.15 * n_files))
+    tr_i = perm[n_val:]; va_i = perm[:n_val]
+    emb_t = torch.tensor(emb_f, dtype=torch.float32)
+    fp_t = torch.tensor(fp_f, dtype=torch.float32)
+    res_t = torch.tensor(residuals, dtype=torch.float32)
+    site_t = torch.tensor(site_ids, dtype=torch.long)
+    hour_t = torch.tensor(hour_ids, dtype=torch.long)
+
+    model = ResidualSSM(ResidualSSMConfig(
+        d_input=emb.shape[1], d_scores=n_classes, n_classes=n_classes,
+        n_windows=N_WINDOWS,
+        d_model=int(cfg["residual_d_model"]),
+        d_state=int(cfg["residual_d_state"]),
+        dropout=float(cfg["residual_dropout"]),
+    ))
+    opt = torch.optim.AdamW(model.parameters(), lr=float(cfg["residual_lr"]), weight_decay=1e-3)
+    n_epochs = int(cfg["residual_n_epochs"])
+    sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=float(cfg["residual_lr"]),
+                                                epochs=n_epochs, steps_per_epoch=1,
+                                                pct_start=0.1, anneal_strategy="cos")
+    best_loss, best_state, wait = float("inf"), None, 0
+    for ep in range(n_epochs):
+        model.train()
+        corr = model(emb_t[tr_i], fp_t[tr_i], site_ids=site_t[tr_i], hours=hour_t[tr_i])
+        loss = F.mse_loss(corr, res_t[tr_i])
+        opt.zero_grad(); loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        opt.step(); sched.step()
+        model.eval()
+        with torch.no_grad():
+            v_loss = F.mse_loss(model(emb_t[va_i], fp_t[va_i],
+                                      site_ids=site_t[va_i], hours=hour_t[va_i]),
+                                res_t[va_i]).item()
+        if v_loss < best_loss:
+            best_loss = v_loss
+            best_state = {k: v.clone() for k, v in model.state_dict().items()}
+            wait = 0
+        else:
+            wait += 1
+            if wait >= int(cfg["residual_patience"]):
+                break
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    model.eval()
+    return model
+
+
+def _temperature_vector(labels: list, class_map: Dict[str, str]) -> np.ndarray:
+    t = np.ones(len(labels), dtype=np.float32)
+    for i, lb in enumerate(labels):
+        cls = class_map.get(lb, "Aves")
+        if cls in {"Amphibia", "Insecta"}:
+            t[i] = 0.95
+        else:
+            t[i] = 1.10
+    return t
+
+
+def _postproc(
+    first_pass_logits: np.ndarray, temperatures: np.ndarray, cfg: dict,
+) -> np.ndarray:
+    scores = first_pass_logits / temperatures[None, :]
+    probs = sigmoid_np(scores)
+    probs = file_confidence_scale(probs, n_windows=N_WINDOWS,
+                                  top_k=int(cfg["file_conf_top_k"]),
+                                  power=float(cfg["file_conf_power"]))
+    probs = rank_aware_scaling(probs, n_windows=N_WINDOWS,
+                               power=float(cfg["rank_power"]))
+    if cfg["smoothing"] == "gaussian":
+        probs = gaussian_smooth(probs, n_windows=N_WINDOWS)
+    elif cfg["smoothing"] == "adaptive":
+        probs = adaptive_delta_smooth(probs, n_windows=N_WINDOWS,
+                                      base_alpha=float(cfg["smoothing_alpha"]))
+    if cfg.get("use_boost", False):
+        probs = hard_soundscape_boost(probs, n_windows=N_WINDOWS,
+                                      threshold=float(cfg["boost_threshold"]),
+                                      lift_weight=float(cfg["boost_lift"]))
+    return np.clip(probs, 0.0, 1.0)
+
+
+def _labeled_file_meta(meta_rows: pd.DataFrame) -> pd.DataFrame:
+    return meta_rows.drop_duplicates("filename")[["filename", "site", "hour_utc"]].reset_index(drop=True)
+
+
+def run_pipeline_for_split(
+    cache: PerchCache, train_idx: np.ndarray, val_idx: np.ndarray, cfg: dict,
+    temperatures: np.ndarray,
+) -> np.ndarray:
+    """Train on train_idx rows, predict on val_idx rows, return final probs."""
+    emb_tr, sc_tr, Y_tr = cache.emb[train_idx], cache.scores[train_idx], cache.Y[train_idx]
+    emb_va, sc_va = cache.emb[val_idx], cache.scores[val_idx]
+    meta_tr = cache.meta.iloc[train_idx].reset_index(drop=True)
+    meta_va = cache.meta.iloc[val_idx].reset_index(drop=True)
+    tr_files = _labeled_file_meta(meta_tr)
+    va_files = _labeled_file_meta(meta_va)
+
+    proto = _train_proto_ssm(emb_tr, sc_tr, Y_tr, tr_files, cfg)
+    proto_va = _predict_proto(proto, emb_va, sc_va, va_files, cfg)
+
+    probe_models, scaler, pca = _train_mlp_probes(emb_tr, sc_tr, Y_tr, cfg)
+    prior_tables = build_prior_tables(meta_tr, Y_tr)
+    sc_va_prior = logit_prior_shift(sc_va, meta_va, prior_tables, lambda_prior=float(cfg["lambda_prior"]))
+    sc_va_mlp = _apply_mlp_probes(emb_va, sc_va_prior, probe_models, scaler, pca,
+                                  float(cfg["mlp_alpha_blend"]))
+    first_pass_va = float(cfg["ensemble_w"]) * proto_va + (1.0 - float(cfg["ensemble_w"])) * sc_va_mlp
+
+    # Residual trained on train split, applied to val split
+    tr_site2i = _site2i(tr_files, int(cfg["n_sites_cap"]))
+    tr_site_ids, tr_hour_ids = _site_hour_ids(tr_files, tr_site2i, int(cfg["n_sites_cap"]))
+    va_site_ids, va_hour_ids = _site_hour_ids(va_files, tr_site2i, int(cfg["n_sites_cap"]))
+    proto_tr = _predict_proto(proto, emb_tr, sc_tr, tr_files, cfg)
+    sc_tr_prior = logit_prior_shift(sc_tr, meta_tr, prior_tables, lambda_prior=float(cfg["lambda_prior"]))
+    sc_tr_mlp = _apply_mlp_probes(emb_tr, sc_tr_prior, probe_models, scaler, pca,
+                                  float(cfg["mlp_alpha_blend"]))
+    first_pass_tr = float(cfg["ensemble_w"]) * proto_tr + (1.0 - float(cfg["ensemble_w"])) * sc_tr_mlp
+
+    res = _train_residual(emb_tr, first_pass_tr, Y_tr, tr_site_ids, tr_hour_ids, cfg)
+    with torch.no_grad():
+        n_va = emb_va.shape[0] // N_WINDOWS
+        corr = res(
+            torch.tensor(emb_va.reshape(n_va, N_WINDOWS, -1), dtype=torch.float32),
+            torch.tensor(first_pass_va.reshape(n_va, N_WINDOWS, -1), dtype=torch.float32),
+            site_ids=torch.tensor(va_site_ids, dtype=torch.long),
+            hours=torch.tensor(va_hour_ids, dtype=torch.long),
+        ).numpy().reshape(-1, cache.Y.shape[1])
+    final_logits = first_pass_va + float(cfg["correction_weight"]) * corr
+
+    # Calibrated thresholds + post-processing
+    first_pass_tr_probs = sigmoid_np(first_pass_tr)
+    thresholds = calibrate_and_optimize_thresholds(
+        first_pass_tr_probs, Y_tr, threshold_grid=list(cfg["threshold_grid"]),
+        n_windows=N_WINDOWS,
+    )
+    probs = _postproc(final_logits, temperatures, cfg)
+    return apply_per_class_thresholds(probs, thresholds)
+
+
+def run_full_evaluation(cfg: dict) -> Dict:
+    """Runs fold-safe OOF + V-anchor for one config. Returns sweep-runner result."""
+    cache = load_perch_cache()
+    # Limit to labeled rows
+    labeled_idx = np.where(cache.labeled_mask)[0]
+    cache_meta = cache.meta.iloc[labeled_idx].reset_index(drop=True)
+    cache_scores = cache.scores[labeled_idx]
+    cache_emb = cache.emb[labeled_idx]
+    cache_Y = cache.Y[labeled_idx]
+    cache_sub = PerchCache(meta=cache_meta, scores=cache_scores, emb=cache_emb,
+                           Y=cache_Y, labeled_mask=np.ones(len(cache_meta), dtype=bool))
+
+    # Temperature vector
+    from birdclef.data.soundscapes import load_taxonomy
+    tax = load_taxonomy()
+    class_map = tax.set_index("primary_label")["class_name"].to_dict()
+    labels = primary_labels()
+    temperatures = _temperature_vector(labels, class_map)
+
+    # Rare/frequent split (support from LABELED rows only — that's what we
+    # have for this comparative sweep).
+    support = cache_Y.sum(axis=0)
+    rare_idx, freq_idx = split_rare_frequent(support)
+
+    # OOF by site×date fold
+    folds = pd.read_parquet(FOLDS_PQ)
+    fold_of = dict(zip(folds["filename"], folds["fold"].astype(int)))
+    row_fold = cache_meta["filename"].map(fold_of).fillna(-1).astype(int).to_numpy()
+    n_splits = int(folds["fold"].max()) + 1 if len(folds) else 5
+
+    oof = np.zeros_like(cache_Y, dtype=np.float32)
+    per_fold = {}
+    for f in range(n_splits):
+        tr = np.where((row_fold != f) & (row_fold >= 0))[0]
+        va = np.where(row_fold == f)[0]
+        if len(va) == 0:
+            continue
+        probs = run_pipeline_for_split(cache_sub, tr, va, cfg, temperatures)
+        oof[va] = probs
+        m = compute_stage_metrics(
+            cache_Y[va], probs,
+            cache_meta.iloc[va].reset_index(drop=True),
+            rare_idx=rare_idx, frequent_idx=freq_idx,
+        )
+        per_fold[int(f)] = m
+        print(f"[ssm] fold {f}  macro_auc={m['macro_auc']:.4f}  "
+              f"site_std={m['site_auc_std']:.4f}")
+
+    oof_keep = row_fold >= 0
+    m_global = compute_stage_metrics(
+        cache_Y[oof_keep], oof[oof_keep],
+        cache_meta.iloc[oof_keep].reset_index(drop=True),
+        rare_idx=rare_idx, frequent_idx=freq_idx,
+    )
+
+    # V-anchor: train on everything not in anchor, predict on anchor.
+    anchor_files = set(load_v_anchor())
+    v_mask = cache_meta["filename"].isin(anchor_files).to_numpy()
+    v_metrics = {}
+    if v_mask.any():
+        tr = np.where(~v_mask)[0]
+        va = np.where(v_mask)[0]
+        probs = run_pipeline_for_split(cache_sub, tr, va, cfg, temperatures)
+        v_metrics = compute_stage_metrics(
+            cache_Y[va], probs,
+            cache_meta.iloc[va].reset_index(drop=True),
+            rare_idx=rare_idx, frequent_idx=freq_idx,
+        )
+        print(f"[ssm] V-anchor  macro_auc={v_metrics['macro_auc']:.4f}  "
+              f"site_std={v_metrics['site_auc_std']:.4f}")
+    return {
+        "metrics": {
+            "global": m_global,
+            "per_fold": per_fold,
+            "v_anchor": v_metrics,
+        }
+    }

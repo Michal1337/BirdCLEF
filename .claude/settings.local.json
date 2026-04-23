@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c ' *)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('c:/Users/mgrom/Desktop/Projects/Kaggle/BirdCLEF/birdclef_example/residual_ssm_config_sweep.py'\\).read\\(\\)\\); print\\('syntax OK'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('c:/Users/mgrom/Desktop/Projects/Kaggle/BirdCLEF/birdclef_example/sota_submit.py'\\).read\\(\\)\\); print\\('syntax OK'\\)\")",
+      "Bash(python -c \"import ast, io; ast.parse\\(io.open\\('c:/Users/mgrom/Desktop/Projects/Kaggle/BirdCLEF/birdclef_example/sota_submit.py', encoding='utf-8'\\).read\\(\\)\\); print\\('syntax OK'\\)\")",
+      "Bash(xargs head *)",
+      "Bash(python -m birdclef.scripts._02_build_splits)"
+    ]
+  }
+}
