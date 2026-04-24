@@ -147,16 +147,90 @@ def macro_auc(y_true, y_score):
     return roc_auc_score(y_true[:, keep], y_score[:, keep], average="macro")
 
 
-def honest_oof_auc(scores, Y, meta_df, n_splits=5, label="scores"):
-    groups = meta_df["filename"].to_numpy()
+NEW_FOLDS_PQ = Path("birdclef/splits/folds_site_date.parquet")
+NEW_VANCHOR_TXT = Path("birdclef/splits/v_anchor_files.txt")
+_NEW_FOLDS_CACHE = {"loaded": False, "map": None, "n": None, "anchor": None}
+
+
+def _load_new_fold_map():
+    """Return (filename -> fold, n_folds, anchor_filenames) from the new
+    site×date split parquet. Returns (None, None, None) if the parquet is
+    absent so callers can fall back to GroupKFold(filename)."""
+    if _NEW_FOLDS_CACHE["loaded"]:
+        return _NEW_FOLDS_CACHE["map"], _NEW_FOLDS_CACHE["n"], _NEW_FOLDS_CACHE["anchor"]
+    _NEW_FOLDS_CACHE["loaded"] = True
+    if not NEW_FOLDS_PQ.exists():
+        print(f"[folds] {NEW_FOLDS_PQ} absent — falling back to GroupKFold(filename)")
+        return None, None, None
+    folds_df = pd.read_parquet(NEW_FOLDS_PQ)
+    fmap = dict(zip(folds_df["filename"].astype(str), folds_df["fold"].astype(int)))
+    n_folds = int(folds_df["fold"].max()) + 1 if len(folds_df) else 0
+    anchor = set()
+    if NEW_VANCHOR_TXT.exists():
+        anchor = {ln.strip() for ln in NEW_VANCHOR_TXT.read_text(encoding="utf-8").splitlines() if ln.strip()}
+    _NEW_FOLDS_CACHE["map"] = fmap
+    _NEW_FOLDS_CACHE["n"] = n_folds
+    _NEW_FOLDS_CACHE["anchor"] = anchor
+    print(f"[folds] using site×date splits from {NEW_FOLDS_PQ} "
+          f"(n_folds={n_folds}, non_anchor_files={len(fmap)}, v_anchor={len(anchor)})")
+    return fmap, n_folds, anchor
+
+
+def _iter_file_splits(file_meta, n_splits):
+    """Yield (train_idx, val_idx) into file_meta rows.
+
+    If the site×date fold parquet exists, rows mapped to anchor files are
+    never returned in either train or val (they're the V-anchor). Rows
+    present in neither the parquet nor the anchor list fall through to
+    train for every fold (safety default).
+    """
+    fmap, n_new, anchor = _load_new_fold_map()
+    fnames = file_meta["filename"].astype(str).to_numpy()
+    if fmap is not None:
+        fold_of = np.array([fmap.get(f, -1) for f in fnames], dtype=np.int32)
+        is_anchor = np.array([f in anchor for f in fnames], dtype=bool)
+        for f in range(n_new):
+            va = np.where(fold_of == f)[0]
+            tr = np.where((fold_of != f) & (fold_of >= 0) & (~is_anchor))[0]
+            if len(va) == 0:
+                continue
+            yield tr, va
+        return
     gkf = GroupKFold(n_splits=n_splits)
+    yield from gkf.split(file_meta, groups=file_meta["filename"].to_numpy())
+
+
+def _iter_row_splits(meta_df, n_splits):
+    """Row-level generator mirror of _iter_file_splits (for honest_oof_auc)."""
+    fmap, n_new, anchor = _load_new_fold_map()
+    rows_fn = meta_df["filename"].astype(str).to_numpy()
+    if fmap is not None:
+        fold_of = np.array([fmap.get(f, -1) for f in rows_fn], dtype=np.int32)
+        is_anchor = np.array([f in anchor for f in rows_fn], dtype=bool)
+        for f in range(n_new):
+            va = np.where(fold_of == f)[0]
+            tr = np.where((fold_of != f) & (fold_of >= 0) & (~is_anchor))[0]
+            if len(va) == 0:
+                continue
+            yield tr, va
+        return
+    gkf = GroupKFold(n_splits=n_splits)
+    yield from gkf.split(rows_fn, groups=rows_fn)
+
+
+def honest_oof_auc(scores, Y, meta_df, n_splits=5, label="scores"):
     oof = np.zeros_like(scores, dtype=np.float32)
-
-    for fold, (tr_idx, va_idx) in enumerate(gkf.split(scores, groups=groups), 1):
+    scored_mask = np.zeros(len(scores), dtype=bool)
+    for fold, (tr_idx, va_idx) in enumerate(_iter_row_splits(meta_df, n_splits), 1):
         oof[va_idx] = scores[va_idx]
+        scored_mask[va_idx] = True
 
-    auc = macro_auc(Y, oof)
-    print(f"[{label}] honest OOF macro-AUC: {auc:.6f}")
+    if scored_mask.any():
+        auc = macro_auc(Y[scored_mask], oof[scored_mask])
+    else:
+        auc = float("nan")
+    print(f"[{label}] honest OOF macro-AUC: {auc:.6f}  "
+          f"(scored={int(scored_mask.sum())}/{len(scored_mask)})")
     return auc, oof
 
 
@@ -1043,8 +1117,8 @@ def run_pipeline_oof(emb_full, sc_full, Y_full, meta_full, n_splits=5):
     """Proper full-pipeline OOF (ProtoSSM + MLP only) — matches notebook Cell 23."""
     file_meta = meta_full.drop_duplicates("filename").reset_index(drop=True)
 
-    gkf = GroupKFold(n_splits=n_splits)
     oof_probs = np.zeros((len(sc_full), N_CLASSES), dtype=np.float32)
+    scored_mask = np.zeros(len(sc_full), dtype=bool)
 
     proto_kw = _cfg_proto_train_kwargs()
     mlp_min_pos = int(CFG.get("mlp_min_pos", 5))
@@ -1052,7 +1126,7 @@ def run_pipeline_oof(emb_full, sc_full, Y_full, meta_full, n_splits=5):
     mlp_alpha_blend = float(CFG.get("mlp_alpha_blend", 0.4))
 
     for fold, (tr_f, va_f) in enumerate(
-        gkf.split(file_meta, groups=file_meta["filename"]), 1
+        _iter_file_splits(file_meta, n_splits), 1
     ):
         tr_fnames = set(file_meta.iloc[tr_f]["filename"])
         va_fnames = set(file_meta.iloc[va_f]["filename"])
@@ -1142,221 +1216,20 @@ def run_pipeline_oof(emb_full, sc_full, Y_full, meta_full, n_splits=5):
         first_pass = ensemble_w * proto_va + (1.0 - ensemble_w) * sc_va_mlp
         probs_va = sigmoid(first_pass)
         oof_probs[va_mask] = probs_va
+        scored_mask[va_mask] = True
 
         fold_auc = macro_auc(Y_full[va_mask], probs_va)
         print(
             f"  Fold {fold}/{n_splits}  val files={len(va_fnames)}  AUC={fold_auc:.6f}"
         )
 
-    overall = macro_auc(Y_full, oof_probs)
-    print(f"\nFull pipeline OOF AUC: {overall:.6f}")
+    if scored_mask.any():
+        overall = macro_auc(Y_full[scored_mask], oof_probs[scored_mask])
+    else:
+        overall = float("nan")
+    print(f"\nFull pipeline OOF AUC: {overall:.6f}  "
+          f"(scored rows={int(scored_mask.sum())}/{len(scored_mask)})")
     return overall, oof_probs
-
-
-def run_pipeline_in_sample_fullstack(
-    emb_full,
-    sc_full,
-    Y_full,
-    meta_full,
-    temperatures,
-):
-    """In-sample full-stack evaluation (no folds) — directly mirrors the notebook
-    submit pipeline (Cell 25), but predicts on the same training data used for
-    fitting. Useful as an upper-bound sanity check; expect optimistic numbers.
-    Records per-stage macro-AUC just like run_pipeline_oof_fullstack and writes
-    them to outputs/sweep/in_sample_stage_metrics_<cfg>.json.
-    """
-    ensemble_w = float(CFG.get("ensemble_w", 0.50))
-    lambda_prior = float(CFG.get("lambda_prior", 0.40))
-    mlp_min_pos = int(CFG.get("mlp_min_pos", 5))
-    mlp_pca_dim = int(CFG.get("mlp_pca_dim", 64))
-    mlp_alpha_blend = float(CFG.get("mlp_alpha_blend", 0.40))
-    file_conf_top_k = int(CFG.get("file_conf_top_k", 2))
-    file_conf_power = float(CFG.get("file_conf_power", 0.40))
-    rank_power = float(CFG.get("rank_power", 0.40))
-    smooth_alpha = float(CFG.get("smooth_alpha", 0.20))
-    tta_shifts = [int(x) for x in CFG.get("tta_shifts", [0, 1, -1, 2, -2])]
-    threshold_grid = CFG.get(
-        "threshold_grid",
-        [0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70],
-    )
-    proto_kw = _cfg_proto_train_kwargs()
-    res_kw = _cfg_residual_train_kwargs()
-
-    cfg_name = str(CFG.get("name", "unnamed"))
-    safe_cfg_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", cfg_name)
-    metrics_out_path = (
-        BASE / "outputs" / "sweep" / f"in_sample_stage_metrics_{safe_cfg_name}.json"
-    )
-    metrics_out_path.parent.mkdir(parents=True, exist_ok=True)
-
-    stage_order = [
-        "raw_perch",
-        "proto_only",
-        "prior_only",
-        "prior_mlp",
-        "first_pass",
-        "residual_plus_temp",
-        "post_file_conf",
-        "post_rank",
-        "post_smooth",
-        "final_after_threshold",
-    ]
-
-    # ── Train all components on the full training set ─────────────────────────
-    proto_model, site2i = train_light_proto_ssm(
-        emb_full,
-        sc_full,
-        Y_full,
-        meta_full,
-        verbose=False,
-        **proto_kw,
-    )
-    probe_models, emb_scaler, emb_pca, alpha_blend = train_mlp_probes(
-        emb_full,
-        sc_full,
-        Y_full,
-        min_pos=mlp_min_pos,
-        pca_dim=mlp_pca_dim,
-        alpha_blend=mlp_alpha_blend,
-    )
-    prior_tables = build_prior_tables(meta_full[["site", "hour_utc"]], Y_full)
-
-    # ── Build per-file site/hour ids (matches notebook submit branch) ─────────
-    n_files = len(emb_full) // N_WINDOWS
-    emb_seq = emb_full.reshape(n_files, N_WINDOWS, -1)
-    sc_seq = sc_full.reshape(n_files, N_WINDOWS, -1)
-
-    fn_list = meta_full.drop_duplicates("filename")["filename"].tolist()
-    site_ids = np.array(
-        [
-            min(
-                site2i.get(
-                    meta_full.loc[meta_full["filename"] == fn, "site"].iloc[0], 0
-                ),
-                n_sites_cap - 1,
-            )
-            for fn in fn_list
-        ],
-        dtype=np.int64,
-    )
-    hour_ids = np.array(
-        [
-            int(meta_full.loc[meta_full["filename"] == fn, "hour_utc"].iloc[0]) % 24
-            for fn in fn_list
-        ],
-        dtype=np.int64,
-    )
-    site_t = torch.tensor(site_ids, dtype=torch.long)
-    hour_t = torch.tensor(hour_ids, dtype=torch.long)
-
-    # ── ProtoSSM in-sample predictions with TTA (matches submit branch) ───────
-    proto_out = run_tta_proto(
-        proto_model, emb_seq, sc_seq, site_t=site_t, hour_t=hour_t, shifts=tta_shifts
-    )
-    proto_flat = proto_out.reshape(-1, N_CLASSES).astype(np.float32)
-
-    sc_prior = apply_prior(
-        sc_full,
-        sites=meta_full["site"].to_numpy(),
-        hours=meta_full["hour_utc"].to_numpy(),
-        tables=prior_tables,
-        lambda_prior=lambda_prior,
-    )
-    sc_mlp = apply_mlp_probes_vectorized(
-        emb_full, sc_prior, probe_models, emb_scaler, emb_pca, alpha_blend
-    )
-    first_pass = ensemble_w * proto_flat + (1.0 - ensemble_w) * sc_mlp
-
-    raw_perch_probs = sigmoid(sc_full)
-    proto_probs = sigmoid(proto_flat)
-    prior_only_probs = sigmoid(sc_prior)
-    prior_mlp_probs = sigmoid(sc_mlp)
-    first_pass_probs = sigmoid(first_pass)
-
-    # ── Calibrate per-class thresholds on in-sample first-pass probs ──────────
-    thresholds = calibrate_and_optimize_thresholds(
-        oof_probs=first_pass_probs,
-        Y_FULL=Y_full,
-        threshold_grid=threshold_grid,
-        n_windows=N_WINDOWS,
-    )
-
-    # ── Train ResidualSSM and apply correction in-sample ──────────────────────
-    res_model, corr_w = train_residual_ssm(
-        emb_full=emb_full,
-        first_pass_flat=first_pass,
-        Y_full=Y_full,
-        site_ids=site_ids,
-        hour_ids=hour_ids,
-        verbose=False,
-        **res_kw,
-    )
-
-    first_pass_seq = first_pass.reshape(n_files, N_WINDOWS, -1)
-    res_model.eval()
-    with torch.no_grad():
-        correction = res_model(
-            torch.tensor(emb_seq, dtype=torch.float32),
-            torch.tensor(first_pass_seq, dtype=torch.float32),
-            site_ids=site_t,
-            hours=hour_t,
-        ).numpy()
-    correction_flat = correction.reshape(-1, N_CLASSES).astype(np.float32)
-
-    final_scores = first_pass + corr_w * correction_flat
-    final_scores = final_scores / temperatures[None, :]
-    residual_plus_temp_probs = sigmoid(final_scores)
-
-    post_file_conf_probs = file_confidence_scale(
-        residual_plus_temp_probs,
-        n_windows=N_WINDOWS,
-        top_k=file_conf_top_k,
-        power=file_conf_power,
-    )
-    post_rank_probs = rank_aware_scaling(
-        post_file_conf_probs, n_windows=N_WINDOWS, power=rank_power
-    )
-    post_smooth_probs = adaptive_delta_smooth(
-        post_rank_probs, n_windows=N_WINDOWS, base_alpha=smooth_alpha
-    )
-    post_smooth_probs = np.clip(post_smooth_probs, 0.0, 1.0)
-    final_probs = apply_per_class_thresholds(post_smooth_probs, thresholds)
-
-    stage_probs = {
-        "raw_perch": raw_perch_probs,
-        "proto_only": proto_probs,
-        "prior_only": prior_only_probs,
-        "prior_mlp": prior_mlp_probs,
-        "first_pass": first_pass_probs,
-        "residual_plus_temp": residual_plus_temp_probs,
-        "post_file_conf": post_file_conf_probs,
-        "post_rank": post_rank_probs,
-        "post_smooth": post_smooth_probs,
-        "final_after_threshold": final_probs,
-    }
-    global_stage_metrics_raw = {
-        stage_name: float(macro_auc(Y_full, stage_probs[stage_name]))
-        for stage_name in stage_order
-    }
-    global_stage_metrics = {
-        stage_name: round(metric_val, 4)
-        for stage_name, metric_val in global_stage_metrics_raw.items()
-    }
-    overall = global_stage_metrics_raw["final_after_threshold"]
-
-    payload = {
-        "config_name": cfg_name,
-        "mode": "in_sample_no_folds",
-        "stage_order": stage_order,
-        "global_metrics": global_stage_metrics,
-    }
-    with metrics_out_path.open("w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2)
-
-    print(f"\nIn-sample full-stack AUC: {overall:.6f}")
-    print(f"Saved in-sample stage metrics: {metrics_out_path}")
-    return overall, final_probs, global_stage_metrics, str(metrics_out_path)
 
 
 def run_pipeline_oof_fullstack(
@@ -1396,7 +1269,6 @@ def run_pipeline_oof_fullstack(
     metrics_out_path.parent.mkdir(parents=True, exist_ok=True)
 
     file_meta = meta_full.drop_duplicates("filename").reset_index(drop=True)
-    gkf = GroupKFold(n_splits=n_splits)
     stage_order = [
         "raw_perch",
         "proto_only",
@@ -1413,9 +1285,10 @@ def run_pipeline_oof_fullstack(
         stage_name: np.zeros((len(sc_full), N_CLASSES), dtype=np.float32)
         for stage_name in stage_order
     }
+    scored_mask = np.zeros(len(sc_full), dtype=bool)
 
     for fold, (tr_f, va_f) in enumerate(
-        gkf.split(file_meta, groups=file_meta["filename"]), 1
+        _iter_file_splits(file_meta, n_splits), 1
     ):
         tr_fnames = set(file_meta.iloc[tr_f]["filename"])
         va_fnames = set(file_meta.iloc[va_f]["filename"])
@@ -1633,15 +1506,20 @@ def run_pipeline_oof_fullstack(
         }
         for stage_name, stage_probs in stage_probs_va.items():
             stage_oof[stage_name][va_mask] = stage_probs
+        scored_mask[va_mask] = True
         fold_auc = float(macro_auc(Y_full[va_mask], final_probs_va))
         print(
             f"  Fold {fold}/{n_splits}  val files={len(va_fnames)}  full-stack AUC={fold_auc:.6f}"
         )
 
+    if not scored_mask.any():
+        raise RuntimeError("No OOF rows were scored — check fold parquet vs cache meta")
     global_stage_metrics_raw = {
-        stage_name: float(macro_auc(Y_full, stage_oof[stage_name]))
+        stage_name: float(macro_auc(Y_full[scored_mask], stage_oof[stage_name][scored_mask]))
         for stage_name in stage_order
     }
+    print(f"[oof_fullstack] scored rows={int(scored_mask.sum())}/{len(scored_mask)}  "
+          f"(V-anchor rows excluded from overall macro-AUC)")
     global_stage_metrics = {
         stage_name: round(metric_val, 4)
         for stage_name, metric_val in global_stage_metrics_raw.items()
@@ -1902,14 +1780,13 @@ if CFG["run_oof"]:
         raise ValueError("OOF_SWEEP_CONFIGS is empty. Add at least one config preset.")
 
     print(
-        f"Running full-stack sweep (in-sample + fold-safe OOF) over {len(OOF_SWEEP_CONFIGS)} configs…"
+        f"Running fold-safe OOF sweep over {len(OOF_SWEEP_CONFIGS)} configs…"
     )
     base_cfg = copy.deepcopy(CFG)
     sweep_results = []
-    sweep_dir = BASE / "outputs" / "sweep2"
+    sweep_dir = BASE / "outputs" / "sweep4"
     sweep_out_path = sweep_dir / "oof_fullstack_sweep_results.json"
     sweep_csv_path = sweep_dir / "oof_fullstack_sweep_results.csv"
-    combined_csv_path = sweep_dir / "in_sample_and_oof_sweep_results.csv"
     sweep_dir.mkdir(parents=True, exist_ok=True)
 
     def round_metrics_dict(metrics_dict):
@@ -1921,12 +1798,6 @@ if CFG["run_oof"]:
             row = copy.deepcopy(result)
             row["metric"] = round(float(result.get("metric", 0.0)), 4)
             row["stage_metrics"] = round_metrics_dict(result.get("stage_metrics", {}))
-            row["in_sample_metric"] = round(
-                float(result.get("in_sample_metric", 0.0)), 4
-            )
-            row["in_sample_stage_metrics"] = round_metrics_dict(
-                result.get("in_sample_stage_metrics", {})
-            )
             export_rows.append(row)
         return export_rows
 
@@ -1937,35 +1808,9 @@ if CFG["run_oof"]:
                 "rank": int(rank),
                 "config_name": str(result.get("config_name", "")),
                 "metric": round(float(result.get("metric", 0.0)), 4),
-                "stage_metrics_path": str(result.get("stage_metrics_path", "")),
             }
             for stage_name, stage_val in result.get("stage_metrics", {}).items():
                 row[f"metric_{stage_name}"] = round(float(stage_val), 4)
-            rows.append(row)
-        pd.DataFrame(rows).to_csv(csv_path, index=False, float_format="%.4f")
-
-    def write_combined_results_csv(ranked_results, csv_path):
-        """One row per config with both in-sample and OOF stage metrics side-by-side."""
-        rows = []
-        for rank, result in enumerate(ranked_results, 1):
-            row = {
-                "rank": int(rank),
-                "config_name": str(result.get("config_name", "")),
-                "oof_metric": round(float(result.get("metric", 0.0)), 4),
-                "in_sample_metric": round(
-                    float(result.get("in_sample_metric", 0.0)), 4
-                ),
-                "oof_stage_metrics_path": str(result.get("stage_metrics_path", "")),
-                "in_sample_stage_metrics_path": str(
-                    result.get("in_sample_stage_metrics_path", "")
-                ),
-            }
-            for stage_name, stage_val in result.get("stage_metrics", {}).items():
-                row[f"oof_{stage_name}"] = round(float(stage_val), 4)
-            for stage_name, stage_val in result.get(
-                "in_sample_stage_metrics", {}
-            ).items():
-                row[f"in_sample_{stage_name}"] = round(float(stage_val), 4)
             rows.append(row)
         pd.DataFrame(rows).to_csv(csv_path, index=False, float_format="%.4f")
 
@@ -1982,22 +1827,6 @@ if CFG["run_oof"]:
         sweep_iter.set_postfix_str(cfg_name)
         print(f"\n[{run_idx}/{len(OOF_SWEEP_CONFIGS)}] {cfg_name}")
 
-        # ── In-sample (no folds) — runs first so the OOF result wins the print order
-        print(f"\n[{cfg_name}] In-sample (no-folds) full-stack…")
-        (
-            in_sample_auc,
-            _,
-            in_sample_stage_metrics,
-            in_sample_metrics_path,
-        ) = run_pipeline_in_sample_fullstack(
-            emb_tr,
-            sc_tr,
-            Y_FULL_aligned,
-            meta_tr,
-            temperatures=temperatures,
-        )
-
-        # ── Fold-safe OOF
         print(f"\n[{cfg_name}] Fold-safe OOF full-stack…")
         pipeline_auc, _, stage_metrics, stage_metrics_path = run_pipeline_oof_fullstack(
             emb_tr,
@@ -2006,9 +1835,7 @@ if CFG["run_oof"]:
             meta_tr,
             temperatures=temperatures,
         )
-        print(
-            f"Completed {cfg_name}: in_sample={in_sample_auc:.6f}  oof={pipeline_auc:.6f}"
-        )
+        print(f"Completed {cfg_name}: oof={pipeline_auc:.6f}")
 
         sweep_results.append(
             {
@@ -2017,9 +1844,6 @@ if CFG["run_oof"]:
                 "config": copy.deepcopy(CFG),
                 "stage_metrics": stage_metrics,
                 "stage_metrics_path": stage_metrics_path,
-                "in_sample_metric": float(in_sample_auc),
-                "in_sample_stage_metrics": in_sample_stage_metrics,
-                "in_sample_stage_metrics_path": in_sample_metrics_path,
             }
         )
 
@@ -2032,10 +1856,9 @@ if CFG["run_oof"]:
         with sweep_out_path.open("w", encoding="utf-8") as f:
             json.dump(partial_results_export, f, indent=2)
         write_sweep_results_csv(partial_results_export, sweep_csv_path)
-        write_combined_results_csv(partial_results_export, combined_csv_path)
         print(
             f"Saved interim sweep results ({len(partial_results)}/{len(OOF_SWEEP_CONFIGS)}): "
-            f"{sweep_out_path}, {sweep_csv_path}, {combined_csv_path}"
+            f"{sweep_out_path}, {sweep_csv_path}"
         )
 
     full_cfg_results = sorted(
@@ -2047,25 +1870,20 @@ if CFG["run_oof"]:
     with sweep_out_path.open("w", encoding="utf-8") as f:
         json.dump(full_cfg_results_export, f, indent=2)
     write_sweep_results_csv(full_cfg_results_export, sweep_csv_path)
-    write_combined_results_csv(full_cfg_results_export, combined_csv_path)
 
     CFG = copy.deepcopy(base_cfg)
 
     print("\nSweep summary (best OOF first):")
     for row in full_cfg_results:
-        print(
-            f"{row['config_name']}: oof={row['metric']:.6f}  "
-            f"in_sample={row['in_sample_metric']:.6f}"
-        )
+        print(f"{row['config_name']}: oof={row['metric']:.6f}")
 
     best_row = full_cfg_results[0]
     print(
         f"\nBest config (by OOF): {best_row['config_name']}  "
-        f"oof={best_row['metric']:.6f}  in_sample={best_row['in_sample_metric']:.6f}"
+        f"oof={best_row['metric']:.6f}"
     )
     print(f"Saved sweep results: {sweep_out_path}")
     print(f"Saved OOF CSV: {sweep_csv_path}")
-    print(f"Saved combined in-sample + OOF CSV: {combined_csv_path}")
 else:
     print("Submit mode: skipping OOF sweep")
 

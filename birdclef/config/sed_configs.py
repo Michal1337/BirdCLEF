@@ -40,7 +40,7 @@ BASELINE = dict(
     grad_clip=1.0,
     ema_decay=0.999,
     # Eval
-    eval_every_n_steps=500,
+    eval_every_n_steps=100,
     pseudo_round=None,
 )
 

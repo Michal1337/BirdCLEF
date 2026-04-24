@@ -45,12 +45,17 @@ class MelFrontend(nn.Module):
         # x: [B, T] or [B, 1, T]
         if x.ndim == 3:
             x = x.squeeze(1)
-        s = self.mel(x)
-        s = self.to_db(s)
-        # Normalize per-sample
-        m = s.mean(dim=(-2, -1), keepdim=True)
-        v = s.std(dim=(-2, -1), keepdim=True).clamp(min=1e-6)
-        s = (s - m) / v
+        # FFT under fp16 autocast is a well-known source of NaN/Inf. Force
+        # the entire mel front-end to run in fp32 regardless of outer AMP
+        # context; the backbone+head still enjoy autocast outside this block.
+        with torch.amp.autocast(device_type=x.device.type, enabled=False):
+            x = x.float()
+            s = self.mel(x)
+            s = self.to_db(s)
+            # Normalize per-sample
+            m = s.mean(dim=(-2, -1), keepdim=True)
+            v = s.std(dim=(-2, -1), keepdim=True).clamp(min=1e-6)
+            s = (s - m) / v
         return s.unsqueeze(1)  # [B, 1, n_mels, T]
 
 

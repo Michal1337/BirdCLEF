@@ -84,17 +84,32 @@ def main(dry_run_files: int = 0, resume: bool = True) -> None:
         df = df.iloc[:dry_run_files].copy()
 
     paths = [Path(p) for p in df["abspath"]]
+    have_prev = False
     if WAVEFORM_INDEX.exists() and WAVEFORM_NPY.exists() and resume:
         prev = pd.read_parquet(WAVEFORM_INDEX)
-        print(f"[waveform_cache] found existing cache with {len(prev)} rows")
-        done = set(prev["filename"].tolist())
-        todo = df[~df["filename"].astype(str).isin(done)].reset_index(drop=True)
-        if len(todo) == 0:
-            print("[waveform_cache] nothing to do.")
-            return
-        print(f"[waveform_cache] resuming: {len(todo)}/{len(df)} new files")
-        df = todo
-        paths = [Path(p) for p in df["abspath"]]
+        if len(prev) == 0 or "filename" not in prev.columns:
+            print(f"[waveform_cache] existing cache at {WAVEFORM_INDEX} is empty or "
+                  f"malformed (rows={len(prev)}, cols={list(prev.columns)}); "
+                  "discarding and rebuilding from scratch.")
+            try:
+                WAVEFORM_INDEX.unlink(missing_ok=True)
+                WAVEFORM_NPY.unlink(missing_ok=True)
+            except OSError as exc:
+                print(f"[waveform_cache] could not delete stale files: {exc}")
+        else:
+            print(f"[waveform_cache] found existing cache with {len(prev)} rows")
+            done = set(prev["filename"].astype(str).tolist())
+            todo = df[~df["filename"].astype(str).isin(done)].reset_index(drop=True)
+            if len(todo) == 0:
+                print("[waveform_cache] nothing to do.")
+                return
+            print(f"[waveform_cache] resuming: {len(todo)}/{len(df)} new files")
+            df = todo
+            paths = [Path(p) for p in df["abspath"]]
+            have_prev = True
+    # If we didn't successfully adopt a prev cache, treat this run as fresh.
+    if not have_prev:
+        resume = False
 
     total = _estimate_samples(paths)
     _ram_guard(total, dtype_bytes=2)

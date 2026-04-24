@@ -8,8 +8,8 @@ from __future__ import annotations
 BASELINE = dict(
     # Base stack blends
     ensemble_w=0.50,
-    lambda_prior=0.40,
-    correction_weight=0.35,
+    lambda_prior=0.0,
+    correction_weight=0.0,
     # Loss choice
     loss="focal_bce",
     focal_alpha=0.25,
@@ -30,7 +30,7 @@ BASELINE = dict(
     file_conf_power=0.40,
     rank_power=0.40,
     # Thresholds
-    threshold_grid=(0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70),
+    threshold_grid=(0.50, ),
     # Training
     proto_n_epochs=80,
     proto_lr=8e-4,

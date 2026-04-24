@@ -62,7 +62,7 @@ def main(dry_run_files: int = 0) -> None:
 
     session = load_onnx_session()
     t0 = time.time()
-    meta_df, scores, embs = run_perch(ordered, session=session, mapping=mapping)
+    meta_df, scores, embs = run_perch(ordered, session=session, mapping=mapping, batch_files=32)
     meta_df["is_labeled"] = meta_df["filename"].isin(labeled_set).astype("uint8")
     dt = time.time() - t0
     print(f"[perch_cache] Perch inference done in {dt/60:.1f} min. rows={len(meta_df)}")

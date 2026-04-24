@@ -1,12 +1,14 @@
 data/
 models/
+outputs/
 !birdclef/data
 !birdclef/models
+!birdclef/outputs
 .vscode
 .ipynb_checkpoints
-outputs
 __pycache__
 .venv
 *.pt
 *.npz
 *.csv
+cache/

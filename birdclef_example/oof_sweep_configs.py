@@ -1,428 +1,82 @@
 """Predefined full-stack OOF sweep configurations.
 
 Each entry is applied with CFG.update(sweep_cfg) before one sweep run.
-Fold count is fixed to 5 in the pipeline and intentionally omitted here.
+Fold count comes from birdclef/splits/folds_site_date.parquet; change it via
+    python -m birdclef.scripts._02_build_splits --n-splits <k>
+
+Design (informed by the prior_off sweep win):
+    no-cache: prior_off=0.8624 final; prior_mlp stage alone=0.8783
+    cache:    prior_off=0.9019 final; prior_mlp stage alone=0.9167
+    → site/hour prior hurts on 46 files. Threshold calibration hurts −0.01–0.03.
+      Post-scaling + smoothing are roughly neutral-to-mild-positive.
+
+New baseline is `prior_off`; sweep explores what else helps on top of it.
+
+Sweep-config keys honoured by run_pipeline_oof_fullstack (CFG.get):
+    ensemble_w, lambda_prior, correction_weight,
+    mlp_alpha_blend, mlp_min_pos, mlp_pca_dim,
+    file_conf_top_k, file_conf_power, rank_power, smooth_alpha,
+    tta_shifts, threshold_grid,
+    proto_n_epochs, proto_patience, proto_lr,
+    residual_n_epochs, residual_patience, residual_lr
 """
 
+# Every config here implicitly uses lambda_prior=0.0 via the "prior_off" base.
+# If/when you change CFG.lambda_prior to 0.0 in the CFG dict itself, remove
+# this field from each entry below.
+_PRIOR_OFF = {"lambda_prior": 0.0}
+
+
+def _cfg(name, **overrides):
+    return {**_PRIOR_OFF, "name": name, **overrides}
+
+
 OOF_SWEEP_CONFIGS = [
-    {
-        "name": f"baseline_lambda",
-    }
-    # for lambda_prior in [0.0, 0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80]
-    ]
-    # {
-    #     "name": "baseline",
-    #     "ensemble_w": 0.50,
-    #     "correction_weight": 0.30,
-    #     "lambda_prior": 0.40,
-    # },
-    # {
-    #     "name": "proto_heavy_low_prior",
-    #     "ensemble_w": 0.68,
-    #     "correction_weight": 0.30,
-    #     "lambda_prior": 0.22,
-    # },
-    # {
-    #     "name": "mlp_heavy_high_prior",
-    #     "ensemble_w": 0.34,
-    #     "correction_weight": 0.30,
-    #     "lambda_prior": 0.58,
-    # },
-    # {
-    #     "name": "high_residual_balanced",
-    #     "ensemble_w": 0.50,
-    #     "correction_weight": 0.42,
-    #     "lambda_prior": 0.40,
-    # },
-    # {
-    #     "name": "low_residual_balanced",
-    #     "ensemble_w": 0.50,
-    #     "correction_weight": 0.20,
-    #     "lambda_prior": 0.40,
-    # },
-    # {
-    #     "name": "prior_very_low",
-    #     "ensemble_w": 0.50,
-    #     "correction_weight": 0.30,
-    #     "lambda_prior": 0.10,
-    # },
-    # {
-    #     "name": "prior_very_high",
-    #     "ensemble_w": 0.50,
-    #     "correction_weight": 0.30,
-    #     "lambda_prior": 0.68,
-    # },
-    # {
-    #     "name": "proto_extreme",
-    #     "ensemble_w": 0.80,
-    #     "correction_weight": 0.28,
-    #     "lambda_prior": 0.35,
-    # },
-    # {
-    #     "name": "mlp_extreme",
-    #     "ensemble_w": 0.20,
-    #     "correction_weight": 0.28,
-    #     "lambda_prior": 0.35,
-    # },
-    # {
-    #     "name": "ssm_longer_train",
-    #     "proto_n_epochs": 55,
-    #     "proto_patience": 12,
-    #     "proto_lr": 8e-4,
-    # },
-    # {
-    #     "name": "ssm_short_fast",
-    #     "proto_n_epochs": 28,
-    #     "proto_patience": 6,
-    #     "proto_lr": 1.2e-3,
-    # },
-    # {
-    #     "name": "ssm_low_sites",
-    #     "proto_n_sites": 16,
-    #     "proto_n_epochs": 42,
-    #     "proto_patience": 9,
-    # },
-    # {
-    #     "name": "ssm_higher_lr",
-    #     "proto_n_epochs": 32,
-    #     "proto_patience": 7,
-    #     "proto_lr": 1.6e-3,
-    # },
-    # {
-    #     "name": "ssm_lower_lr_long",
-    #     "proto_n_epochs": 60,
-    #     "proto_patience": 14,
-    #     "proto_lr": 6e-4,
-    # },
-    # {
-    #     "name": "mlp_small_pca_aggressive",
-    #     "mlp_pca_dim": 48,
-    #     "mlp_min_pos": 4,
-    #     "mlp_alpha_blend": 0.55,
-    # },
-    # {
-    #     "name": "mlp_large_pca_conservative",
-    #     "mlp_pca_dim": 96,
-    #     "mlp_min_pos": 6,
-    #     "mlp_alpha_blend": 0.30,
-    # },
-    # {
-    #     "name": "mlp_rare_classes",
-    #     "mlp_pca_dim": 80,
-    #     "mlp_min_pos": 3,
-    #     "mlp_alpha_blend": 0.45,
-    # },
-    # {
-    #     "name": "mlp_strict_classes",
-    #     "mlp_pca_dim": 64,
-    #     "mlp_min_pos": 8,
-    #     "mlp_alpha_blend": 0.35,
-    # },
-    # {
-    #     "name": "mlp_light_blend",
-    #     "mlp_alpha_blend": 0.25,
-    #     "mlp_pca_dim": 72,
-    # },
-    # {
-    #     "name": "mlp_heavy_blend",
-    #     "mlp_alpha_blend": 0.60,
-    #     "mlp_pca_dim": 72,
-    # },
-    # {
-    #     "name": "residual_long_train",
-    #     "correction_weight": 0.35,
-    #     "residual_n_epochs": 45,
-    #     "residual_patience": 12,
-    #     "residual_lr": 8e-4,
-    # },
-    # {
-    #     "name": "residual_fast_high_lr",
-    #     "correction_weight": 0.28,
-    #     "residual_n_epochs": 22,
-    #     "residual_patience": 5,
-    #     "residual_lr": 1.4e-3,
-    # },
-    # {
-    #     "name": "residual_strong",
-    #     "correction_weight": 0.45,
-    #     "residual_n_epochs": 38,
-    #     "residual_patience": 10,
-    # },
-    # {
-    #     "name": "residual_light",
-    #     "correction_weight": 0.18,
-    #     "residual_n_epochs": 24,
-    #     "residual_patience": 6,
-    # },
-    # {
-    #     "name": "post_soft",
-    #     "rank_power": 0.30,
-    #     "smooth_alpha": 0.28,
-    # },
-    # {
-    #     "name": "post_sharp",
-    #     "rank_power": 0.55,
-    #     "smooth_alpha": 0.10,
-    # },
-    # {
-    #     "name": "tta_three_shifts",
-    #     "tta_shifts": [0, 1, -1],
-    # },
-    # {
-    #     "name": "tta_wide",
-    #     "tta_shifts": [0, 1, -1, 2, -2, 3, -3],
-    # },
-    # {
-    #     "name": "all_regularized",
-    #     "ensemble_w": 0.58,
-    #     "correction_weight": 0.33,
-    #     "lambda_prior": 0.50,
-    #     "proto_n_epochs": 50,
-    #     "proto_patience": 11,
-    #     "proto_lr": 8e-4,
-    #     "mlp_pca_dim": 96,
-    #     "mlp_min_pos": 6,
-    #     "mlp_alpha_blend": 0.32,
-    #     "residual_n_epochs": 40,
-    #     "residual_patience": 10,
-    #     "residual_lr": 8e-4,
-    #     "rank_power": 0.35,
-    #     "smooth_alpha": 0.22,
-    # },
-    # {
-    #     "name": "high_recall_mix",
-    #     "ensemble_w": 0.42,
-    #     "correction_weight": 0.38,
-    #     "lambda_prior": 0.25,
-    #     "proto_n_epochs": 45,
-    #     "proto_patience": 9,
-    #     "proto_lr": 1.1e-3,
-    #     "mlp_pca_dim": 72,
-    #     "mlp_min_pos": 3,
-    #     "mlp_alpha_blend": 0.55,
-    #     "residual_n_epochs": 40,
-    #     "residual_patience": 9,
-    #     "residual_lr": 9e-4,
-    #     "rank_power": 0.45,
-    #     "smooth_alpha": 0.18,
-    # },
-    # {
-    #     "name": "low_prior_hrm_blend_a",
-    #     "ensemble_w": 0.44,
-    #     "correction_weight": 0.34,
-    #     "lambda_prior": 0.12,
-    #     "proto_n_epochs": 45,
-    #     "proto_patience": 9,
-    #     "proto_lr": 1.1e-3,
-    #     "mlp_pca_dim": 72,
-    #     "mlp_min_pos": 3,
-    #     "mlp_alpha_blend": 0.55,
-    #     "residual_n_epochs": 38,
-    #     "residual_patience": 9,
-    #     "residual_lr": 9e-4,
-    #     "rank_power": 0.43,
-    #     "smooth_alpha": 0.18,
-    # },
-    # {
-    #     "name": "low_prior_hrm_blend_b",
-    #     "ensemble_w": 0.46,
-    #     "correction_weight": 0.36,
-    #     "lambda_prior": 0.14,
-    #     "proto_n_epochs": 45,
-    #     "proto_patience": 9,
-    #     "proto_lr": 1.1e-3,
-    #     "mlp_pca_dim": 72,
-    #     "mlp_min_pos": 3,
-    #     "mlp_alpha_blend": 0.55,
-    #     "residual_n_epochs": 38,
-    #     "residual_patience": 9,
-    #     "residual_lr": 9e-4,
-    #     "rank_power": 0.44,
-    #     "smooth_alpha": 0.18,
-    # },
-    # {
-    #     "name": "low_prior_hrm_blend_c",
-    #     "ensemble_w": 0.40,
-    #     "correction_weight": 0.34,
-    #     "lambda_prior": 0.15,
-    #     "proto_n_epochs": 44,
-    #     "proto_patience": 9,
-    #     "proto_lr": 1.0e-3,
-    #     "mlp_pca_dim": 72,
-    #     "mlp_min_pos": 3,
-    #     "mlp_alpha_blend": 0.56,
-    #     "residual_n_epochs": 36,
-    #     "residual_patience": 8,
-    #     "residual_lr": 1.0e-3,
-    #     "rank_power": 0.42,
-    #     "smooth_alpha": 0.19,
-    # },
-    # {
-    #     "name": "low_prior_hrm_blend_d",
-    #     "ensemble_w": 0.48,
-    #     "correction_weight": 0.32,
-    #     "lambda_prior": 0.16,
-    #     "proto_n_epochs": 48,
-    #     "proto_patience": 10,
-    #     "proto_lr": 1.0e-3,
-    #     "mlp_pca_dim": 72,
-    #     "mlp_min_pos": 4,
-    #     "mlp_alpha_blend": 0.52,
-    #     "residual_n_epochs": 34,
-    #     "residual_patience": 8,
-    #     "residual_lr": 1.0e-3,
-    #     "rank_power": 0.40,
-    #     "smooth_alpha": 0.20,
-    # },
-    # {
-    #     "name": "low_prior_hrm_blend_e",
-    #     "ensemble_w": 0.42,
-    #     "correction_weight": 0.30,
-    #     "lambda_prior": 0.10,
-    #     "proto_n_epochs": 42,
-    #     "proto_patience": 9,
-    #     "proto_lr": 1.0e-3,
-    #     "mlp_pca_dim": 72,
-    #     "mlp_min_pos": 3,
-    #     "mlp_alpha_blend": 0.58,
-    #     "residual_n_epochs": 30,
-    #     "residual_patience": 7,
-    #     "residual_lr": 1.1e-3,
-    #     "rank_power": 0.44,
-    #     "smooth_alpha": 0.16,
-    # },
-    # {
-    #     "name": "low_prior_hrm_blend_f",
-    #     "ensemble_w": 0.45,
-    #     "correction_weight": 0.33,
-    #     "lambda_prior": 0.11,
-    #     "proto_n_epochs": 50,
-    #     "proto_patience": 11,
-    #     "proto_lr": 9e-4,
-    #     "mlp_pca_dim": 80,
-    #     "mlp_min_pos": 3,
-    #     "mlp_alpha_blend": 0.52,
-    #     "residual_n_epochs": 34,
-    #     "residual_patience": 8,
-    #     "residual_lr": 9e-4,
-    #     "rank_power": 0.41,
-    #     "smooth_alpha": 0.20,
-    # },
-    # {
-    #     "name": "prior_low_threshold_relaxed",
-    #     "lambda_prior": 0.10,
-    #     "threshold_grid": [0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60],
-    # },
-    # {
-    #     "name": "prior_low_threshold_mid",
-    #     "lambda_prior": 0.10,
-    #     "threshold_grid": [0.20, 0.24, 0.28, 0.32, 0.36, 0.40, 0.44, 0.48, 0.52, 0.56],
-    # },
-    # {
-    #     "name": "prior_low_threshold_fine_low",
-    #     "lambda_prior": 0.10,
-    #     "threshold_grid": [0.18, 0.22, 0.26, 0.30, 0.34, 0.38, 0.42, 0.46, 0.50, 0.54],
-    # },
-    # {
-    #     "name": "high_recall_threshold_relaxed",
-    #     "ensemble_w": 0.42,
-    #     "correction_weight": 0.38,
-    #     "lambda_prior": 0.25,
-    #     "proto_n_epochs": 45,
-    #     "proto_patience": 9,
-    #     "proto_lr": 1.1e-3,
-    #     "mlp_pca_dim": 72,
-    #     "mlp_min_pos": 3,
-    #     "mlp_alpha_blend": 0.55,
-    #     "residual_n_epochs": 40,
-    #     "residual_patience": 9,
-    #     "residual_lr": 9e-4,
-    #     "rank_power": 0.45,
-    #     "smooth_alpha": 0.18,
-    #     "threshold_grid": [0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60],
-    # },
-    # {
-    #     "name": "high_recall_low_prior_threshold",
-    #     "ensemble_w": 0.42,
-    #     "correction_weight": 0.38,
-    #     "lambda_prior": 0.15,
-    #     "proto_n_epochs": 45,
-    #     "proto_patience": 9,
-    #     "proto_lr": 1.1e-3,
-    #     "mlp_pca_dim": 72,
-    #     "mlp_min_pos": 3,
-    #     "mlp_alpha_blend": 0.55,
-    #     "residual_n_epochs": 40,
-    #     "residual_patience": 9,
-    #     "residual_lr": 9e-4,
-    #     "rank_power": 0.45,
-    #     "smooth_alpha": 0.18,
-    #     "threshold_grid": [0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60],
-    # },
-    # {
-    #     "name": "prior_low_mlp_rare_heavy",
-    #     "lambda_prior": 0.10,
-    #     "mlp_pca_dim": 80,
-    #     "mlp_min_pos": 3,
-    #     "mlp_alpha_blend": 0.50,
-    # },
-    # {
-    #     "name": "prior_low_mlp_small_aggressive",
-    #     "lambda_prior": 0.10,
-    #     "mlp_pca_dim": 48,
-    #     "mlp_min_pos": 4,
-    #     "mlp_alpha_blend": 0.55,
-    # },
-    # {
-    #     "name": "prior_low_mlp_heavy_blend",
-    #     "lambda_prior": 0.10,
-    #     "mlp_pca_dim": 72,
-    #     "mlp_alpha_blend": 0.60,
-    # },
-    # {
-    #     "name": "prior_low_mlp_mid_blend",
-    #     "lambda_prior": 0.10,
-    #     "mlp_pca_dim": 72,
-    #     "mlp_min_pos": 4,
-    #     "mlp_alpha_blend": 0.50,
-    # },
-    # {
-    #     "name": "prior_low_residual_light",
-    #     "lambda_prior": 0.10,
-    #     "correction_weight": 0.22,
-    #     "residual_n_epochs": 24,
-    #     "residual_patience": 6,
-    #     "residual_lr": 1.1e-3,
-    # },
-    # {
-    #     "name": "prior_low_residual_mid",
-    #     "lambda_prior": 0.10,
-    #     "correction_weight": 0.26,
-    #     "residual_n_epochs": 30,
-    #     "residual_patience": 8,
-    #     "residual_lr": 1.0e-3,
-    # },
-    # {
-    #     "name": "prior_low_post_soft_balanced",
-    #     "lambda_prior": 0.10,
-    #     "rank_power": 0.33,
-    #     "smooth_alpha": 0.24,
-    # },
-    # {
-    #     "name": "prior_low_ssm_longer",
-    #     "lambda_prior": 0.10,
-    #     "proto_n_epochs": 55,
-    #     "proto_patience": 12,
-    #     "proto_lr": 8e-4,
-    # },
-    # {
-    #     "name": "prior_low_ssm_longer_rare",
-    #     "lambda_prior": 0.10,
-    #     "proto_n_epochs": 55,
-    #     "proto_patience": 12,
-    #     "proto_lr": 8e-4,
-    #     "mlp_pca_dim": 72,
-    #     "mlp_min_pos": 3,
-    #     "mlp_alpha_blend": 0.50,
-    # },
-# ]
+    # ── Group 0: reference points ───────────────────────────────────────────
+    _cfg("prior_off_baseline"),                                    # best from previous sweep
+    {"name": "baseline_with_prior"},                               # old default for sanity
+
+    # ── Group 1: drop threshold calibration (consistently hurts OOF) ───────
+    _cfg("no_threshold", threshold_grid=[0.5]),                    # soft-threshold becomes identity
+    _cfg("threshold_narrow", threshold_grid=[0.45, 0.50, 0.55]),   # tighter grid → less overfit
+    _cfg("no_threshold_no_residual",
+         threshold_grid=[0.5], correction_weight=0.0),
+
+    # ── Group 2: ablate each remaining late stage individually ─────────────
+    _cfg("no_residual", correction_weight=0.0),
+    _cfg("no_file_conf", file_conf_power=0.0),
+    _cfg("no_rank_scaling", rank_power=0.0),
+    _cfg("no_smooth", smooth_alpha=0.0),
+
+    # ── Group 3: re-weight proto↔MLP (MLP branch was strongest stage) ──────
+    _cfg("mlp_heavy", ensemble_w=0.25),
+    _cfg("mlp_only", ensemble_w=0.0),
+    _cfg("proto_heavy", ensemble_w=0.75),
+
+    # ── Group 4: stripped / near-prior_mlp (strongest stage alone) ─────────
+    _cfg("stripped",
+         correction_weight=0.0, file_conf_power=0.0, rank_power=0.0,
+         smooth_alpha=0.0, threshold_grid=[0.5]),
+    _cfg("prior_mlp_only",                                         # pure-MLP, no proto, no late stages
+         ensemble_w=0.0,
+         correction_weight=0.0, file_conf_power=0.0, rank_power=0.0,
+         smooth_alpha=0.0, threshold_grid=[0.5]),
+
+    # ── Group 5: smoother thresholding + post-scaling combos ───────────────
+    _cfg("softer_post",
+         file_conf_power=0.2, rank_power=0.2, smooth_alpha=0.1,
+         threshold_grid=[0.5]),
+    _cfg("keep_smooth_drop_rest",                                  # smoothing was roughly neutral-positive
+         correction_weight=0.0, file_conf_power=0.0, rank_power=0.0,
+         threshold_grid=[0.5]),
+
+    # ── Group 6: MLP-probe regularization ──────────────────────────────────
+    _cfg("mlp_alpha_high", mlp_alpha_blend=0.6),
+    _cfg("mlp_alpha_low",  mlp_alpha_blend=0.2),
+    _cfg("mlp_more_pca",   mlp_pca_dim=128),
+    _cfg("mlp_min_pos_low", mlp_min_pos=3),                        # more active probes
+
+    # ── Group 7: ProtoSSM capacity (less overfit on 46 files) ──────────────
+    _cfg("proto_short",      proto_n_epochs=30, proto_patience=10),
+    _cfg("proto_very_short", proto_n_epochs=15, proto_patience=6),
+]

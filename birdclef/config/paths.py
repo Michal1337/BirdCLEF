@@ -44,10 +44,10 @@ else:
     SPLIT_ROOT = _env_path("BIRDCLEF_SPLIT_ROOT", BCLEF_ROOT / "splits")
 
 
-TRAIN_AUDIO = DATA_ROOT / "train_audio"
+TRAIN_AUDIO = Path("/mnt/evafs/groups/re-com/mgromadzki/data/train_audio")
 SOUNDSCAPES = DATA_ROOT / "train_soundscapes"
 TEST_SC = DATA_ROOT / "test_soundscapes"
-TRAIN_CSV = DATA_ROOT / "train.csv"
+TRAIN_CSV = Path("/mnt/evafs/groups/re-com/mgromadzki/data/train.csv")
 SCLABEL_CSV = DATA_ROOT / "train_soundscapes_labels.csv"
 TAXONOMY = DATA_ROOT / "taxonomy.csv"
 SAMPLE_SUB = DATA_ROOT / "sample_submission.csv"

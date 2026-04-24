@@ -1,0 +1,178 @@
+{
+  "config": {
+    "ensemble_w": 0.5,
+    "lambda_prior": 0.0,
+    "correction_weight": 0.0,
+    "loss": "focal_bce",
+    "focal_alpha": 0.25,
+    "focal_gamma": 2.0,
+    "label_smoothing": 0.03,
+    "mask_secondary": false,
+    "tta": "window_roll",
+    "tta_shifts": [
+      0,
+      1,
+      -1,
+      2,
+      -2
+    ],
+    "tta_shifts_secs": [
+      0.0,
+      1.25,
+      -1.25,
+      2.5,
+      -2.5
+    ],
+    "smoothing": "gaussian",
+    "smoothing_alpha": 0.2,
+    "use_boost": true,
+    "boost_threshold": 0.5,
+    "boost_lift": 0.25,
+    "file_conf_top_k": 2,
+    "file_conf_power": 0.4,
+    "rank_power": 0.4,
+    "threshold_grid": [
+      0.5
+    ],
+    "proto_n_epochs": 80,
+    "proto_lr": 0.0008,
+    "proto_patience": 20,
+    "proto_pos_weight_cap": 25.0,
+    "proto_distill_weight": 0.15,
+    "proto_swa_start_frac": 0.65,
+    "proto_swa_lr": 0.0004,
+    "residual_n_epochs": 40,
+    "residual_lr": 0.0008,
+    "residual_patience": 12,
+    "residual_d_model": 128,
+    "residual_d_state": 16,
+    "residual_dropout": 0.1,
+    "mlp_pca_dim": 64,
+    "mlp_alpha_blend": 0.4,
+    "mlp_min_pos": 5,
+    "n_sites_cap": 20,
+    "name": "baseline"
+  },
+  "config_hash": "45405afe71",
+  "result": {
+    "metrics": {
+      "global": {
+        "macro_auc": 0.9159663265096051,
+        "rare_auc": NaN,
+        "frequent_auc": 0.9056501600177981,
+        "per_site_auc": {
+          "S03": 0.9045454545454545,
+          "S08": NaN,
+          "S13": NaN,
+          "S15": NaN,
+          "S18": 0.6543209876543209,
+          "S19": 0.6787947529259027,
+          "S22": 0.9120663647241288,
+          "S23": NaN
+        },
+        "site_auc_std": 0.12121249849462613,
+        "per_hour_auc": {
+          "0-5": 0.9280689319190923,
+          "18-23": 0.8692156470580403,
+          "6-11": 0.7303513680106851
+        }
+      },
+      "per_fold": {
+        "0": {
+          "macro_auc": 0.8805234183738958,
+          "rare_auc": NaN,
+          "frequent_auc": 0.8805234183738958,
+          "per_site_auc": {
+            "S22": 0.8805234183738958
+          },
+          "site_auc_std": 0.0,
+          "per_hour_auc": {
+            "0-5": 0.8706802789893603,
+            "18-23": 0.8495829381944833
+          }
+        },
+        "1": {
+          "macro_auc": 0.938117045948257,
+          "rare_auc": NaN,
+          "frequent_auc": 0.9293154987397213,
+          "per_site_auc": {
+            "S18": 0.6543209876543209,
+            "S22": 0.9434842926338722
+          },
+          "site_auc_std": 0.14458165248977567,
+          "per_hour_auc": {
+            "0-5": NaN,
+            "18-23": 0.9398935895651477
+          }
+        },
+        "2": {
+          "macro_auc": 0.8308579343957266,
+          "rare_auc": NaN,
+          "frequent_auc": 0.8055053731277093,
+          "per_site_auc": {
+            "S19": 0.6787947529259027,
+            "S22": 0.9139617106249776
+          },
+          "site_auc_std": 0.1175834788495374,
+          "per_hour_auc": {
+            "0-5": 0.913446680780412,
+            "18-23": 0.7595981753521953
+          }
+        },
+        "3": {
+          "macro_auc": 0.8667348626622933,
+          "rare_auc": NaN,
+          "frequent_auc": 0.8413402796823629,
+          "per_site_auc": {
+            "S13": NaN,
+            "S22": 0.8720556431489007,
+            "S23": NaN
+          },
+          "site_auc_std": 0.0,
+          "per_hour_auc": {
+            "0-5": 0.8087957046937166,
+            "18-23": NaN
+          }
+        },
+        "4": {
+          "macro_auc": 0.8439655623917369,
+          "rare_auc": NaN,
+          "frequent_auc": 0.8305612956080602,
+          "per_site_auc": {
+            "S03": 0.9045454545454545,
+            "S08": NaN,
+            "S15": NaN,
+            "S22": NaN
+          },
+          "site_auc_std": 0.0,
+          "per_hour_auc": {
+            "0-5": NaN,
+            "18-23": 0.799052025005583,
+            "6-11": 0.7303513680106851
+          }
+        }
+      },
+      "v_anchor": {
+        "macro_auc": 0.8729628059852145,
+        "rare_auc": NaN,
+        "frequent_auc": 0.8759677323065345,
+        "per_site_auc": {
+          "S03": NaN,
+          "S08": 0.7982916354769903,
+          "S13": NaN,
+          "S15": NaN,
+          "S19": NaN,
+          "S22": 0.8915488454427074,
+          "S23": NaN
+        },
+        "site_auc_std": 0.046628604982858535,
+        "per_hour_auc": {
+          "0-5": 0.8606937488288416,
+          "18-23": 0.8814289862989558,
+          "6-11": 0.85530646720006
+        }
+      }
+    },
+    "runtime_min": 1.5835008382797242
+  }
+}

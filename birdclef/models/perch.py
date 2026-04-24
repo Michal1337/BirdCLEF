@@ -10,7 +10,7 @@ import json
 import re
 from pathlib import Path
 from typing import List
-
+import torch
 import numpy as np
 import pandas as pd
 import soundfile as sf
@@ -38,13 +38,16 @@ def read_60s(path: Path | str) -> np.ndarray:
     return y.astype(np.float32)
 
 
-def load_onnx_session(num_threads: int = 4):
+def load_onnx_session(num_threads: int = 8):
     import onnxruntime as ort
 
     so = ort.SessionOptions()
     so.intra_op_num_threads = int(num_threads)
     sess = ort.InferenceSession(
-        str(ONNX_PERCH_PATH), sess_options=so, providers=["CPUExecutionProvider"]
+        str(ONNX_PERCH_PATH), sess_options=so, providers=[
+            ("CUDAExecutionProvider", {"device_id": 0, "cudnn_conv_algo_search": "EXHAUSTIVE"}),
+            "CPUExecutionProvider",
+        ]
     )
     return sess
 
@@ -153,7 +156,7 @@ def run_perch(
     it = range(0, len(paths), batch_files)
     if verbose:
         it = tqdm(it, desc="Perch")
-    with cf.ThreadPoolExecutor(max_workers=4) as io:
+    with cf.ThreadPoolExecutor(max_workers=8) as io:
         next_paths = paths[0:batch_files]
         future = [io.submit(read_60s, p) for p in next_paths]
         for start in it:
