@@ -68,6 +68,7 @@ class SEDTrainDataset(Dataset):
         window_seconds: int = 5,
         include_secondary: bool = True,
         pseudo_round: Optional[int] = None,
+        seed: int = 42,
     ):
         from birdclef.data.splits import load_folds, load_v_anchor
         from birdclef.data.train_audio import build_train_audio_labels, load_train_audio_meta
@@ -114,7 +115,7 @@ class SEDTrainDataset(Dataset):
         # __getitem__.
         self._sc_df = sc
 
-        self._rng = np.random.default_rng(42)
+        self._rng = np.random.default_rng(int(seed))
         # Length heuristic: iterate per-epoch through max(n_train_audio, n_sc*12).
         self._length = max(len(self._ta_rows), len(self._sc_files) * N_WINDOWS)
 

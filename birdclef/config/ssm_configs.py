@@ -18,6 +18,9 @@ and explores only knobs that still have unexplored signal.
 from __future__ import annotations
 
 BASELINE = dict(
+    # Reproducibility — the sweep runner reseeds python/numpy/torch at the
+    # start of each config with this value; per-fold seeds derive as seed+f+1.
+    seed=42,
     # Base stack blends
     ensemble_w=0.50,
     lambda_prior=0.0,

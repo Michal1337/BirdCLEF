@@ -40,6 +40,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler
 
 from birdclef.config.paths import MODEL_ROOT, N_WINDOWS, SR, SOUNDSCAPES, WINDOW_SAMPLES, ensure_dirs
+from birdclef.utils.seed import seed_everything
 from birdclef.config.sed_configs import BASELINE as SED_BASELINE
 from birdclef.data.augment import WaveformAug, background_mix, mixup
 from birdclef.data.datasets import SEDTrainDataset
@@ -254,7 +255,12 @@ def train_one_fold(cfg: dict, fold: int | None, dry_run_steps: int = 0) -> dict:
     ddp, world_size, rank, local_rank = _dist_ctx()
     _setup_ddp(ddp)
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
-    torch.manual_seed(42 + rank)
+    # Per-rank seed derived from the config — so cfg["seed"]=N gives
+    # reproducible runs, and each DDP rank still gets a distinct stream.
+    base_seed = int(cfg.get("seed", 42))
+    if fold is not None:
+        base_seed += int(fold) * 37
+    seed_everything(base_seed + rank)
     if _is_main(rank):
         ensure_dirs()
 
@@ -285,9 +291,11 @@ def train_one_fold(cfg: dict, fold: int | None, dry_run_steps: int = 0) -> dict:
         first_window_prob=float(cfg["first_window_prob"]),
         window_seconds=int(cfg["window_seconds"]),
         pseudo_round=cfg.get("pseudo_round"),
+        seed=base_seed + rank,
     )
     if ddp:
-        sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True)
+        sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank,
+                                     shuffle=True, seed=base_seed)
     else:
         sampler = None
     loader = DataLoader(

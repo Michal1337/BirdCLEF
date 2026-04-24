@@ -43,6 +43,7 @@ from birdclef.postproc.calibration import (
     logit_prior_shift,
 )
 from birdclef.postproc.smoothing import adaptive_delta_smooth, gaussian_smooth
+from birdclef.utils.seed import seed_everything
 
 
 def sigmoid_np(x: np.ndarray) -> np.ndarray:
@@ -204,10 +205,11 @@ def _predict_proto(
 def _train_mlp_probes(
     emb: np.ndarray, scores: np.ndarray, Y: np.ndarray, cfg: dict
 ):
+    seed = int(cfg.get("seed", 42))
     scaler = StandardScaler().fit(emb)
     emb_s = scaler.transform(emb)
     pca_dim = min(int(cfg["mlp_pca_dim"]), emb_s.shape[1] - 1)
-    pca = PCA(n_components=pca_dim).fit(emb_s)
+    pca = PCA(n_components=pca_dim, random_state=seed).fit(emb_s)
     Z = pca.transform(emb_s).astype(np.float32)
     active = np.where(Y.sum(axis=0) >= int(cfg["mlp_min_pos"]))[0]
     models = {}
@@ -235,7 +237,7 @@ def _train_mlp_probes(
         clf = MLPClassifier(hidden_layer_sizes=(256, 128), activation="relu",
                             max_iter=500, early_stopping=True, validation_fraction=0.15,
                             n_iter_no_change=20, learning_rate_init=5e-4, alpha=0.005,
-                            random_state=42)
+                            random_state=seed)
         clf.fit(X_bal, y_bal)
         models[int(ci)] = clf
     return models, scaler, pca
@@ -271,7 +273,8 @@ def _train_residual(
     residuals = lab_f - fp_prob
 
     # 3-fold internal mini-CV (no leakage) — train/val split for early stopping.
-    rng = torch.Generator(); rng.manual_seed(42)
+    seed = int(cfg.get("seed", 42))
+    rng = torch.Generator(); rng.manual_seed(seed)
     perm = torch.randperm(n_files, generator=rng).numpy()
     n_val = max(1, int(0.15 * n_files))
     tr_i = perm[n_val:]; va_i = perm[:n_val]
@@ -412,6 +415,8 @@ def run_pipeline_for_split(
 
 def run_full_evaluation(cfg: dict) -> Dict:
     """Runs fold-safe OOF + V-anchor for one config. Returns sweep-runner result."""
+    base_seed = int(cfg.get("seed", 42))
+    seed_everything(base_seed)
     cache = load_perch_cache()
     # Limit to labeled rows
     labeled_idx = np.where(cache.labeled_mask)[0]
@@ -447,6 +452,9 @@ def run_full_evaluation(cfg: dict) -> Dict:
         va = np.where(row_fold == f)[0]
         if len(va) == 0:
             continue
+        # Seed per fold so each fold is independently reproducible
+        # (otherwise fold 2's RNG depends on how long fold 0/1 trained).
+        seed_everything(base_seed + int(f) + 1)
         probs = run_pipeline_for_split(cache_sub, tr, va, cfg, temperatures)
         oof[va] = probs
         m = compute_stage_metrics(
@@ -472,6 +480,8 @@ def run_full_evaluation(cfg: dict) -> Dict:
     if v_mask.any():
         tr = np.where(~v_mask)[0]
         va = np.where(v_mask)[0]
+        # Distinct from any fold seed
+        seed_everything(base_seed + 1000)
         probs = run_pipeline_for_split(cache_sub, tr, va, cfg, temperatures)
         v_metrics = compute_stage_metrics(
             cache_Y[va], probs,

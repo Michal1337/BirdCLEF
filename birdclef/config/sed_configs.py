@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 BASELINE = dict(
+    # Reproducibility — seed used by sweep runner + per-rank
+    # (effective manual_seed = seed + rank in train_sed_ddp).
+    seed=42,
     # Model
     backbone="tf_efficientnetv2_s.in21k_ft_in1k",
     n_classes=234,

@@ -22,6 +22,7 @@ import numpy as np
 
 from birdclef.eval.metrics import primary_score
 from birdclef.sweep.writer import write_config_json, write_hparams_diff_csv, write_summary_csv
+from birdclef.utils.seed import seed_everything
 
 
 def _config_hash(cfg: dict) -> str:
@@ -88,6 +89,11 @@ def run_sweep(
                 continue
             except Exception:
                 pass
+        # Deterministic starting state per config — every stage_fn call
+        # sees the same RNG sequence regardless of iteration order or
+        # whether this is a resumed sweep. Pass `seed` via the config
+        # itself to customize (default 42).
+        seed_everything(int(cfg.get("seed", 42)))
         t0 = time.time()
         try:
             result = stage_fn(cfg)
