@@ -234,7 +234,7 @@ def pseudo_label_with_ssm_pipeline(
     out_dir = _round_dir(output_round)
     np.savez_compressed(
         out_dir / "probs.npz",
-        probs=agg_final, first_pass=agg_first_pass, keep_mask=keep_mask,
+        final=agg_final, first_pass=agg_first_pass, keep_mask=keep_mask,
     )
     meta.to_parquet(out_dir / "meta.parquet", index=False)
     info = {

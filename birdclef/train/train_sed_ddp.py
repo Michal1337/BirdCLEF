@@ -298,11 +298,24 @@ def train_one_fold(cfg: dict, fold: int | None, dry_run_steps: int = 0) -> dict:
                                      shuffle=True, seed=base_seed)
     else:
         sampler = None
-    loader = DataLoader(
-        dataset, batch_size=int(cfg["batch_size"]),
+    # num_workers tuning matters a lot once pseudo-label mode is on: each
+    # soundscape sample blocks on sf.read of a full 60 s OGG, so with too
+    # few workers the GPU starves. `persistent_workers=True` avoids the
+    # respawn cost between epochs; `prefetch_factor` overlaps decode with
+    # compute.
+    num_workers = int(cfg.get("num_workers", 8))
+    prefetch_factor = int(cfg.get("prefetch_factor", 4)) if num_workers > 0 else None
+    loader_kwargs = dict(
+        batch_size=int(cfg["batch_size"]),
         sampler=sampler, shuffle=(sampler is None),
-        num_workers=2, pin_memory=torch.cuda.is_available(), drop_last=True,
+        num_workers=num_workers,
+        pin_memory=torch.cuda.is_available(),
+        drop_last=True,
+        persistent_workers=(num_workers > 0),
     )
+    if prefetch_factor is not None:
+        loader_kwargs["prefetch_factor"] = prefetch_factor
+    loader = DataLoader(dataset, **loader_kwargs)
 
     wav_aug = WaveformAug().to(device)
 
@@ -315,7 +328,16 @@ def train_one_fold(cfg: dict, fold: int | None, dry_run_steps: int = 0) -> dict:
             return step / max(1, warmup_steps)
         t = (step - warmup_steps) / max(1, total_steps - warmup_steps)
         return 0.5 * (1.0 + math.cos(math.pi * min(1.0, t)))
-    scaler = torch.amp.GradScaler(enabled=bool(cfg["amp"]) and torch.cuda.is_available())
+    # AMP dtype — bf16 on H100/A100 has the same tensor-core throughput as
+    # fp16 but better numerical range, so we skip the GradScaler entirely
+    # (bf16 doesn't need loss scaling). Default remains fp16 for backward
+    # compat with older cards.
+    amp_dtype_name = str(cfg.get("amp_dtype", "fp16")).lower()
+    amp_dtype = torch.bfloat16 if amp_dtype_name in {"bf16", "bfloat16"} else torch.float16
+    use_grad_scaler = amp_dtype == torch.float16
+    scaler = torch.amp.GradScaler(
+        enabled=bool(cfg["amp"]) and torch.cuda.is_available() and use_grad_scaler
+    )
 
     step = 0
     best_primary = float("-inf")
@@ -354,15 +376,24 @@ def train_one_fold(cfg: dict, fold: int | None, dry_run_steps: int = 0) -> dict:
                 g["lr"] = float(cfg["lr"]) * lr_at(step)
 
             opt.zero_grad(set_to_none=True)
-            with torch.amp.autocast(device_type="cuda" if torch.cuda.is_available() else "cpu",
-                                     enabled=bool(cfg["amp"]) and torch.cuda.is_available()):
+            with torch.amp.autocast(
+                device_type="cuda" if torch.cuda.is_available() else "cpu",
+                dtype=amp_dtype,
+                enabled=bool(cfg["amp"]) and torch.cuda.is_available(),
+            ):
                 logits = model(wav.squeeze(1))
                 loss = loss_fn(logits, y, loss_mask=loss_mask)
-            scaler.scale(loss).backward()
-            scaler.unscale_(opt)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), float(cfg["grad_clip"]))
-            scaler.step(opt)
-            scaler.update()
+            if use_grad_scaler:
+                scaler.scale(loss).backward()
+                scaler.unscale_(opt)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), float(cfg["grad_clip"]))
+                scaler.step(opt)
+                scaler.update()
+            else:
+                # bf16 path: no loss scaling needed
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), float(cfg["grad_clip"]))
+                opt.step()
             ema.update(model_raw)
 
             if _is_main(rank) and step % 50 == 0:

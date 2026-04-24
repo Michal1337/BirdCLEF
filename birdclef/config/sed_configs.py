@@ -40,11 +40,17 @@ BASELINE = dict(
     mixup_mode="max",
     # DDP / precision
     amp=True,
+    amp_dtype="fp16",      # "fp16" for V100/consumer, "bf16" for A100/H100 (no GradScaler)
     grad_clip=1.0,
     ema_decay=0.999,
     # Eval
     eval_every_n_steps=100,
     pseudo_round=None,
+    # DataLoader throughput — soundscape OGG decoding is the hot path under
+    # pseudo-label mode. Raise workers until GPU util saturates; prefetch
+    # factor lets workers keep producing while GPU is busy.
+    num_workers=8,
+    prefetch_factor=4,
 )
 
 

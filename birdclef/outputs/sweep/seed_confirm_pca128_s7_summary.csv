@@ -1,0 +1,2 @@
+rank,config_name,primary,macro_auc,first_pass_auc,v_anchor_auc,v_anchor_first_pass_auc,site_auc_std,mean_oof_auc,rare_auc,frequent_auc,runtime_min,stage_metrics_path
+1,pca128_s7,0.7494,0.9085,0.9037,0.8525,0.8389,0.1031,0.8595,nan,0.9008,2.65,/mnt/evafs/faculty/home/mgromadzki/src/BirdCLEF/birdclef/outputs/sweep/seed_confirm_pca128_s7/pca128_s7.json
