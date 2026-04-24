@@ -363,8 +363,17 @@ def _labeled_file_meta(meta_rows: pd.DataFrame) -> pd.DataFrame:
 def run_pipeline_for_split(
     cache: PerchCache, train_idx: np.ndarray, val_idx: np.ndarray, cfg: dict,
     temperatures: np.ndarray,
-) -> np.ndarray:
-    """Train on train_idx rows, predict on val_idx rows, return final probs."""
+) -> dict:
+    """Train on train_idx rows, predict on val_idx rows.
+
+    Returns:
+        {
+            "first_pass": (N_val, C) float32 — sigmoid(ensemble_w*proto + (1-w)*mlp_probe)
+                          i.e. the calibrated pre-post-processing teacher signal.
+            "final":      (N_val, C) float32 — full pipeline output through post-proc + threshold.
+        }
+    The caller decides which one to rank on and which one to emit as pseudo-label.
+    """
     emb_tr, sc_tr, Y_tr = cache.emb[train_idx], cache.scores[train_idx], cache.Y[train_idx]
     emb_va, sc_va = cache.emb[val_idx], cache.scores[val_idx]
     meta_tr = cache.meta.iloc[train_idx].reset_index(drop=True)
@@ -410,7 +419,12 @@ def run_pipeline_for_split(
         n_windows=N_WINDOWS,
     )
     probs = _postproc(final_logits, temperatures, cfg)
-    return apply_per_class_thresholds(probs, thresholds)
+    final_probs = apply_per_class_thresholds(probs, thresholds)
+
+    return {
+        "first_pass": sigmoid_np(first_pass_va).astype(np.float32),
+        "final": final_probs.astype(np.float32),
+    }
 
 
 def run_full_evaluation(cfg: dict) -> Dict:
@@ -445,55 +459,65 @@ def run_full_evaluation(cfg: dict) -> Dict:
     row_fold = cache_meta["filename"].map(fold_of).fillna(-1).astype(int).to_numpy()
     n_splits = int(folds["fold"].max()) + 1 if len(folds) else 5
 
-    oof = np.zeros_like(cache_Y, dtype=np.float32)
+    oof_final = np.zeros_like(cache_Y, dtype=np.float32)
+    oof_fp = np.zeros_like(cache_Y, dtype=np.float32)
     per_fold = {}
     for f in range(n_splits):
         tr = np.where((row_fold != f) & (row_fold >= 0))[0]
         va = np.where(row_fold == f)[0]
         if len(va) == 0:
             continue
-        # Seed per fold so each fold is independently reproducible
-        # (otherwise fold 2's RNG depends on how long fold 0/1 trained).
         seed_everything(base_seed + int(f) + 1)
-        probs = run_pipeline_for_split(cache_sub, tr, va, cfg, temperatures)
-        oof[va] = probs
-        m = compute_stage_metrics(
-            cache_Y[va], probs,
-            cache_meta.iloc[va].reset_index(drop=True),
-            rare_idx=rare_idx, frequent_idx=freq_idx,
-        )
-        per_fold[int(f)] = m
-        print(f"[ssm] fold {f}  macro_auc={m['macro_auc']:.4f}  "
-              f"site_std={m['site_auc_std']:.4f}")
+        out = run_pipeline_for_split(cache_sub, tr, va, cfg, temperatures)
+        oof_final[va] = out["final"]
+        oof_fp[va] = out["first_pass"]
+        va_meta = cache_meta.iloc[va].reset_index(drop=True)
+        m_final = compute_stage_metrics(cache_Y[va], out["final"], va_meta,
+                                        rare_idx=rare_idx, frequent_idx=freq_idx)
+        m_fp = compute_stage_metrics(cache_Y[va], out["first_pass"], va_meta,
+                                     rare_idx=rare_idx, frequent_idx=freq_idx)
+        m_final["first_pass_auc"] = m_fp.get("macro_auc", float("nan"))
+        per_fold[int(f)] = {"final": m_final, "first_pass": m_fp}
+        print(f"[ssm] fold {f}  final={m_final['macro_auc']:.4f}  "
+              f"first_pass={m_fp['macro_auc']:.4f}  "
+              f"site_std={m_final['site_auc_std']:.4f}")
 
     oof_keep = row_fold >= 0
-    m_global = compute_stage_metrics(
-        cache_Y[oof_keep], oof[oof_keep],
-        cache_meta.iloc[oof_keep].reset_index(drop=True),
-        rare_idx=rare_idx, frequent_idx=freq_idx,
-    )
+    keep_meta = cache_meta.iloc[oof_keep].reset_index(drop=True)
+    m_global_final = compute_stage_metrics(cache_Y[oof_keep], oof_final[oof_keep], keep_meta,
+                                           rare_idx=rare_idx, frequent_idx=freq_idx)
+    m_global_fp = compute_stage_metrics(cache_Y[oof_keep], oof_fp[oof_keep], keep_meta,
+                                        rare_idx=rare_idx, frequent_idx=freq_idx)
+    m_global_final["first_pass_auc"] = m_global_fp.get("macro_auc", float("nan"))
 
     # V-anchor: train on everything not in anchor, predict on anchor.
     anchor_files = set(load_v_anchor())
     v_mask = cache_meta["filename"].isin(anchor_files).to_numpy()
-    v_metrics = {}
+    v_metrics_final = {}
+    v_metrics_fp = {}
     if v_mask.any():
         tr = np.where(~v_mask)[0]
         va = np.where(v_mask)[0]
-        # Distinct from any fold seed
         seed_everything(base_seed + 1000)
-        probs = run_pipeline_for_split(cache_sub, tr, va, cfg, temperatures)
-        v_metrics = compute_stage_metrics(
-            cache_Y[va], probs,
-            cache_meta.iloc[va].reset_index(drop=True),
-            rare_idx=rare_idx, frequent_idx=freq_idx,
-        )
-        print(f"[ssm] V-anchor  macro_auc={v_metrics['macro_auc']:.4f}  "
-              f"site_std={v_metrics['site_auc_std']:.4f}")
+        out = run_pipeline_for_split(cache_sub, tr, va, cfg, temperatures)
+        va_meta = cache_meta.iloc[va].reset_index(drop=True)
+        v_metrics_final = compute_stage_metrics(cache_Y[va], out["final"], va_meta,
+                                                rare_idx=rare_idx, frequent_idx=freq_idx)
+        v_metrics_fp = compute_stage_metrics(cache_Y[va], out["first_pass"], va_meta,
+                                             rare_idx=rare_idx, frequent_idx=freq_idx)
+        v_metrics_final["first_pass_auc"] = v_metrics_fp.get("macro_auc", float("nan"))
+        print(f"[ssm] V-anchor  final={v_metrics_final['macro_auc']:.4f}  "
+              f"first_pass={v_metrics_fp['macro_auc']:.4f}  "
+              f"site_std={v_metrics_final['site_auc_std']:.4f}")
     return {
         "metrics": {
-            "global": m_global,
+            # Stage selected for sweep ranking = final. `first_pass_auc` is
+            # surfaced alongside so you can inspect post-processing delta.
+            "global": m_global_final,
             "per_fold": per_fold,
-            "v_anchor": v_metrics,
+            "v_anchor": v_metrics_final,
+            # Full first-pass metric objects if you need every subgroup.
+            "global_first_pass": m_global_fp,
+            "v_anchor_first_pass": v_metrics_fp,
         }
     }

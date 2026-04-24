@@ -1,8 +1,14 @@
 """Declares which fields become lean-CSV columns vs per-config JSON.
 
 Lean CSV (one row per config, sorted by `primary` desc):
-    rank, config_name, primary, macro_auc, v_anchor_auc, site_auc_std,
+    rank, config_name, primary, macro_auc (=final), first_pass_auc,
+    v_anchor_auc (=final), v_anchor_first_pass_auc, site_auc_std,
     mean_oof_auc, rare_auc, frequent_auc, runtime_min, stage_metrics_path
+
+`first_pass_auc` columns are informational only — ranking still uses
+the full-pipeline `primary`. A positive (first_pass − final) gap on a
+given config means post-processing is hurting generalization for that
+config; investigate before promoting it to pseudo-label teacher.
 """
 from __future__ import annotations
 
@@ -11,7 +17,9 @@ SUMMARY_COLUMNS = [
     "config_name",
     "primary",
     "macro_auc",
+    "first_pass_auc",
     "v_anchor_auc",
+    "v_anchor_first_pass_auc",
     "site_auc_std",
     "mean_oof_auc",
     "rare_auc",
@@ -23,7 +31,9 @@ SUMMARY_COLUMNS = [
 FLOAT_COLUMNS = {
     "primary",
     "macro_auc",
+    "first_pass_auc",
     "v_anchor_auc",
+    "v_anchor_first_pass_auc",
     "site_auc_std",
     "mean_oof_auc",
     "rare_auc",
