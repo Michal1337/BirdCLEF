@@ -1,0 +1,9 @@
+rank,config_name,primary,macro_auc,first_pass_auc,v_anchor_auc,v_anchor_first_pass_auc,site_auc_std,mean_oof_auc,rare_auc,frequent_auc,runtime_min,stage_metrics_path
+1,bce_posw_legacy,0.7164,0.869,0.8698,0.8408,0.8347,0.1244,0.8519,nan,0.8816,1.508,/mnt/evafs/faculty/home/mgromadzki/src/BirdCLEF/birdclef/outputs/sweep/cheap_wins/bce_posw_legacy.json
+2,bce_focal_mean,0.6888,0.8872,0.8837,0.8342,0.8244,0.1453,0.852,nan,0.8906,1.602,/mnt/evafs/faculty/home/mgromadzki/src/BirdCLEF/birdclef/outputs/sweep/cheap_wins/bce_focal_mean.json
+3,no_boost,0.6846,0.8941,0.8888,0.8316,0.8209,0.147,0.8557,nan,0.8949,1.5236,/mnt/evafs/faculty/home/mgromadzki/src/BirdCLEF/birdclef/outputs/sweep/cheap_wins/no_boost.json
+4,boost_strong,0.6845,0.8933,0.8888,0.8319,0.8209,0.1473,0.8568,nan,0.8955,1.5806,/mnt/evafs/faculty/home/mgromadzki/src/BirdCLEF/birdclef/outputs/sweep/cheap_wins/boost_strong.json
+5,focal_bce_waveform_shift,0.684,0.8934,0.8892,0.8308,0.8207,0.1468,0.8558,nan,0.8956,1.5239,/mnt/evafs/faculty/home/mgromadzki/src/BirdCLEF/birdclef/outputs/sweep/cheap_wins/focal_bce_waveform_shift.json
+6,gaussian_plus_boost,0.684,0.8934,0.8892,0.8308,0.8207,0.1468,0.8558,nan,0.8956,1.5518,/mnt/evafs/faculty/home/mgromadzki/src/BirdCLEF/birdclef/outputs/sweep/cheap_wins/gaussian_plus_boost.json
+7,baseline,0.6835,0.8936,0.8888,0.8305,0.8209,0.1471,0.8562,nan,0.8955,1.6336,/mnt/evafs/faculty/home/mgromadzki/src/BirdCLEF/birdclef/outputs/sweep/cheap_wins/baseline.json
+8,adaptive_smooth,0.6726,0.8987,0.8888,0.8318,0.8209,0.1592,0.859,nan,0.8956,1.4946,/mnt/evafs/faculty/home/mgromadzki/src/BirdCLEF/birdclef/outputs/sweep/cheap_wins/adaptive_smooth.json

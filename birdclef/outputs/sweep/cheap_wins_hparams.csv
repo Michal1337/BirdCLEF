@@ -1,0 +1,9 @@
+config_name,boost_lift,boost_threshold,loss,name,smoothing,tta,use_boost
+baseline,0.25,0.5,focal_bce,baseline,gaussian,window_roll,True
+focal_bce_waveform_shift,0.25,0.5,focal_bce,focal_bce_waveform_shift,gaussian,waveform_shift,True
+bce_posw_legacy,0.25,0.5,bce_posw,bce_posw_legacy,gaussian,window_roll,True
+no_boost,0.25,0.5,focal_bce,no_boost,gaussian,window_roll,False
+adaptive_smooth,0.25,0.5,focal_bce,adaptive_smooth,adaptive,window_roll,True
+gaussian_plus_boost,0.25,0.5,focal_bce,gaussian_plus_boost,gaussian,waveform_shift,True
+bce_focal_mean,0.25,0.5,bce_focal_mean,bce_focal_mean,gaussian,window_roll,True
+boost_strong,0.4,0.4,focal_bce,boost_strong,gaussian,window_roll,True

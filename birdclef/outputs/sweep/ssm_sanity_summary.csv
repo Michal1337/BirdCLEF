@@ -1,0 +1,2 @@
+rank,config_name,primary,macro_auc,first_pass_auc,v_anchor_auc,v_anchor_first_pass_auc,site_auc_std,mean_oof_auc,rare_auc,frequent_auc,runtime_min,stage_metrics_path
+1,ssm_sanity,0.6835,0.8936,0.8888,0.8305,0.8209,0.1471,0.8562,nan,0.8955,1.6224,/mnt/evafs/faculty/home/mgromadzki/src/BirdCLEF/birdclef/outputs/sweep/ssm_sanity/ssm_sanity.json

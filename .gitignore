@@ -10,5 +10,4 @@ __pycache__
 .venv
 *.pt
 *.npz
-*.csv
 cache/
