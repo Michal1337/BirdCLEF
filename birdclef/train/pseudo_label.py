@@ -1,26 +1,34 @@
-"""Pseudo-label orchestrator — runs a teacher over unlabeled + labeled soundscapes.
+"""Pseudo-label orchestrator — runs a teacher over all soundscapes and writes
+soft-target probabilities that the SED student consumes via
+`SEDTrainDataset(pseudo_round=N)`.
 
-Writes to cache/pseudo/round{N}/:
-    probs.npz     : {'probs': (N_rows, C) float32}
-    meta.parquet  : same columns as perch cache meta (row_id, filename, site, ...)
+Output layout — `cache/pseudo/round{N}/`:
+    probs.npz     : {'probs': (N_rows, C) float32,
+                     'keep_mask': (N_rows, C) uint8}
+    meta.parquet  : row_id, filename, window, is_labeled, is_v_anchor
+                    (same row ordering as the Perch cache meta)
+    info.json     : teacher name, seeds, confidence filter, coverage stats
 
-The next SED training run reads these and mixes them in at 50 % of the batch.
+Two teacher paths:
+  - SSM pipeline ensemble (current default): trains the full proto+MLP+residual
+    stack on non-anchor labeled rows, once per seed, and runs Perch-cache
+    inference on all 10 658 soundscape files. Averages across seeds → final
+    pseudo-label. This is the round-0 teacher since it doesn't require a
+    trained SED yet.
+  - SED checkpoint ensemble: loads one or more SED `best.pt` files and
+    averages their predictions over the same soundscapes. Use this for
+    round≥1 once you have a student that's stronger than the SSM teacher.
 
-Supports two teacher types:
-  - "ssm"     : runs train_ssm_head.run_pipeline_for_split on all files
-                (trains on non-anchor rows, predicts on everything).
-  - "sed_ckpt": loads one or more SED checkpoints from MODEL_ROOT/sed/**/best.pt
-                and averages their predictions on the soundscapes.
-
-The top-k-per-species / τ confidence filter is applied on the raw probs and
-stored in meta as `keep_mask` for training-time sampling.
+Both paths share the same output schema so the downstream consumer doesn't
+care which teacher produced round N.
 """
 from __future__ import annotations
 
 import argparse
 import json
+import time
 from pathlib import Path
-from typing import List
+from typing import List, Sequence
 
 import numpy as np
 import pandas as pd
@@ -38,12 +46,37 @@ from birdclef.config.paths import (
     WINDOW_SAMPLES,
 )
 from birdclef.data.soundscapes import primary_labels
+from birdclef.data.splits import load_v_anchor
+from birdclef.utils.seed import seed_everything
 
 
 def _round_dir(rnd: int) -> Path:
     d = PSEUDO_DIR / f"round{rnd}"
     d.mkdir(parents=True, exist_ok=True)
     return d
+
+
+def _apply_confidence_filter(
+    probs: np.ndarray,
+    confidence_tau: float,
+    topk_per_species: int,
+) -> np.ndarray:
+    """Build a {0,1} uint8 mask of positions the student should supervise on."""
+    keep_mask = np.zeros_like(probs, dtype=np.uint8)
+    if confidence_tau > 0:
+        keep_mask = (probs >= confidence_tau).astype(np.uint8)
+    if topk_per_species > 0:
+        n_files = probs.shape[0] // N_WINDOWS
+        n_classes = probs.shape[1]
+        view = probs.reshape(n_files, N_WINDOWS, n_classes)
+        k = min(topk_per_species, N_WINDOWS)
+        topk_idx = np.argpartition(-view, kth=k - 1, axis=1)[:, :k]
+        km = np.zeros_like(view, dtype=np.uint8)
+        for f in range(n_files):
+            for c in range(n_classes):
+                km[f, topk_idx[f, :, c], c] = 1
+        keep_mask = np.maximum(keep_mask, km.reshape(n_files * N_WINDOWS, n_classes))
+    return keep_mask
 
 
 @torch.no_grad()
@@ -62,7 +95,7 @@ def _predict_sed_on_file(model, wav_60s: np.ndarray, device) -> np.ndarray:
 def pseudo_label_with_sed(
     checkpoints: List[Path], output_round: int,
     confidence_tau: float = 0.5, topk_per_species: int = 0,
-):
+) -> None:
     from birdclef.models.sed import SED, SEDConfig
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -81,7 +114,6 @@ def pseudo_label_with_sed(
         )
         m = SED(sed_cfg).to(device)
         sd = state.get("ema") or state["state_dict"]
-        # Handle EMA-shadow-only dicts (keys match named_parameters()).
         if all(k in dict(m.named_parameters()) for k in sd):
             for n, p in m.named_parameters():
                 if n in sd:
@@ -92,11 +124,12 @@ def pseudo_label_with_sed(
         models.append(m)
 
     paths = sorted(SOUNDSCAPES.glob("*.ogg"))
+    anchor = set(load_v_anchor())
     meta_rows = []
     probs_rows = []
-    for p in tqdm(paths, desc="pseudo"):
+    for p in tqdm(paths, desc="pseudo[sed]"):
         try:
-            y, sr = sf.read(str(p), dtype="float32", always_2d=False)
+            y, _sr = sf.read(str(p), dtype="float32", always_2d=False)
         except Exception:
             continue
         if y.ndim == 2:
@@ -107,28 +140,15 @@ def pseudo_label_with_sed(
         ensemble /= max(1, len(models))
         for w in range(N_WINDOWS):
             meta_rows.append({
-                "row_id": f"{p.stem}_{(w+1)*5}",
+                "row_id": f"{p.stem}_{(w + 1) * 5}",
                 "filename": p.name,
                 "window": w,
+                "is_v_anchor": p.name in anchor,
             })
         probs_rows.append(ensemble)
     meta = pd.DataFrame(meta_rows)
     probs = np.concatenate(probs_rows, axis=0).astype(np.float32)
-
-    # Confidence filter
-    keep_mask = np.zeros_like(probs, dtype=np.uint8)
-    if confidence_tau > 0:
-        keep_mask = (probs >= confidence_tau).astype(np.uint8)
-    if topk_per_species > 0:
-        # per-file per-species top-k windows
-        n_files = probs.shape[0] // N_WINDOWS
-        view = probs.reshape(n_files, N_WINDOWS, n_classes)
-        topk_idx = np.argpartition(-view, kth=topk_per_species - 1, axis=1)[:, :topk_per_species]
-        km = np.zeros_like(view, dtype=np.uint8)
-        for f in range(n_files):
-            for c in range(n_classes):
-                km[f, topk_idx[f, :, c], c] = 1
-        keep_mask = np.maximum(keep_mask, km.reshape(n_files * N_WINDOWS, n_classes))
+    keep_mask = _apply_confidence_filter(probs, confidence_tau, topk_per_species)
 
     np.savez_compressed(out_dir / "probs.npz", probs=probs, keep_mask=keep_mask)
     meta.to_parquet(out_dir / "meta.parquet", index=False)
@@ -145,17 +165,132 @@ def pseudo_label_with_sed(
     print(f"[pseudo] round {output_round} written to {out_dir}")
 
 
+def pseudo_label_with_ssm_pipeline(
+    teacher_cfg: dict,
+    seeds: Sequence[int],
+    output_round: int,
+    confidence_tau: float = 0.5,
+    topk_per_species: int = 0,
+) -> None:
+    """Round-0-capable teacher: SSM pipeline as an ensemble over `seeds`.
+
+    Each seed independently (a) trains proto+MLP+residual on all non-anchor
+    labeled rows, (b) predicts final-stage probs on every soundscape row in
+    the Perch cache (labeled + V-anchor + unlabeled). Probs averaged across
+    seeds. V-anchor rows are emitted but flagged so the SED trainer can
+    exclude them from training.
+    """
+    from birdclef.train.train_ssm_head import (
+        PerchCache,
+        _temperature_vector,
+        load_perch_cache,
+        run_pipeline_for_split,
+    )
+    from birdclef.data.soundscapes import load_taxonomy
+
+    if len(seeds) == 0:
+        raise ValueError("Need at least one seed for the SSM teacher")
+
+    print(f"[pseudo:ssm] loading Perch cache...")
+    cache = load_perch_cache()
+    n_rows, n_classes = cache.scores.shape
+
+    anchor_files = set(load_v_anchor())
+    in_anchor = cache.meta["filename"].isin(anchor_files).to_numpy()
+    is_labeled = cache.labeled_mask
+    train_mask = is_labeled & ~in_anchor
+    train_idx = np.where(train_mask)[0]
+    all_idx = np.arange(n_rows)
+    print(f"[pseudo:ssm] train rows={len(train_idx)} (labeled non-anchor), "
+          f"predict rows={len(all_idx)} (every soundscape window)")
+
+    labels = primary_labels()
+    tax = load_taxonomy()
+    class_map = tax.set_index("primary_label")["class_name"].to_dict()
+    temperatures = _temperature_vector(labels, class_map)
+
+    t0 = time.time()
+    agg_final = np.zeros((n_rows, n_classes), dtype=np.float64)
+    agg_first_pass = np.zeros((n_rows, n_classes), dtype=np.float64)
+    for si, seed in enumerate(seeds):
+        print(f"[pseudo:ssm] seed {seed} ({si + 1}/{len(seeds)})...")
+        seed_everything(int(seed))
+        cfg_seed = {**teacher_cfg, "seed": int(seed),
+                    "name": f"{teacher_cfg.get('name', 'teacher')}_s{seed}"}
+        out = run_pipeline_for_split(cache, train_idx, all_idx, cfg_seed, temperatures)
+        agg_final += out["final"].astype(np.float64)
+        agg_first_pass += out["first_pass"].astype(np.float64)
+    agg_final = (agg_final / len(seeds)).astype(np.float32)
+    agg_first_pass = (agg_first_pass / len(seeds)).astype(np.float32)
+    elapsed = (time.time() - t0) / 60.0
+
+    keep_mask = _apply_confidence_filter(agg_final, confidence_tau, topk_per_species)
+
+    meta = cache.meta[["row_id", "filename"]].copy()
+    meta["window"] = np.tile(np.arange(N_WINDOWS), n_rows // N_WINDOWS)
+    meta["is_labeled"] = cache.meta["is_labeled"].astype(int)
+    meta["is_v_anchor"] = in_anchor.astype(int)
+
+    out_dir = _round_dir(output_round)
+    np.savez_compressed(
+        out_dir / "probs.npz",
+        probs=agg_final, first_pass=agg_first_pass, keep_mask=keep_mask,
+    )
+    meta.to_parquet(out_dir / "meta.parquet", index=False)
+    info = {
+        "teacher": "ssm_pipeline",
+        "teacher_name": teacher_cfg.get("name", "unnamed"),
+        "seeds": list(int(s) for s in seeds),
+        "confidence_tau": float(confidence_tau),
+        "topk_per_species": int(topk_per_species),
+        "n_files": int(n_rows // N_WINDOWS),
+        "n_rows": int(n_rows),
+        "n_train_rows": int(len(train_idx)),
+        "n_v_anchor_rows": int(in_anchor.sum()),
+        "keep_fraction": float(keep_mask.mean()),
+        "runtime_min": round(elapsed, 2),
+    }
+    (out_dir / "info.json").write_text(json.dumps(info, indent=2), encoding="utf-8")
+    print(f"[pseudo:ssm] round {output_round} written to {out_dir}  "
+          f"keep_fraction={info['keep_fraction']:.4f}  "
+          f"runtime={elapsed:.1f}m")
+
+
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--teacher", choices=["ssm", "sed"], default="ssm",
+                    help="Which teacher path to use. Default 'ssm' (round-0 capable).")
     ap.add_argument("--round", type=int, required=True)
-    ap.add_argument("--ckpts", nargs="+", required=True,
-                    help="Paths to SED best.pt checkpoints (one or more)")
-    ap.add_argument("--tau", type=float, default=0.5)
-    ap.add_argument("--topk-per-species", type=int, default=0)
+    ap.add_argument("--tau", type=float, default=0.5,
+                    help="Confidence floor for keep_mask. 0 disables.")
+    ap.add_argument("--topk-per-species", type=int, default=0,
+                    help="Union with per-file top-k-window mask per species. 0 disables.")
+    # SSM teacher options
+    ap.add_argument("--seeds", type=int, nargs="+", default=None,
+                    help="Seeds for the SSM teacher ensemble. Default from teacher config.")
+    # SED teacher options
+    ap.add_argument("--ckpts", type=str, nargs="*", default=[],
+                    help="For --teacher sed: paths to SED best.pt files (one or more).")
     args = ap.parse_args()
-    pseudo_label_with_sed([Path(p) for p in args.ckpts], args.round,
-                           confidence_tau=args.tau,
-                           topk_per_species=args.topk_per_species)
+
+    if args.teacher == "ssm":
+        from birdclef.config.teacher import TEACHER_LATEST
+
+        seeds = args.seeds if args.seeds else TEACHER_LATEST["seeds"]
+        pseudo_label_with_ssm_pipeline(
+            teacher_cfg=TEACHER_LATEST["config"],
+            seeds=seeds,
+            output_round=args.round,
+            confidence_tau=args.tau,
+            topk_per_species=args.topk_per_species,
+        )
+    else:
+        if not args.ckpts:
+            raise SystemExit("--teacher sed requires --ckpts <path> [<path> ...]")
+        pseudo_label_with_sed(
+            [Path(p) for p in args.ckpts], args.round,
+            confidence_tau=args.tau, topk_per_species=args.topk_per_species,
+        )
 
 
 if __name__ == "__main__":

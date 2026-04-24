@@ -1,18 +1,25 @@
 """Datasets for SED training and inference.
 
-SEDTrainDataset: reads from the preloaded waveform memmap (.npy). No OGG
-decoding on the hot path. 50/50 mixes Xeno-Canto train_audio and labeled
-soundscapes by default. Supports pseudo-label rounds via a second source.
+SEDTrainDataset: reads train_audio from the preloaded waveform memmap (.npy),
+soundscapes via on-the-fly OGG decode. Every `__getitem__` returns
+(waveform, target, loss_mask) so the trainer can apply a per-position loss
+mask without special-casing pseudo vs GT samples.
+
+When `pseudo_round` is set, cache/pseudo/round{N}/ is opened and its soft
+targets replace (or merge with) the ground-truth soundscape labels:
+    - labeled non-anchor soundscape → target = max(GT, pseudo)  (2024 #2 recipe)
+    - unlabeled soundscape         → target = pseudo,  mask = keep_mask
+    - V-anchor soundscape          → excluded from the training pool
+    - train_audio                   → unchanged (GT multi-hot, mask = all ones)
 
 InferenceDataset: streams 60 s soundscape OGGs from disk for final prediction.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from pathlib import Path
-from typing import List, Optional
-
 import json
+from dataclasses import dataclass
+from pathlib import Path
+from typing import List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -23,6 +30,8 @@ from torch.utils.data import Dataset
 from birdclef.config.paths import (
     FILE_SAMPLES,
     N_WINDOWS,
+    PSEUDO_DIR,
+    SOUNDSCAPES,
     SR,
     WAVEFORM_INDEX,
     WAVEFORM_NPY,
@@ -33,7 +42,7 @@ from birdclef.data.soundscapes import label_to_idx, load_soundscape_meta
 
 @dataclass
 class SEDTrainSample:
-    source: str       # "train_audio" | "soundscape" | "pseudo"
+    source: str       # "train_audio" | "soundscape_gt" | "soundscape_pseudo"
     source_id: int
     y: np.ndarray     # multi-hot target (n_classes,)
     offset: int       # start offset in global memmap samples
@@ -50,13 +59,47 @@ def _load_waveform_store() -> tuple[np.ndarray, pd.DataFrame]:
     return store, index
 
 
-class SEDTrainDataset(Dataset):
-    """Yields (waveform[win_samples], multihot[n_classes]).
+def _load_pseudo_round(rnd: int):
+    """Load cache/pseudo/round{rnd}/ artifacts.
 
-    Sampling semantics:
-    - For train_audio clips, with prob `first_window_prob` crop from the first
-      0-30 s (primary bird most likely present). Otherwise random crop.
-    - For soundscape windows, pick a random 5-s window from the 60-s file.
+    Returns (probs: (N, C) float32, keep_mask: (N, C) uint8,
+             file_to_start: dict[filename -> row offset in probs]).
+    """
+    rdir = PSEUDO_DIR / f"round{int(rnd)}"
+    meta_path = rdir / "meta.parquet"
+    probs_path = rdir / "probs.npz"
+    if not meta_path.exists() or not probs_path.exists():
+        raise FileNotFoundError(
+            f"Pseudo round {rnd} not found under {rdir}. "
+            "Run scripts/_05_pseudo_label.py --round N first."
+        )
+    meta = pd.read_parquet(meta_path)
+    arrs = np.load(probs_path)
+    probs = arrs["probs"].astype(np.float32)
+    keep = arrs["keep_mask"].astype(np.uint8) if "keep_mask" in arrs.files else np.ones_like(probs, dtype=np.uint8)
+    # Rows come in blocks of N_WINDOWS per filename, ordered by appearance.
+    file_start = (
+        meta.reset_index()
+        .drop_duplicates("filename")[["filename", "index"]]
+        .rename(columns={"index": "start_row"})
+    )
+    file_to_start = dict(zip(file_start["filename"].astype(str), file_start["start_row"].astype(int)))
+    info_path = rdir / "info.json"
+    info = {}
+    if info_path.exists():
+        try:
+            info = json.loads(info_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            pass
+    return probs, keep, file_to_start, meta, info
+
+
+class SEDTrainDataset(Dataset):
+    """Yields (waveform[win_samples], target[n_classes], loss_mask[n_classes]).
+
+    Every returned tuple has the same shape regardless of source; if a sample
+    has no pseudo-label, `loss_mask` is all ones. This lets the trainer pass
+    a single `loss_mask` to FocalBCE without branching.
     """
 
     def __init__(
@@ -79,9 +122,7 @@ class SEDTrainDataset(Dataset):
         self._store, self._idx = _load_waveform_store()
 
         ta = load_train_audio_meta()
-        # Map filename → row in index
         idx_by_file = dict(zip(self._idx["filename"].astype(str), self._idx.index))
-        label_idx = label_to_idx()
         Y_ta = build_train_audio_labels(ta)
         self._ta_rows: list[SEDTrainSample] = []
         for i, row in ta.iterrows():
@@ -95,89 +136,166 @@ class SEDTrainDataset(Dataset):
                 length=int(meta["n_samples"]),
             ))
 
-        # Soundscapes: on the fly, we read OGG-cropped 60 s from the soundscape
-        # OGG files (not from the waveform memmap). This keeps memory usage low
-        # since soundscapes total only ~hundreds of MB.
+        self._n_classes = len(label_to_idx())
+
+        # Labeled soundscape pool (window-level GT)
         sc = load_soundscape_meta()
         sc = sc[sc["fully_labeled"]]
+        anchor = set(load_v_anchor()) if exclude_v_anchor else set()
         if exclude_v_anchor:
-            anchor = set(load_v_anchor())
             sc = sc[~sc["filename"].isin(anchor)]
         if fold is not None:
             folds_df = load_folds()
             fold_of = dict(zip(folds_df["filename"], folds_df["fold"].astype(int)))
             keep_filenames = {fn for fn, fld in fold_of.items() if fld != int(fold)}
             sc = sc[sc["filename"].isin(keep_filenames)]
-        # For soundscapes we'll sample at __getitem__ time from a file list
-        self._sc_files = sc.drop_duplicates("filename")["filename"].tolist()
-        # Precompute per-file label union so we can use soundscape-level labels
-        # for windowing decisions; per-window labels come from the CSV during
-        # __getitem__.
         self._sc_df = sc
+        labeled_sc_files = sc.drop_duplicates("filename")["filename"].astype(str).tolist()
+
+        # Pseudo-labels (optional)
+        self._pseudo_round = int(pseudo_round) if pseudo_round is not None else None
+        self._pseudo_probs = None
+        self._pseudo_keep = None
+        self._pseudo_file_start: dict = {}
+        self._pseudo_info: dict = {}
+        unlabeled_sc_files: list[str] = []
+
+        if self._pseudo_round is not None:
+            probs, keep, file_to_start, meta, info = _load_pseudo_round(self._pseudo_round)
+            self._pseudo_probs = probs
+            self._pseudo_keep = keep
+            self._pseudo_file_start = file_to_start
+            self._pseudo_info = info
+
+            # Soundscape pool grows to include every file covered by the
+            # pseudo-label cache, minus V-anchor files (held out for eval).
+            # We use .get + flag to skip V-anchor even if exclude_v_anchor is False.
+            if "is_v_anchor" in meta.columns:
+                va_mask_per_file = meta.groupby("filename")["is_v_anchor"].max()
+                eligible_files = va_mask_per_file[va_mask_per_file == 0].index.astype(str).tolist()
+            else:
+                eligible_files = sorted(file_to_start.keys())
+                if exclude_v_anchor:
+                    eligible_files = [f for f in eligible_files if f not in anchor]
+            labeled_set = set(labeled_sc_files)
+            unlabeled_sc_files = [f for f in eligible_files if f not in labeled_set]
+
+        # Final soundscape file pool (labeled GT files + pseudo-only files)
+        self._sc_labeled_files = labeled_sc_files
+        self._sc_pseudo_only_files = unlabeled_sc_files
+        self._sc_files = labeled_sc_files + unlabeled_sc_files
+        self._labeled_set = set(labeled_sc_files)
+
+        # Precompute (filename, window_idx) -> GT multihot for fast lookup
+        idx_map = label_to_idx()
+        self._gt_by_key: dict[tuple[str, int], np.ndarray] = {}
+        for _, row in sc.iterrows():
+            wi = int(row["end_sec"]) // 5 - 1
+            if wi < 0 or wi >= N_WINDOWS:
+                continue
+            y = np.zeros(self._n_classes, dtype=np.float32)
+            for lb in row["label_list"]:
+                j = idx_map.get(lb)
+                if j is not None:
+                    y[j] = 1.0
+            self._gt_by_key[(str(row["filename"]), wi)] = y
 
         self._rng = np.random.default_rng(int(seed))
-        # Length heuristic: iterate per-epoch through max(n_train_audio, n_sc*12).
-        self._length = max(len(self._ta_rows), len(self._sc_files) * N_WINDOWS)
-
-        self._pseudo_round = pseudo_round  # hook; extended dataset reads cache/pseudo/
+        # Length heuristic: enough iterations per epoch to sweep both pools once.
+        self._length = max(
+            len(self._ta_rows),
+            max(1, len(self._sc_files)) * N_WINDOWS,
+        )
 
     def __len__(self) -> int:
         return self._length
 
-    def _get_train_audio(self) -> tuple[np.ndarray, np.ndarray]:
+    def _pseudo_row_for(self, filename: str, window_idx: int) -> Optional[int]:
+        """Return the row offset in pseudo_probs for (filename, window), or None."""
+        if self._pseudo_probs is None:
+            return None
+        start = self._pseudo_file_start.get(str(filename))
+        if start is None:
+            return None
+        return int(start) + int(window_idx)
+
+    def _get_train_audio(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         s = self._ta_rows[self._rng.integers(len(self._ta_rows))]
         start = s.offset
         length = s.length
         if length < self.win:
             buf = np.zeros(self.win, dtype=np.float32)
             buf[:length] = self._store[start : start + length].astype(np.float32)
-            return buf, s.y.astype(np.float32)
-        # Prefer first 30 s of recording.
-        max_start = max(1, length - self.win)
-        if self._rng.random() < self.fw_prob:
-            upper = min(max_start, 30 * SR)
-            off = int(self._rng.integers(0, max(1, upper)))
+            x = buf
         else:
-            off = int(self._rng.integers(0, max_start))
-        x = self._store[start + off : start + off + self.win].astype(np.float32)
-        return x, s.y.astype(np.float32)
+            max_start = max(1, length - self.win)
+            if self._rng.random() < self.fw_prob:
+                upper = min(max_start, 30 * SR)
+                off = int(self._rng.integers(0, max(1, upper)))
+            else:
+                off = int(self._rng.integers(0, max_start))
+            x = self._store[start + off : start + off + self.win].astype(np.float32)
+        y = s.y.astype(np.float32)
+        mask = np.ones(self._n_classes, dtype=np.float32)
+        return x, y, mask
 
-    def _get_soundscape(self) -> tuple[np.ndarray, np.ndarray]:
-        from birdclef.config.paths import SOUNDSCAPES
-
+    def _get_soundscape(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         if not self._sc_files:
             return self._get_train_audio()
         fn = self._sc_files[int(self._rng.integers(len(self._sc_files)))]
-        sub = self._sc_df[self._sc_df["filename"] == fn].sort_values("end_sec")
-        if sub.empty:
-            return self._get_train_audio()
-        win_row = sub.iloc[int(self._rng.integers(len(sub)))]
-        start_sec = int(win_row["end_sec"]) - 5
-        # Read OGG, extract 5 s window
+        is_labeled = fn in self._labeled_set
+
+        if is_labeled:
+            sub = self._sc_df[self._sc_df["filename"] == fn].sort_values("end_sec")
+            if sub.empty:
+                return self._get_train_audio()
+            pick = int(self._rng.integers(len(sub)))
+            win_row = sub.iloc[pick]
+            window_idx = int(win_row["end_sec"]) // 5 - 1
+        else:
+            # Pseudo-only file: sample a random window uniformly.
+            window_idx = int(self._rng.integers(N_WINDOWS))
+
+        start_sec = max(0, window_idx * 5)
         try:
-            y, sr = sf.read(str(SOUNDSCAPES / fn), dtype="float32", always_2d=False)
+            y_wav, _sr = sf.read(str(SOUNDSCAPES / fn), dtype="float32", always_2d=False)
         except Exception:
             return self._get_train_audio()
-        if y.ndim == 2:
-            y = y.mean(axis=1)
-        off = max(0, start_sec * SR)
-        x = y[off : off + self.win]
+        if y_wav.ndim == 2:
+            y_wav = y_wav.mean(axis=1)
+        off = start_sec * SR
+        x = y_wav[off : off + self.win]
         if x.shape[0] < self.win:
             x = np.pad(x, (0, self.win - x.shape[0]))
-        yv = np.zeros(len(label_to_idx()), dtype=np.float32)
-        idx = label_to_idx()
-        for lb in win_row["label_list"]:
-            j = idx.get(lb)
-            if j is not None:
-                yv[j] = 1.0
-        return x, yv
+
+        gt = self._gt_by_key.get((fn, window_idx))
+        pseudo_row = self._pseudo_row_for(fn, window_idx)
+        if pseudo_row is not None:
+            pseudo_y = self._pseudo_probs[pseudo_row]
+            pseudo_mask = self._pseudo_keep[pseudo_row].astype(np.float32)
+            if gt is not None:
+                # max(GT, pseudo): GT positives stay 1.0, pseudo covers the rest
+                target = np.maximum(gt, pseudo_y).astype(np.float32)
+                # GT-labeled positions are always supervised, plus pseudo-kept ones
+                mask = np.maximum((gt > 0).astype(np.float32), pseudo_mask)
+            else:
+                target = pseudo_y.astype(np.float32)
+                mask = pseudo_mask
+        elif gt is not None:
+            target = gt.astype(np.float32)
+            mask = np.ones(self._n_classes, dtype=np.float32)
+        else:
+            # No GT, no pseudo — should not happen once pseudo round is built.
+            target = np.zeros(self._n_classes, dtype=np.float32)
+            mask = np.zeros(self._n_classes, dtype=np.float32)
+        return x, target, mask
 
     def __getitem__(self, _index: int):
         if self._rng.random() < self.sfrac and self._sc_files:
-            x, y = self._get_soundscape()
+            x, y, m = self._get_soundscape()
         else:
-            x, y = self._get_train_audio()
-        return torch.from_numpy(x), torch.from_numpy(y)
+            x, y, m = self._get_train_audio()
+        return torch.from_numpy(x), torch.from_numpy(y), torch.from_numpy(m)
 
 
 class InferenceDataset(Dataset):
@@ -191,7 +309,7 @@ class InferenceDataset(Dataset):
 
     def __getitem__(self, i: int):
         p = self.paths[i]
-        y, sr = sf.read(str(p), dtype="float32", always_2d=False)
+        y, _sr = sf.read(str(p), dtype="float32", always_2d=False)
         if y.ndim == 2:
             y = y.mean(axis=1)
         if y.shape[0] < FILE_SAMPLES:

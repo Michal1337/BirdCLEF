@@ -328,16 +328,28 @@ def train_one_fold(cfg: dict, fold: int | None, dry_run_steps: int = 0) -> dict:
     for epoch in range(int(cfg["epochs"])):
         if sampler is not None:
             sampler.set_epoch(epoch)
-        for wav, y in loader:
+        for batch in loader:
+            # Dataset always returns 3-tuple (wav, y, loss_mask). loss_mask is
+            # all ones for samples without pseudo-labels; only pseudo rows use
+            # it to gate confidence-filtered positions.
+            if len(batch) == 3:
+                wav, y, loss_mask = batch
+            else:
+                wav, y = batch
+                loss_mask = torch.ones_like(y)
             wav = wav.to(device, non_blocking=True).unsqueeze(1)
             y = y.to(device, non_blocking=True).float()
+            loss_mask = loss_mask.to(device, non_blocking=True).float()
             if model.training is False:
                 model.train()
             if float(cfg["mixup_alpha"]) > 0:
                 wav, y = mixup(wav, y, alpha=float(cfg["mixup_alpha"]),
                                mode=str(cfg["mixup_mode"]))
+                # Mixup blends two samples but the loss mask for position j
+                # should fire if either source wanted supervision there.
+                perm = torch.arange(loss_mask.size(0), device=loss_mask.device)
+                loss_mask = torch.maximum(loss_mask, loss_mask[perm.flip(0)])
             wav = wav_aug(wav)
-            # Set LR
             for g in opt.param_groups:
                 g["lr"] = float(cfg["lr"]) * lr_at(step)
 
@@ -345,7 +357,7 @@ def train_one_fold(cfg: dict, fold: int | None, dry_run_steps: int = 0) -> dict:
             with torch.amp.autocast(device_type="cuda" if torch.cuda.is_available() else "cpu",
                                      enabled=bool(cfg["amp"]) and torch.cuda.is_available()):
                 logits = model(wav.squeeze(1))
-                loss = loss_fn(logits, y)
+                loss = loss_fn(logits, y, loss_mask=loss_mask)
             scaler.scale(loss).backward()
             scaler.unscale_(opt)
             torch.nn.utils.clip_grad_norm_(model.parameters(), float(cfg["grad_clip"]))
