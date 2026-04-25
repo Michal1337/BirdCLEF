@@ -71,13 +71,29 @@ def export(ckpt: Path, out: Path, fp16: bool = True, opset: int = 17,
         hop_length=cfg["hop_length"], f_min=cfg["f_min"], f_max=cfg["f_max"],
     )
     model = SED(sed_cfg)
-    sd = state.get("ema") or state["state_dict"]
-    if all(k in dict(model.named_parameters()) for k in sd):
-        for n, p in model.named_parameters():
-            if n in sd:
-                p.data.copy_(sd[n])
-    else:
-        model.load_state_dict(state["state_dict"], strict=False)
+
+    # CRITICAL load order:
+    # 1. Load full state_dict to get the trained BN running_mean/running_var
+    #    (those are buffers, not parameters; the EMA shadow doesn't contain
+    #    them, and missing them produces NaN activations on every real input).
+    # 2. THEN overwrite only the trainable parameters with the EMA shadow if
+    #    one exists, since EMA weights generalize a bit better than the live
+    #    snapshot at "best step".
+    missing, unexpected = model.load_state_dict(state["state_dict"], strict=False)
+    if missing:
+        print(f"[onnx] state_dict missing {len(missing)} keys (e.g. {missing[:3]})")
+    if unexpected:
+        print(f"[onnx] state_dict had {len(unexpected)} unexpected keys (e.g. {unexpected[:3]})")
+    ema_shadow = state.get("ema")
+    if ema_shadow:
+        with torch.no_grad():
+            n_copied = 0
+            for n, p in model.named_parameters():
+                if n in ema_shadow:
+                    p.data.copy_(ema_shadow[n])
+                    n_copied += 1
+        print(f"[onnx] overwrote {n_copied}/{len(list(model.named_parameters()))} "
+              "params with EMA shadow (BN buffers kept from state_dict)")
     model.eval()
 
     # Swap mel front-end with the ONNX-friendly Conv1d-based equivalent.

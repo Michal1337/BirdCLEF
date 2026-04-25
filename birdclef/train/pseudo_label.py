@@ -113,13 +113,17 @@ def pseudo_label_with_sed(
             hop_length=cfg["hop_length"], f_min=cfg["f_min"], f_max=cfg["f_max"],
         )
         m = SED(sed_cfg).to(device)
-        sd = state.get("ema") or state["state_dict"]
-        if all(k in dict(m.named_parameters()) for k in sd):
-            for n, p in m.named_parameters():
-                if n in sd:
-                    p.data.copy_(sd[n].to(p.device))
-        else:
-            m.load_state_dict(state["state_dict"], strict=False)
+        # Load full state_dict first so BN running buffers come from training,
+        # then overwrite trainable params with the EMA shadow if present.
+        # (EMA only contains parameters; using EMA-only loses the BN buffers
+        # and produces NaN activations at inference time.)
+        m.load_state_dict(state["state_dict"], strict=False)
+        ema_shadow = state.get("ema")
+        if ema_shadow:
+            with torch.no_grad():
+                for n, p in m.named_parameters():
+                    if n in ema_shadow:
+                        p.data.copy_(ema_shadow[n].to(p.device))
         m.eval()
         models.append(m)
 
