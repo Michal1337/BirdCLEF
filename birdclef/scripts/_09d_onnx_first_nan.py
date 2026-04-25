@@ -69,25 +69,49 @@ def _ops_histogram(model) -> None:
 
 def _expose_all_intermediate_outputs(onnx_module, model):
     """Return a copy of `model` whose graph emits every intermediate tensor
-    as a graph output, in topological order. Run inference once on that
-    instrumented model to inspect which node first produces NaN.
+    as a graph output, in topological order.
+
+    Uses onnx.shape_inference so we can declare intermediate tensors with
+    their true dtypes — ORT rejects UNDEFINED.
     """
     import copy
+    from onnx import shape_inference
 
     m = copy.deepcopy(model)
+    # Run shape inference; populates m.graph.value_info with type+shape per
+    # intermediate tensor. Best-effort — if it fails we fall back to FLOAT.
+    try:
+        m = shape_inference.infer_shapes(m, strict_mode=False)
+    except Exception as exc:
+        print(f"  warning: shape inference failed ({exc}); declaring all "
+              "intermediates as FLOAT and skipping non-float tensors.")
+
+    type_by_name = {}
+    for vi in list(m.graph.value_info) + list(m.graph.input) + list(m.graph.output):
+        type_by_name[vi.name] = vi.type
+
     existing_outs = {o.name for o in m.graph.output}
-    # Collect every named tensor the graph produces internally.
     intermediate_names = []
     for node in m.graph.node:
-        for o in node.output:
-            if o and o not in existing_outs and o not in intermediate_names:
-                intermediate_names.append(o)
-    # Add as graph outputs (with a permissive type — ORT will fill it in).
+        for oname in node.output:
+            if oname and oname not in existing_outs and oname not in intermediate_names:
+                intermediate_names.append(oname)
+
+    n_added = 0
+    n_skipped_no_type = 0
     for name in intermediate_names:
-        vi = onnx_module.helper.make_tensor_value_info(
-            name, onnx_module.TensorProto.UNDEFINED, None
-        )
+        ttype = type_by_name.get(name)
+        if ttype is None:
+            # No inferred type — skip rather than risk an UNDEFINED tensor.
+            n_skipped_no_type += 1
+            continue
+        vi = onnx_module.helper.ValueInfoProto()
+        vi.name = name
+        vi.type.CopyFrom(ttype)
         m.graph.output.append(vi)
+        n_added += 1
+    print(f"  exposed {n_added} intermediate tensors as outputs "
+          f"(skipped {n_skipped_no_type} with no inferred type)")
     return m, intermediate_names
 
 
