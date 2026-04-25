@@ -50,7 +50,10 @@ def _extract_summary_row(name: str, cfg: dict, result: dict, path: Path) -> dict
     else:
         mean_oof = float(m_global.get("macro_auc", float("nan")))
     site_std = float(m_global.get("site_auc_std", 0.0))
-    primary = primary_score(m_global, std_penalty=1.0)
+    # primary == macro_auc (official BirdCLEF metric shape).
+    # site_auc_std stays as a diagnostic column but is no longer in the
+    # ranking formula — see eval/metrics.py:primary_score for rationale.
+    primary = primary_score(m_global)
     fp_global = float(m_global_fp.get("macro_auc", m_global.get("first_pass_auc", float("nan"))))
     return {
         "config_name": name,

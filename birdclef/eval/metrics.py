@@ -100,10 +100,24 @@ def compute_stage_metrics(
     return out
 
 
-def primary_score(m: Dict, std_penalty: float = 1.0) -> float:
-    """Ranking scalar: macro_auc - λ·site_auc_std."""
+def primary_score(m: Dict, std_penalty: float = 0.0) -> float:
+    """Ranking scalar: macro_auc − λ·site_auc_std (default λ=0).
+
+    The official BirdCLEF metric is macro-averaged ROC-AUC (excluding
+    classes with no true positives). Top-team writeups (BirdCLEF 2024 / 2025)
+    rank configs by stitched OOF macro AUC directly — none use a site-std
+    penalty. We default `std_penalty=0.0` so `primary == macro_auc` and our
+    ranking matches the LB metric's shape.
+
+    The `std_penalty` knob is kept (not removed) so it's still possible to
+    re-enable site-fragility regularisation if a future cross-site holdout
+    turns out to predict LB better than plain macro AUC. site_auc_std stays
+    in the lean CSV either way as a diagnostic column.
+    """
     mauc = m.get("macro_auc", float("nan"))
-    std = m.get("site_auc_std", 0.0)
     if np.isnan(mauc):
         return float("-inf")
+    if std_penalty == 0.0:
+        return float(mauc)
+    std = m.get("site_auc_std", 0.0)
     return float(mauc - std_penalty * (0.0 if np.isnan(std) else std))
