@@ -221,10 +221,20 @@ class SEDExportWrapper(nn.Module):
         if waveform.ndim == 3:
             waveform = waveform.squeeze(1)
         log_mel = self.mel(waveform)                              # (B, n_mels, frames)
-        # Per-sample standardization, mirrors birdclef.models.sed.MelFrontend.
+
+        # Per-sample standardization, equivalent to MelFrontend's
+        # `(x - x.mean()) / x.std().clamp(min=1e-6)` but written with only
+        # ReduceMean/Mul/Sqrt/Clamp so the ONNX graph stays NaN-safe even on
+        # constant inputs (where torch.std emits sqrt(~0) and ORT silently
+        # returns NaN that clamp() cannot repair).
         m = log_mel.mean(dim=(-2, -1), keepdim=True)
-        v = log_mel.std(dim=(-2, -1), keepdim=True).clamp(min=1e-6)
-        x = (log_mel - m) / v
+        diff = log_mel - m
+        var = (diff * diff).mean(dim=(-2, -1), keepdim=True)
+        # Clamp variance BEFORE sqrt so we never feed sqrt a negative number
+        # (variance can drift slightly negative through fp accumulation), then
+        # clamp std again as a guard for very low-variance inputs.
+        std = torch.sqrt(var.clamp(min=1e-12)).clamp(min=1e-6)
+        x = diff / std
         x = x.unsqueeze(1)                                        # (B, 1, n_mels, frames)
         feats = self.backbone(x)
         if feats.ndim == 4:
