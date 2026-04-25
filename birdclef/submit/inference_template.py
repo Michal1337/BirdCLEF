@@ -88,12 +88,25 @@ def run_submission(
     if recipe is None:
         recipe = {"blend": "sigmoid", "weights": [1.0] * max(1, len(sed_onnx_paths))}
 
+    def _np_dtype_from_ort(type_str: str):
+        # ORT input.type is a string like "tensor(float)" / "tensor(float16)".
+        if "float16" in type_str:
+            return np.float16
+        if "double" in type_str:
+            return np.float64
+        return np.float32
+
     sess_opts = ort.SessionOptions()
     sess_opts.intra_op_num_threads = 4
     sed_sessions = [ort.InferenceSession(str(p), sess_options=sess_opts,
                                          providers=["CPUExecutionProvider"])
                     for p in sed_onnx_paths]
     sed_input_names = [s.get_inputs()[0].name for s in sed_sessions]
+    # Each ONNX may have been exported as float32 OR float16 (FP16 cast).
+    # Capture the expected dtype per session so we can cast inputs without
+    # crashing with "Unexpected input data type".
+    sed_input_dtypes = [_np_dtype_from_ort(s.get_inputs()[0].type) for s in sed_sessions]
+    print(f"[submit] SED session input dtypes: {[str(np.dtype(d)) for d in sed_input_dtypes]}")
 
     # Pre-resolve weights to length(sed_sessions). If recipe weights count
     # mismatches (e.g. safe variant with 1 ONNX but a 5-weight recipe),
@@ -112,10 +125,12 @@ def run_submission(
 
     perch_sess = None
     perch_input = None
+    perch_input_dtype = np.float32
     if perch_onnx and Path(str(perch_onnx)).exists():
         perch_sess = ort.InferenceSession(str(perch_onnx), sess_options=sess_opts,
                                           providers=["CPUExecutionProvider"])
         perch_input = perch_sess.get_inputs()[0].name
+        perch_input_dtype = _np_dtype_from_ort(perch_sess.get_inputs()[0].type)
 
     test_paths = sorted(Path(test_dir).glob("*.ogg"))
     rows = []
@@ -126,9 +141,11 @@ def run_submission(
         y = _read_60s(p, sr, file_samples)
         wins = y.reshape(n_windows, win_samples).astype(np.float32)
         preds = []
-        for s, inp in zip(sed_sessions, sed_input_names):
-            out = s.run(None, {inp: wins})[0]
-            preds.append(_sigmoid(out))
+        for s, inp, dt in zip(sed_sessions, sed_input_names, sed_input_dtypes):
+            x = wins if wins.dtype == dt else wins.astype(dt)
+            out = s.run(None, {inp: x})[0]
+            # Promote to float32 before sigmoid so downstream math stays stable
+            preds.append(_sigmoid(out.astype(np.float32, copy=False)))
         if preds:
             stack = np.stack(preds, axis=0)
             probs = (stack * weights[:, None, None]).sum(axis=0)

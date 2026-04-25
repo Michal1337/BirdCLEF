@@ -1,22 +1,22 @@
 {
   "final": {
     "fold_val": {
-      "macro_auc": 0.8328541629442706,
+      "macro_auc": 0.9206966705133537,
       "site_auc_std": 0.0,
       "rare_auc": NaN,
       "frequent_auc": NaN,
-      "n_files": 10,
-      "n_windows": 120
+      "n_files": 9,
+      "n_windows": 108
     },
     "v_anchor": {
-      "macro_auc": 0.8868560232168502,
-      "site_auc_std": 0.06390439389948105,
+      "macro_auc": 0.8545116871257078,
+      "site_auc_std": 0.08894591350947512,
       "rare_auc": NaN,
       "frequent_auc": NaN,
       "n_files": 13,
       "n_windows": 156
     }
   },
-  "best_primary": 0.8289253221416756,
-  "runtime_min": 275.8853344519933
+  "best_primary": 0.8077370814835068,
+  "runtime_min": 109.46004266738892
 }

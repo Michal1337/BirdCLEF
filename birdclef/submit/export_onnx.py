@@ -55,7 +55,12 @@ def export(ckpt: Path, out: Path, fp16: bool = True, opset: int = 17) -> None:
             import onnx
 
             m = onnx.load(str(out))
-            m16 = float16.convert_float_to_float16(m)
+            # keep_io_types=True leaves the model's input/output tensors as
+            # float32 even though weights and intermediate ops cast down to
+            # float16. Saves a `wins.astype(np.float16)` dance in the
+            # inference template and avoids the "Unexpected input data type"
+            # crash at submission time.
+            m16 = float16.convert_float_to_float16(m, keep_io_types=True)
             out16 = out.with_suffix(".fp16.onnx")
             onnx.save(m16, str(out16))
             print(f"[onnx] FP16 cast saved to {out16}")
