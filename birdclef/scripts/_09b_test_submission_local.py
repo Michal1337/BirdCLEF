@@ -128,8 +128,15 @@ def _score_v_anchor_csv(out_csv: Path, n_files_in_test: int) -> dict:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--sed-onnx", nargs="+", required=True,
-                    help="LOCAL paths to SED ONNX files (one or more).")
+    sed_group = ap.add_mutually_exclusive_group(required=True)
+    sed_group.add_argument("--sed-onnx", nargs="+",
+                    help="LOCAL paths to SED ONNX files (one or more). "
+                         "For bold ensemble, list all 5 fold paths.")
+    sed_group.add_argument("--sed-folds-glob",
+                    help=("Glob pattern that expands to multiple SED ONNX paths, "
+                          "e.g. 'birdclef/models_ckpt/sed/sed_v2s/fold*/best.onnx'. "
+                          "Convenience flag for testing the bold ensemble without "
+                          "typing all 5 fold paths."))
     ap.add_argument("--perch-onnx", default=None,
                     help="Optional local Perch ONNX path. None = skip Perch.")
     ap.add_argument("--recipe", default=None,
@@ -146,6 +153,18 @@ def main():
     ap.add_argument("--out-dir", default=str(OUTPUT_ROOT / "submit" / "local_test"),
                     help="Where to write submission.csv + staged files.")
     args = ap.parse_args()
+
+    # Resolve SED ONNX list (either explicit --sed-onnx or expanded glob)
+    if args.sed_onnx:
+        sed_onnx_paths = list(args.sed_onnx)
+    else:
+        import glob as _glob
+        sed_onnx_paths = sorted(_glob.glob(args.sed_folds_glob))
+        if not sed_onnx_paths:
+            raise SystemExit(f"--sed-folds-glob '{args.sed_folds_glob}' matched zero files")
+        print(f"[local-test] glob expanded to {len(sed_onnx_paths)} SED ONNX file(s):")
+        for p in sed_onnx_paths:
+            print(f"  - {p}")
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -175,7 +194,7 @@ def main():
         test_dir=stage_dir,
         sample_sub_csv=SAMPLE_SUB,
         perch_onnx=args.perch_onnx,
-        sed_onnx_paths=args.sed_onnx,
+        sed_onnx_paths=sed_onnx_paths,
         recipe=recipe,
         output_csv=out_csv,
     )
