@@ -139,20 +139,23 @@ def main():
                 Y[i, j] = 1
 
     P = np.zeros_like(Y, dtype=np.float32)
+    fold_metrics: dict[int, dict] = {}
 
-    # Walk folds: for each fold, load its best.pt, predict on its val files
+    # Walk folds: for each fold, load its best.pt, predict on its val files,
+    # and record both the per-fold AUC AND fill in the global stitched grid.
     n_folds_seen = 0
     for fold in sorted(sc["fold"].unique()):
         ckpt = base_dir / f"fold{fold}" / "best.pt"
         if not ckpt.exists():
-            print(f"[stitched-oof] WARN: missing {ckpt}; fold {fold} val rows will stay 0")
+            print(f"[oof-sed] WARN: missing {ckpt}; fold {fold} val rows will stay 0")
             continue
         model, _cfg = _load_sed_from_ckpt(ckpt, device)
         n_folds_seen += 1
 
         sub = sc[sc["fold"] == fold]
         files = sub.drop_duplicates("filename")["filename"].astype(str).tolist()
-        print(f"[stitched-oof] fold {fold}: {len(files)} files, ckpt={ckpt}")
+        print(f"[oof-sed] fold {fold}: {len(files)} files, ckpt={ckpt}")
+        fold_row_idxs: list[int] = []
         for fn in files:
             row_idx = sub.index[sub["filename"] == fn].to_numpy()
             if len(row_idx) == 0:
@@ -161,6 +164,18 @@ def main():
             # `row_idx` is sorted by end_sec → 1-to-1 with the 12 ascending windows
             n = min(len(row_idx), N_WINDOWS)
             P[row_idx[:n]] = probs[:n]
+            fold_row_idxs.extend(row_idx[:n].tolist())
+
+        # Score this fold's val rows independently — same calibration scope
+        # the deployed model would have. `fold_metrics[i].macro_auc` averaged
+        # across folds is the LB-proxy primary metric.
+        if fold_row_idxs:
+            fr = np.asarray(fold_row_idxs, dtype=int)
+            fold_meta = sc.iloc[fr][["site", "hour_utc"]].reset_index(drop=True)
+            fold_metrics[int(fold)] = compute_stage_metrics(Y[fr], P[fr], fold_meta)
+            print(f"[oof-sed]   fold {fold} macro_auc = "
+                  f"{fold_metrics[int(fold)].get('macro_auc', float('nan')):.4f}")
+
         del model
         if device.type == "cuda":
             torch.cuda.empty_cache()
@@ -169,21 +184,46 @@ def main():
         raise SystemExit(f"No fold checkpoints found under {base_dir}/fold*/best.pt")
 
     meta_for_metrics = sc[["site", "hour_utc"]].reset_index(drop=True)
-    metrics = compute_stage_metrics(Y, P, meta_for_metrics)
+    stitched = compute_stage_metrics(Y, P, meta_for_metrics)
+
+    fold_aucs = [m.get("macro_auc", float("nan")) for m in fold_metrics.values()]
+    fold_aucs = [a for a in fold_aucs if not np.isnan(a)]
+    mean_oof_auc = float(np.mean(fold_aucs)) if fold_aucs else float("nan")
+    macro_auc = float(stitched.get("macro_auc", float("nan")))
+    drift = (mean_oof_auc - macro_auc) if not (np.isnan(mean_oof_auc) or np.isnan(macro_auc)) else float("nan")
+
+    summary = {
+        # Primary = mean of per-fold AUCs. Best LB proxy (each fold = one
+        # deployed-style model on one test set).
+        "primary": mean_oof_auc,
+        "mean_oof_auc": mean_oof_auc,
+        # Diagnostic = stitched AUC. If `mean_oof_auc - macro_auc` is large
+        # (>0.02), per-fold calibration drift; deployed model wouldn't have it.
+        "macro_auc": macro_auc,
+        "calibration_drift": drift,
+        "site_auc_std": float(stitched.get("site_auc_std", float("nan"))),
+        "rare_auc": stitched.get("rare_auc", float("nan")),
+        "frequent_auc": stitched.get("frequent_auc", float("nan")),
+        "per_fold": {str(k): v for k, v in fold_metrics.items()},
+        "stitched_full": stitched,
+        "n_folds_seen": n_folds_seen,
+        "n_splits": int(args.n_splits),
+    }
 
     out_json = base_dir / "stitched_oof_metrics.json"
     out_npz = base_dir / "stitched_oof_probs.npz"
-    out_json.write_text(json.dumps(metrics, indent=2, default=str), encoding="utf-8")
+    out_json.write_text(json.dumps(summary, indent=2, default=str), encoding="utf-8")
     np.savez_compressed(out_npz, probs=P, y_true=Y)
 
     print()
-    print(f"[stitched-oof] config={args.config}  n_splits={args.n_splits}  folds_seen={n_folds_seen}")
-    print(f"[stitched-oof] macro_auc       = {metrics.get('macro_auc', float('nan')):.4f}")
-    print(f"[stitched-oof] site_auc_std    = {metrics.get('site_auc_std', float('nan')):.4f}")
-    print(f"[stitched-oof] rare_auc        = {metrics.get('rare_auc', float('nan'))}")
-    print(f"[stitched-oof] frequent_auc    = {metrics.get('frequent_auc', float('nan'))}")
-    print(f"[stitched-oof] wrote {out_json}")
-    print(f"[stitched-oof] wrote {out_npz}")
+    print(f"[oof-sed] config={args.config}  n_splits={args.n_splits}  folds_seen={n_folds_seen}")
+    print(f"[oof-sed] primary (mean_oof_auc) = {mean_oof_auc:.4f}")
+    print(f"[oof-sed] macro_auc (stitched)   = {macro_auc:.4f}")
+    print(f"[oof-sed] calibration_drift      = {drift:+.4f}  "
+          f"({'OK' if abs(drift) < 0.02 else 'investigate post-proc'})")
+    print(f"[oof-sed] site_auc_std           = {summary['site_auc_std']:.4f}")
+    print(f"[oof-sed] wrote {out_json}")
+    print(f"[oof-sed] wrote {out_npz}")
 
 
 if __name__ == "__main__":

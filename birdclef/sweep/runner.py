@@ -20,7 +20,6 @@ from typing import Callable, Dict, List
 
 import numpy as np
 
-from birdclef.eval.metrics import primary_score
 from birdclef.sweep.writer import write_config_json, write_hparams_diff_csv, write_summary_csv
 from birdclef.utils.seed import seed_everything
 
@@ -32,9 +31,16 @@ def _config_hash(cfg: dict) -> str:
 def _extract_summary_row(name: str, cfg: dict, result: dict, path: Path) -> dict:
     """Flatten a stage-fn result into the lean CSV schema.
 
-    Primary metric = stitched-OOF macro AUC minus site_auc_std penalty.
-    `mean_oof_auc` is the unweighted mean of per-fold AUCs (informational —
-    higher variance than the stitched metric, included for inspection).
+    `primary == mean_oof_auc` (mean of per-fold macro AUCs). This is the
+    closest proxy to LB scoring for any pipeline that includes per-fold
+    calibration steps (per-class thresholds, isotonic regression, etc.):
+    each fold scores its own self-consistent predictions, mirroring how
+    one deployed model fits its calibration once on all data.
+
+    `macro_auc` is the stitched-OOF macro AUC (concat all fold val probs,
+    one global AUC). It's kept in the CSV as a diagnostic — when
+    `mean_oof_auc - macro_auc` is large (>0.02), the config has fold-local
+    calibration drift. Worth investigating, not necessarily bad.
     """
     metrics = result.get("metrics", {}) or {}
     m_global = metrics.get("global", metrics) or {}
@@ -50,18 +56,15 @@ def _extract_summary_row(name: str, cfg: dict, result: dict, path: Path) -> dict
     else:
         mean_oof = float(m_global.get("macro_auc", float("nan")))
     site_std = float(m_global.get("site_auc_std", 0.0))
-    # primary == macro_auc (official BirdCLEF metric shape).
-    # site_auc_std stays as a diagnostic column but is no longer in the
-    # ranking formula — see eval/metrics.py:primary_score for rationale.
-    primary = primary_score(m_global)
+    primary = mean_oof if not np.isnan(mean_oof) else float("-inf")
     fp_global = float(m_global_fp.get("macro_auc", m_global.get("first_pass_auc", float("nan"))))
     return {
         "config_name": name,
         "primary": primary,
+        "mean_oof_auc": mean_oof,
         "macro_auc": m_global.get("macro_auc", float("nan")),
         "first_pass_auc": fp_global,
         "site_auc_std": site_std,
-        "mean_oof_auc": mean_oof,
         "rare_auc": m_global.get("rare_auc", float("nan")),
         "frequent_auc": m_global.get("frequent_auc", float("nan")),
         "runtime_min": result.get("runtime_min", float("nan")),

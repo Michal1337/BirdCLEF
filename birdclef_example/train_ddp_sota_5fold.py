@@ -365,7 +365,7 @@ def run_one_fold(
     return summary
 
 
-def _stitched_oof_for_exp(
+def _cross_fold_oof_for_exp(
     exp_name: str,
     fold_list: List[int],
     output_dir: Path,
@@ -379,27 +379,34 @@ def _stitched_oof_for_exp(
     batch_size: int,
     num_workers: int,
 ) -> Dict[str, float]:
-    """Stitched-OOF macro AUC over all folds of one experiment.
+    """Cross-fold OOF metrics for one experiment.
 
-    Loads each fold's `best_model.pt`, predicts on its val rows, concatenates
-    across folds, computes one global AUC. Replaces V-anchor as the
-    cross-config ranker. Only computed when the user passes --all-folds and
-    every fold completed.
+    Loads each fold's `best_model.pt`, predicts on its val rows, and
+    reports BOTH:
+      - mean_oof_mapped_auc / mean_oof_full_auc (mean of per-fold AUCs) —
+        the LB-proxy primary metric (each fold = one deployed-style model
+        on one test set, no cross-fold calibration mixing).
+      - stitched_oof_mapped_auc / stitched_oof_full_auc (single AUC over
+        concatenated val predictions) — diagnostic; large mean-vs-stitched
+        gap signals fold-local calibration drift.
+    Only computed when --all-folds was passed.
     """
     if len(fold_list) <= 1:
         return {}
     exp_dir = output_dir / exp_name
     targets_chunks: List[np.ndarray] = []
     preds_chunks: List[np.ndarray] = []
+    fold_mapped: List[float] = []
+    fold_full: List[float] = []
+
     for fold in fold_list:
         ckpt = exp_dir / f"fold{fold}" / "best_model.pt"
         if not ckpt.exists():
-            print(f"[stitched-oof] WARN: missing {ckpt}; skipping fold {fold}")
+            print(f"[oof] WARN: missing {ckpt}; skipping fold {fold}")
             continue
         state = torch.load(ckpt, map_location="cpu")
         model_config = state["model_config"]
         model = TimmSpectrogramClassifier(**model_config).to(device)
-        # State dict may be saved as 'model_state' (new) — use that key.
         sd = state.get("model_state") or state.get("state_dict")
         model.load_state_dict(sd, strict=False)
         model.eval()
@@ -415,14 +422,36 @@ def _stitched_oof_for_exp(
         )
         loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False,
                             num_workers=num_workers, pin_memory=torch.cuda.is_available())
+        ft_chunks: List[np.ndarray] = []
+        fp_chunks: List[np.ndarray] = []
         with torch.no_grad():
             for inputs, targets in loader:
                 inputs = inputs.to(device, non_blocking=True)
                 with torch.autocast(device_type=device.type, dtype=torch.bfloat16,
                                     enabled=use_bf16 and device.type == "cuda"):
                     logits = model(inputs)
-                preds_chunks.append(torch.sigmoid(logits).float().cpu().numpy())
-                targets_chunks.append(targets.float().cpu().numpy())
+                p = torch.sigmoid(logits).float().cpu().numpy()
+                t = targets.float().cpu().numpy()
+                fp_chunks.append(p); ft_chunks.append(t)
+                preds_chunks.append(p); targets_chunks.append(t)
+
+        if ft_chunks:
+            Yf = np.concatenate(ft_chunks, axis=0)
+            Pf = np.concatenate(fp_chunks, axis=0)
+            try:
+                fold_full.append(float(birdclef_roc_auc(Yf, Pf)))
+            except ValueError:
+                fold_full.append(float("nan"))
+            if len(mapped_label_indices) > 0:
+                try:
+                    fold_mapped.append(float(birdclef_roc_auc(
+                        Yf[:, mapped_label_indices], Pf[:, mapped_label_indices])))
+                except ValueError:
+                    fold_mapped.append(float("nan"))
+            else:
+                fold_mapped.append(float("nan"))
+            print(f"[oof]   fold {fold}: mapped={fold_mapped[-1]:.4f}  full={fold_full[-1]:.4f}")
+
         del model
         if device.type == "cuda":
             torch.cuda.empty_cache()
@@ -432,20 +461,35 @@ def _stitched_oof_for_exp(
     Y = np.concatenate(targets_chunks, axis=0)
     P = np.concatenate(preds_chunks, axis=0)
     try:
-        full_auc = birdclef_roc_auc(Y, P)
+        stitched_full = float(birdclef_roc_auc(Y, P))
     except ValueError:
-        full_auc = float("nan")
+        stitched_full = float("nan")
     if len(mapped_label_indices) > 0:
         try:
-            mapped_auc = birdclef_roc_auc(Y[:, mapped_label_indices], P[:, mapped_label_indices])
+            stitched_mapped = float(birdclef_roc_auc(
+                Y[:, mapped_label_indices], P[:, mapped_label_indices]))
         except ValueError:
-            mapped_auc = float("nan")
+            stitched_mapped = float("nan")
     else:
-        mapped_auc = float("nan")
+        stitched_mapped = float("nan")
+
+    valid_mapped = [a for a in fold_mapped if not np.isnan(a)]
+    valid_full = [a for a in fold_full if not np.isnan(a)]
+    mean_mapped = float(np.mean(valid_mapped)) if valid_mapped else float("nan")
+    mean_full = float(np.mean(valid_full)) if valid_full else float("nan")
+
     return {
-        "stitched_oof_mapped_auc": float(mapped_auc),
-        "stitched_oof_full_auc": float(full_auc),
+        # Primary ranker: mean of per-fold AUCs (LB-shape proxy).
+        "mean_oof_mapped_auc": mean_mapped,
+        "mean_oof_full_auc": mean_full,
+        # Diagnostic: stitched AUC. Large `mean - stitched` gap (>0.02) =
+        # fold-local calibration drift; deployed model wouldn't have it.
+        "stitched_oof_mapped_auc": stitched_mapped,
+        "stitched_oof_full_auc": stitched_full,
+        "calibration_drift_mapped": mean_mapped - stitched_mapped if not (
+            np.isnan(mean_mapped) or np.isnan(stitched_mapped)) else float("nan"),
         "stitched_oof_n_rows": int(Y.shape[0]),
+        "n_folds_seen": int(len(valid_mapped)),
     }
 
 
@@ -610,11 +654,14 @@ def main() -> None:
                     df = df.sort_values(by=["best_val_mapped_auc"], ascending=[False])
                 df.to_csv(output_dir / "experiments_summary.csv", index=False)
 
-        # Stitched OOF (only meaningful when all folds of this experiment
+        # Cross-fold OOF (only meaningful when all folds of this experiment
         # completed in this run — i.e. --all-folds was passed and rank 0).
+        # Reports BOTH mean of per-fold AUCs (primary, LB-shape proxy) AND
+        # stitched AUC (diagnostic — large mean-vs-stitched gap = fold-local
+        # calibration drift).
         if args.all_folds and _is_main_process(rank):
             try:
-                stitched = _stitched_oof_for_exp(
+                oof = _cross_fold_oof_for_exp(
                     exp_name=experiment["name"],
                     fold_list=fold_list,
                     output_dir=output_dir,
@@ -629,24 +676,27 @@ def main() -> None:
                     num_workers=int(args.num_workers),
                 )
             except Exception as ex:
-                print(f"[WARN] stitched-OOF for {experiment['name']} FAILED: {ex}")
-                stitched = {}
-            if stitched:
-                stitched_record = {"experiment": experiment["name"], **stitched}
-                # Append a single stitched-OOF row per experiment to the
+                print(f"[WARN] cross-fold OOF for {experiment['name']} FAILED: {ex}")
+                oof = {}
+            if oof:
+                # Append a single cross-fold OOF row per experiment to the
                 # summary CSV / JSON so it ranks alongside per-fold entries.
-                all_summaries.append({"_kind": "stitched_oof", **stitched_record})
+                all_summaries.append({"_kind": "cross_fold_oof",
+                                      "experiment": experiment["name"], **oof})
                 with open(output_dir / "experiments_summary.json", "w", encoding="utf-8") as f:
                     json.dump(all_summaries, f, indent=2, sort_keys=True, default=str)
                 df = pd.DataFrame(all_summaries)
-                if "stitched_oof_mapped_auc" in df.columns:
-                    df = df.sort_values(by=["stitched_oof_mapped_auc"],
+                if "mean_oof_mapped_auc" in df.columns:
+                    df = df.sort_values(by=["mean_oof_mapped_auc"],
                                         ascending=[False], na_position="last")
                 df.to_csv(output_dir / "experiments_summary.csv", index=False)
-                print(f"[stitched-oof] {experiment['name']}  "
-                      f"mapped={stitched.get('stitched_oof_mapped_auc'):.4f}  "
-                      f"full={stitched.get('stitched_oof_full_auc'):.4f}  "
-                      f"rows={stitched.get('stitched_oof_n_rows')}")
+                drift = oof.get("calibration_drift_mapped", float("nan"))
+                drift_flag = "OK" if (not np.isnan(drift) and abs(drift) < 0.02) else "investigate"
+                print(f"[oof] {experiment['name']}  "
+                      f"mean_mapped={oof.get('mean_oof_mapped_auc'):.4f}  "
+                      f"stitched_mapped={oof.get('stitched_oof_mapped_auc'):.4f}  "
+                      f"drift={drift:+.4f} ({drift_flag})  "
+                      f"rows={oof.get('stitched_oof_n_rows')}")
 
     _cleanup_distributed(distributed)
 
