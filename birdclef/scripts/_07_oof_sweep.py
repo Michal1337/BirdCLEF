@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import argparse
+import warnings
+warnings.filterwarnings("ignore")
 
 from birdclef.config.paths import OUTPUT_ROOT
 from birdclef.config.ssm_configs import SWEEP_BEST_SSM, SWEEP_CHEAP_WINS, SWEEP_LB_093

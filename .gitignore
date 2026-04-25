@@ -15,3 +15,6 @@ __pycache__
 *.onnx
 *.data
 *.pt
+local_test/
+splits/
+birdclef/cache/
