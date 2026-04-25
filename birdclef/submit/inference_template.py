@@ -63,10 +63,11 @@ def run_submission(
     *,
     test_dir: Path,
     sample_sub_csv: Path,
-    perch_onnx: Path | None,
+    perch_onnx,                # str | Path | None
     sed_onnx_paths: list,
-    recipe_json: Path | None,
-    output_csv: Path,
+    recipe=None,               # dict (preferred — inlined by build_notebook)
+    recipe_json=None,          # str | Path | None (legacy: load from file if recipe is None)
+    output_csv: Path = Path("submission.csv"),
     sr: int = 32000,
     window_sec: int = 5,
     n_windows: int = 12,
@@ -80,10 +81,12 @@ def run_submission(
     win_samples = sr * window_sec
     file_samples = window_sec * n_windows * sr
 
-    # Load recipe
-    recipe = {"blend": "sigmoid", "weights": [1.0] * max(1, len(sed_onnx_paths))}
-    if recipe_json and Path(recipe_json).exists():
-        recipe = json.loads(Path(recipe_json).read_text(encoding="utf-8"))
+    # Resolve recipe: prefer the inlined dict; fall back to file path; final
+    # fallback is uniform weights over whatever sed_onnx_paths we got.
+    if recipe is None and recipe_json and Path(str(recipe_json)).exists():
+        recipe = json.loads(Path(str(recipe_json)).read_text(encoding="utf-8"))
+    if recipe is None:
+        recipe = {"blend": "sigmoid", "weights": [1.0] * max(1, len(sed_onnx_paths))}
 
     sess_opts = ort.SessionOptions()
     sess_opts.intra_op_num_threads = 4
@@ -92,9 +95,24 @@ def run_submission(
                     for p in sed_onnx_paths]
     sed_input_names = [s.get_inputs()[0].name for s in sed_sessions]
 
+    # Pre-resolve weights to length(sed_sessions). If recipe weights count
+    # mismatches (e.g. safe variant with 1 ONNX but a 5-weight recipe),
+    # silently fall back to uniform — the user's intent is "use these
+    # checkpoints", not "broadcast a wrong vector".
+    n_members = max(1, len(sed_sessions))
+    raw_weights = list(recipe.get("weights") or [])
+    if len(raw_weights) != n_members:
+        if raw_weights:
+            print(f"[submit] recipe has {len(raw_weights)} weights but "
+                  f"{n_members} SED ONNX provided; falling back to uniform.")
+        raw_weights = [1.0] * n_members
+    weights = np.asarray(raw_weights, dtype=np.float32)
+    weights = weights / max(weights.sum(), 1e-8)
+    print(f"[submit] {n_members} SED member(s); weights={weights.tolist()}")
+
     perch_sess = None
     perch_input = None
-    if perch_onnx and Path(perch_onnx).exists():
+    if perch_onnx and Path(str(perch_onnx)).exists():
         perch_sess = ort.InferenceSession(str(perch_onnx), sess_options=sess_opts,
                                           providers=["CPUExecutionProvider"])
         perch_input = perch_sess.get_inputs()[0].name
@@ -112,10 +130,8 @@ def run_submission(
             out = s.run(None, {inp: wins})[0]
             preds.append(_sigmoid(out))
         if preds:
-            w = np.asarray(recipe.get("weights", [1.0] * len(preds)), dtype=np.float32)
-            w = w / max(w.sum(), 1e-8)
             stack = np.stack(preds, axis=0)
-            probs = (stack * w[:, None, None]).sum(axis=0)
+            probs = (stack * weights[:, None, None]).sum(axis=0)
         else:
             probs = np.zeros((n_windows, n_classes), dtype=np.float32)
         if perch_sess is not None:
