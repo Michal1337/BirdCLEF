@@ -8,8 +8,10 @@ Single-process fallback (no torchrun): runs with world_size=1.
 
 Reads train_audio from the shared memmap produced by scripts/01_build_caches.py.
 Writes per-fold checkpoint under MODEL_ROOT/sed/<name>/fold{k}/best.pt and EMA
-weights alongside. A minimal V-anchor evaluation runs every
-`eval_every_n_steps` on rank 0.
+weights alongside. A periodic fold-val evaluation runs every
+`eval_every_n_steps` on rank 0; checkpoint selection uses fold_val.macro_auc
+minus a site_auc_std penalty. After all folds train, run
+`scripts/_03b_stitched_oof_sed.py` for the cross-fold metric.
 """
 from __future__ import annotations
 
@@ -45,7 +47,7 @@ from birdclef.config.sed_configs import BASELINE as SED_BASELINE
 from birdclef.data.augment import WaveformAug, background_mix, mixup
 from birdclef.data.datasets import SEDTrainDataset
 from birdclef.data.soundscapes import label_to_idx, load_soundscape_meta, primary_labels
-from birdclef.data.splits import load_v_anchor
+from birdclef.data.splits import load_folds
 from birdclef.models.losses import build_loss
 from birdclef.models.sed import SED, SEDConfig
 from birdclef.eval.metrics import compute_stage_metrics
@@ -104,11 +106,6 @@ class EMA:
         for n, p in model.named_parameters():
             if n in saved:
                 p.data.copy_(saved[n])
-
-
-def _v_anchor_file_paths() -> List[Path]:
-    files = load_v_anchor()
-    return [SOUNDSCAPES / f for f in files]
 
 
 def _windowize(waveform: np.ndarray, n_windows: int = N_WINDOWS, win: int = WINDOW_SAMPLES) -> np.ndarray:
@@ -188,31 +185,29 @@ def _eval_on_soundscape_files(
     return m
 
 
-def _fold_val_filenames(fold: int) -> list:
-    """Return filenames that are held out in `fold` of the site×date split."""
+def _fold_val_filenames(fold: int, n_splits: int = 5) -> list:
+    """Return filenames that are held out in `fold` of the file-level split."""
     from birdclef.data.splits import load_folds
 
-    folds_df = load_folds()
+    folds_df = load_folds(n_splits=int(n_splits))
     return folds_df.loc[folds_df["fold"] == int(fold), "filename"].astype(str).tolist()
 
 
 @torch.no_grad()
-def _v_anchor_eval(model: torch.nn.Module, device: torch.device, max_files: int = 0) -> Dict:
-    """Evaluate on the permanent V-anchor hold-out. Rank-0 only."""
-    return _eval_on_soundscape_files(model, device, load_v_anchor(), max_files=max_files)
-
-
-@torch.no_grad()
 def _fold_val_eval(
-    model: torch.nn.Module, device: torch.device, fold: int, max_files: int = 0
+    model: torch.nn.Module, device: torch.device, fold: int,
+    n_splits: int = 5, max_files: int = 0,
 ) -> Dict:
     """Evaluate on the val split of the current training fold. Rank-0 only."""
     if fold is None:
         return {"macro_auc": float("nan"), "n_files": 0, "n_windows": 0}
-    return _eval_on_soundscape_files(model, device, _fold_val_filenames(fold), max_files=max_files)
+    return _eval_on_soundscape_files(
+        model, device, _fold_val_filenames(fold, n_splits=n_splits),
+        max_files=max_files,
+    )
 
 
-def _combine_eval_summary(fold_m: Dict, anchor_m: Dict) -> Dict:
+def _combine_eval_summary(fold_m: Dict) -> Dict:
     """Flatten to what we want in printed logs and saved JSON."""
     def _g(d, k, default=float("nan")):
         v = d.get(k, default)
@@ -228,14 +223,6 @@ def _combine_eval_summary(fold_m: Dict, anchor_m: Dict) -> Dict:
             "frequent_auc": _g(fold_m, "frequent_auc"),
             "n_files": int(fold_m.get("n_files", 0) or 0),
             "n_windows": int(fold_m.get("n_windows", 0) or 0),
-        },
-        "v_anchor": {
-            "macro_auc": _g(anchor_m, "macro_auc"),
-            "site_auc_std": _g(anchor_m, "site_auc_std"),
-            "rare_auc": _g(anchor_m, "rare_auc"),
-            "frequent_auc": _g(anchor_m, "frequent_auc"),
-            "n_files": int(anchor_m.get("n_files", 0) or 0),
-            "n_windows": int(anchor_m.get("n_windows", 0) or 0),
         },
     }
 
@@ -284,9 +271,11 @@ def train_one_fold(cfg: dict, fold: int | None, dry_run_steps: int = 0) -> dict:
     else:
         loss_fn = build_loss("bce_posw", label_smoothing=float(cfg["label_smoothing"]))
 
-    # Dataset / loader
+    # Dataset / loader. With V-anchor abandoned, training pool is every
+    # labeled non-val-fold soundscape file.
+    n_splits = int(cfg.get("n_splits", 5))
     dataset = SEDTrainDataset(
-        fold=fold, exclude_v_anchor=True,
+        fold=fold, n_splits=n_splits,
         soundscape_fraction=float(cfg["soundscape_fraction"]),
         first_window_prob=float(cfg["first_window_prob"]),
         window_seconds=int(cfg["window_seconds"]),
@@ -400,24 +389,23 @@ def train_one_fold(cfg: dict, fold: int | None, dry_run_steps: int = 0) -> dict:
                 print(f"[sed:{cfg['name']} f{fold}] step={step} loss={loss.item():.4f} "
                       f"lr={opt.param_groups[0]['lr']:.2e}")
 
-            # Periodic eval (rank 0 only): fold-val + V-anchor
+            # Periodic eval (rank 0 only): fold-val only. V-anchor was
+            # abandoned — see plan file. Best checkpoint = highest
+            # fold_val.macro_auc minus site_auc_std penalty.
             if _is_main(rank) and step > 0 and step % int(cfg["eval_every_n_steps"]) == 0:
                 saved = ema.copy_to(model_raw)
-                fold_m = _fold_val_eval(model_raw, device, fold)
-                anchor_m = _v_anchor_eval(model_raw, device)
+                fold_m = _fold_val_eval(model_raw, device, fold, n_splits=n_splits)
                 ema.restore(model_raw, saved)
-                summary = _combine_eval_summary(fold_m, anchor_m)
+                summary = _combine_eval_summary(fold_m)
                 last_eval = summary
-                a_mauc = summary["v_anchor"]["macro_auc"]
-                a_std = summary["v_anchor"]["site_auc_std"] or 0.0
-                primary = (a_mauc - 1.0 * a_std) if not math.isnan(a_mauc) else float("-inf")
+                f_mauc = summary["fold_val"]["macro_auc"]
+                f_std = summary["fold_val"]["site_auc_std"] or 0.0
+                primary = (f_mauc - 1.0 * f_std) if not math.isnan(f_mauc) else float("-inf")
                 print(
                     f"[sed:{cfg['name']} f{fold}] eval step={step}  "
-                    f"fold_val auc={summary['fold_val']['macro_auc']:.4f} "
+                    f"fold_val auc={f_mauc:.4f} "
                     f"(n={summary['fold_val']['n_files']} files)  "
-                    f"vanchor auc={a_mauc:.4f} "
-                    f"(n={summary['v_anchor']['n_files']} files)  "
-                    f"site_std={a_std:.4f}  primary={primary:.4f}"
+                    f"site_std={f_std:.4f}  primary={primary:.4f}"
                 )
                 if primary > best_primary:
                     best_primary = primary
@@ -430,30 +418,27 @@ def train_one_fold(cfg: dict, fold: int | None, dry_run_steps: int = 0) -> dict:
                                 "primary": primary},
                                best_path)
                     print(f"[sed:{cfg['name']} f{fold}] ↑ new best primary={primary:.4f}  "
-                          f"(v_anchor={a_mauc:.4f}, fold_val={summary['fold_val']['macro_auc']:.4f})")
+                          f"(fold_val={f_mauc:.4f})")
             step += 1
             if dry_run_steps and step >= dry_run_steps:
                 break
         if dry_run_steps and step >= dry_run_steps:
             break
 
-    # Final eval + save (full file count for both splits)
+    # Final eval + save (full file count for fold val)
     if _is_main(rank):
         saved = ema.copy_to(model_raw)
-        fold_m = _fold_val_eval(model_raw, device, fold, max_files=0)
-        anchor_m = _v_anchor_eval(model_raw, device, max_files=0)
+        fold_m = _fold_val_eval(model_raw, device, fold, n_splits=n_splits, max_files=0)
         ema.restore(model_raw, saved)
-        summary = _combine_eval_summary(fold_m, anchor_m)
-        a_mauc = summary["v_anchor"]["macro_auc"]
-        a_std = summary["v_anchor"]["site_auc_std"] or 0.0
-        final_primary = (a_mauc - 1.0 * a_std) if not math.isnan(a_mauc) else float("-inf")
+        summary = _combine_eval_summary(fold_m)
+        f_mauc = summary["fold_val"]["macro_auc"]
+        f_std = summary["fold_val"]["site_auc_std"] or 0.0
+        final_primary = (f_mauc - 1.0 * f_std) if not math.isnan(f_mauc) else float("-inf")
         print(
             f"[sed:{cfg['name']} f{fold}] FINAL  "
-            f"fold_val auc={summary['fold_val']['macro_auc']:.4f} "
+            f"fold_val auc={f_mauc:.4f} "
             f"(n={summary['fold_val']['n_files']})  "
-            f"vanchor auc={a_mauc:.4f} "
-            f"(n={summary['v_anchor']['n_files']})  "
-            f"site_std={a_std:.4f}  primary={final_primary:.4f}"
+            f"site_std={f_std:.4f}  primary={final_primary:.4f}"
         )
         if final_primary > best_primary:
             best_primary = final_primary
@@ -473,10 +458,13 @@ def train_one_fold(cfg: dict, fold: int | None, dry_run_steps: int = 0) -> dict:
         print(f"[sed:{cfg['name']} f{fold}] DONE best_primary={best_primary:.4f} "
               f"runtime={(time.time()-t0)/60:.1f}m")
     _teardown_ddp(ddp)
+    # Caller side reads `metrics.global` for the sweep summary; we surface
+    # the fold_val summary there so a single-fold run produces a usable row
+    # in the sweep CSV (stitched OOF requires running all folds — see
+    # _03b_stitched_oof_sed.py).
     return {"metrics": {
-        "v_anchor": (last_eval or {}).get("v_anchor", {}),
         "fold_val": (last_eval or {}).get("fold_val", {}),
-        "global": (last_eval or {}).get("v_anchor", {}),
+        "global": (last_eval or {}).get("fold_val", {}),
         "per_fold": {},
     }}
 

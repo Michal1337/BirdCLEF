@@ -1,8 +1,8 @@
 # BirdCLEF 2026 — Strategy v2
 
-> **Status snapshot (2026-04-25)**: Legacy SSM notebook ([LB_093.ipynb](LB_093.ipynb)) at **0.92–0.93 public LB** (full-data trained, real). Single-fold SED at **0.738 public LB** despite v_anchor 0.89. Pseudo-label round 1 complete; SED 5-fold ensemble untested on LB. Soundscape memmap built; SED training infrastructure stable.
+> **Status snapshot (2026-04-25)**: Legacy SSM notebook ([LB_093.ipynb](LB_093.ipynb)) at **0.92–0.93 public LB** (full-data trained, real). Single-fold SED at **0.738 public LB** despite v_anchor 0.89; SED 5-fold ensemble at **0.747 public LB** with v_anchor 0.878. **V-anchor abandoned** — see §11 — replaced by stitched 5-fold OOF macro AUC over all 59 labeled soundscapes.
 >
-> **CRITICAL**: the 0.93 LB came from the *legacy* SSM stack (`lambda_prior=0.4`, `correction_weight=0.30`, `pca_dim=64`, adaptive smoothing + per-class threshold sharpening). The "cleaned" port in [birdclef/train/train_ssm_head.py](birdclef/train/train_ssm_head.py) (`lambda_prior=0`, `correction_weight=0`, `threshold=[0.5]`) has only been validated on OOF/V-anchor — **never on public LB**. Do not assume the two are interchangeable.
+> **CRITICAL**: the 0.93 LB came from the *legacy* SSM stack (`lambda_prior=0.4`, `correction_weight=0.30`, `pca_dim=64`, adaptive smoothing + per-class threshold sharpening). The "cleaned" port in [birdclef/train/train_ssm_head.py](birdclef/train/train_ssm_head.py) (`lambda_prior=0`, `correction_weight=0`, `threshold=[0.5]`) has only been validated on OOF — **never on public LB**. Do not assume the two are interchangeable.
 
 This supersedes [STRATEGY.md](STRATEGY.md). The pivot from v1: **SSM is the workhorse, SED is a candidate ensemble member, not a replacement.**
 
@@ -28,14 +28,14 @@ This supersedes [STRATEGY.md](STRATEGY.md). The pivot from v1: **SSM is the work
 
 ## 2. Honest current numbers
 
-| Pipeline | Train data | Honest V-anchor | Public LB |
+| Pipeline | Train data | Stitched OOF | Public LB |
 |---|---|---:|---:|
 | **SSM legacy ([LB_093.ipynb](LB_093.ipynb), prior=0.4, corr=0.30)** | all 59 labeled | not tracked | **0.92–0.93** |
-| SSM cleaned port (`train_ssm_head.py`, prior=0, corr=0) | all 59 labeled | 0.83 (proxy) | untested — do not assume = 0.93 |
-| SED fold 0 (round 1) | ~37 labeled + train_audio + pseudo | 0.89 | **0.738** |
-| SED 5-fold ensemble (round 1) | per-fold | mean 0.865 | untested, project ~0.75–0.78 |
-| SSM legacy + SED 5-fold blend | as above | untested | **target 0.93–0.95** |
-| + Pseudo round 2 SED | + better pseudo-labels | untested | target 0.94–0.96 |
+| SSM cleaned port (`train_ssm_head.py`, prior=0, corr=0) | all 59 labeled | 0.83 (legacy v_anchor proxy; rerun under stitched OOF pending) | untested — do not assume = 0.93 |
+| SED fold 0 (round 1) | ~37 labeled + train_audio + pseudo | (rerun pending) | **0.738** |
+| SED 5-fold ensemble (round 1) | per-fold | (rerun pending; old v_anchor 0.878) | **0.747** |
+| SSM legacy + SED 5-fold blend | as above | (rerun pending) | **target 0.93–0.95** |
+| + Pseudo round 2 SED | + better pseudo-labels | (rerun pending) | target 0.94–0.96 |
 
 The honest ceiling for "what we can ship without major work" is roughly **0.93–0.95**. Beyond that needs a different backbone or many more pseudo rounds.
 
@@ -217,3 +217,22 @@ This is the load-bearing artifact. Knobs as inspected on 2026-04-25:
 | Per-class thresholds | Isotonic regression per class on first-pass OOF probs, then F1-grid search over `[0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70]`. Probabilities linearly sharpened around the per-class threshold. |
 
 The `submit` branch of CFG (cell 3) sets the n_epochs/patience/oof_n_splits values used in the pipeline call. The pipeline call in cell 25 also overrides some of those (e.g. ProtoSSM `lr=1e-3` instead of CFG's `8e-4`). When porting, preserve the **call-site** values, not the CFG defaults.
+
+## 11. V-anchor abandoned — switch to stitched 5/10-fold OOF
+
+**Why removed**: V-anchor scored each LB submission too poorly (0.89 → 0.738 single-fold; 0.878 → 0.747 ensemble — gaps of ~0.13 on a 156-row evaluation set). Three failure modes at this scale: (1) only 13 files × 12 windows = 156 evaluation rows so per-config noise was ±0.02; (2) holds out 28% of labeled data permanently — real cost in per-fold training data; (3) different distribution from public LB so the absolute number was biased even when the ranking was right.
+
+**Replacement**: file-level `StratifiedKFold` over all 59 fully-labeled soundscapes, stratified by each file's modal primary species. Folds materialized statically by [`birdclef.scripts._02_build_splits`](birdclef/scripts/_02_build_splits.py) — produces both `splits/folds_5_strat.parquet` and `splits/folds_10_strat.parquet`. Trainers / pseudo-labeler / evaluator pick via `--n-splits {5,10}`; default 5.
+
+**Why file-level (not site×month)**: site×month gives only ~10–20 unique groups → `GroupKFold(n_splits=10)` collapses to LOO at the group level and produces folds with 1–2 groups (very high variance). Top BirdCLEF solutions ([2025 winner](https://www.youtube.com/watch?v=jivW1JBxV8s)) use stratified-by-primary-species rather than strict site separation. Site-leakage worry is low for our data: train_soundscapes and test_soundscapes both come from Pantanal — likely same eco-region, so site-typical features probably help test performance.
+
+**New primary metric**: stitched OOF macro AUC = concatenate each fold's val predictions → one global `compute_stage_metrics` call. 59 × 12 = 708 evaluation rows (4.5× the V-anchor sample) and uses 100% of labeled data for evaluation, 80% (5-fold) or 90% (10-fold) per-fold training.
+
+**Decision rules** (replaces §5):
+- **Use 5-fold for the broad sweep** (cheap_wins, hyperparameter exploration). 23 SED configs × 5 folds = 115 runs.
+- **Use 10-fold for finalist re-validation** of the top 3–5 configs from the 5-fold sweep. Tighter ranking, less bias toward "all-data model performance."
+- **For SED**: per-fold trainer selects on `fold_val.macro_auc - site_auc_std`. After all folds done, run [`birdclef.scripts._03b_stitched_oof_sed`](birdclef/scripts/_03b_stitched_oof_sed.py) to compute the stitched-OOF metric for the config.
+- **For SSM sweeps**: `_07_oof_sweep` already produces stitched OOF via `train_ssm_head.run_full_evaluation` — just sort the summary CSV by `macro_auc` (= stitched OOF).
+- **For blend search**: use [`_07b_dump_oof_probs`](birdclef/scripts/_07b_dump_oof_probs.py) to dump SSM + SED stitched-OOF probs aligned over all 708 rows, then existing `_08_ensemble.py` runs the weight grid.
+- **No V-anchor decision thresholds** — the historical 0.78/0.85 V-anchor cutoffs are obsolete.
+- **LB still beats local for absolute calibration**: at this data scale, even stitched OOF noise is non-trivial. Use it to avoid catastrophic regressions and to rank, not to fine-tune the last 0.005 — that lives in LB submissions.

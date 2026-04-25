@@ -1,8 +1,9 @@
-"""Perch + SSM head trainer (site×date fold-safe).
+"""Perch + SSM head trainer (file-level StratifiedKFold).
 
 Uses the regenerated Perch cache + fold assignment parquet. Exposes
-`run_pipeline(cfg, ...)` that trains/evaluates one config over CV folds AND
-on the V-anchor. Suitable for direct use by the sweep runner.
+`run_full_evaluation(cfg)` that trains/evaluates one config over CV folds
+and returns stitched-OOF macro AUC as the primary metric (V-anchor was
+abandoned). Suitable for direct use by the sweep runner.
 """
 from __future__ import annotations
 
@@ -19,14 +20,13 @@ from sklearn.neural_network import MLPClassifier
 from sklearn.preprocessing import StandardScaler
 
 from birdclef.config.paths import (
-    FOLDS_PQ,
     N_WINDOWS,
     PERCH_LABELS,
     PERCH_META,
     PERCH_NPZ,
 )
 from birdclef.data.soundscapes import primary_labels
-from birdclef.data.splits import load_v_anchor
+from birdclef.data.splits import load_folds
 from birdclef.eval.metrics import compute_stage_metrics, split_rare_frequent
 from birdclef.models.losses import build_loss
 from birdclef.models.ssm import (
@@ -428,7 +428,7 @@ def run_pipeline_for_split(
 
 
 def run_full_evaluation(cfg: dict) -> Dict:
-    """Runs fold-safe OOF + V-anchor for one config. Returns sweep-runner result."""
+    """Runs fold-safe stitched OOF for one config. Returns sweep-runner result."""
     base_seed = int(cfg.get("seed", 42))
     seed_everything(base_seed)
     cache = load_perch_cache()
@@ -453,11 +453,12 @@ def run_full_evaluation(cfg: dict) -> Dict:
     support = cache_Y.sum(axis=0)
     rare_idx, freq_idx = split_rare_frequent(support)
 
-    # OOF by site×date fold
-    folds = pd.read_parquet(FOLDS_PQ)
+    # OOF by file-level StratifiedKFold (n_splits configurable per cfg)
+    n_splits_cfg = int(cfg.get("n_splits", 5))
+    folds = load_folds(n_splits=n_splits_cfg)
     fold_of = dict(zip(folds["filename"], folds["fold"].astype(int)))
     row_fold = cache_meta["filename"].map(fold_of).fillna(-1).astype(int).to_numpy()
-    n_splits = int(folds["fold"].max()) + 1 if len(folds) else 5
+    n_splits = int(folds["fold"].max()) + 1 if len(folds) else n_splits_cfg
 
     oof_final = np.zeros_like(cache_Y, dtype=np.float32)
     oof_fp = np.zeros_like(cache_Y, dtype=np.float32)
@@ -489,35 +490,17 @@ def run_full_evaluation(cfg: dict) -> Dict:
     m_global_fp = compute_stage_metrics(cache_Y[oof_keep], oof_fp[oof_keep], keep_meta,
                                         rare_idx=rare_idx, frequent_idx=freq_idx)
     m_global_final["first_pass_auc"] = m_global_fp.get("macro_auc", float("nan"))
+    print(f"[ssm] stitched-OOF  final={m_global_final['macro_auc']:.4f}  "
+          f"first_pass={m_global_fp['macro_auc']:.4f}  "
+          f"site_std={m_global_final['site_auc_std']:.4f}")
 
-    # V-anchor: train on everything not in anchor, predict on anchor.
-    anchor_files = set(load_v_anchor())
-    v_mask = cache_meta["filename"].isin(anchor_files).to_numpy()
-    v_metrics_final = {}
-    v_metrics_fp = {}
-    if v_mask.any():
-        tr = np.where(~v_mask)[0]
-        va = np.where(v_mask)[0]
-        seed_everything(base_seed + 1000)
-        out = run_pipeline_for_split(cache_sub, tr, va, cfg, temperatures)
-        va_meta = cache_meta.iloc[va].reset_index(drop=True)
-        v_metrics_final = compute_stage_metrics(cache_Y[va], out["final"], va_meta,
-                                                rare_idx=rare_idx, frequent_idx=freq_idx)
-        v_metrics_fp = compute_stage_metrics(cache_Y[va], out["first_pass"], va_meta,
-                                             rare_idx=rare_idx, frequent_idx=freq_idx)
-        v_metrics_final["first_pass_auc"] = v_metrics_fp.get("macro_auc", float("nan"))
-        print(f"[ssm] V-anchor  final={v_metrics_final['macro_auc']:.4f}  "
-              f"first_pass={v_metrics_fp['macro_auc']:.4f}  "
-              f"site_std={v_metrics_final['site_auc_std']:.4f}")
     return {
         "metrics": {
-            # Stage selected for sweep ranking = final. `first_pass_auc` is
-            # surfaced alongside so you can inspect post-processing delta.
+            # Stage selected for sweep ranking = final stitched OOF.
+            # `first_pass_auc` is surfaced alongside so you can inspect the
+            # post-processing delta. Per-fold dict is informational.
             "global": m_global_final,
             "per_fold": per_fold,
-            "v_anchor": v_metrics_final,
-            # Full first-pass metric objects if you need every subgroup.
             "global_first_pass": m_global_fp,
-            "v_anchor_first_pass": v_metrics_fp,
         }
     }

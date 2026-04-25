@@ -147,14 +147,16 @@ def macro_auc(y_true, y_score):
     return roc_auc_score(y_true[:, keep], y_score[:, keep], average="macro")
 
 
-NEW_FOLDS_PQ = Path("birdclef/splits/folds_site_date.parquet")
-NEW_VANCHOR_TXT = Path("birdclef/splits/v_anchor_files.txt")
+# Updated to consume the new file-level StratifiedKFold parquet from
+# birdclef.scripts._02_build_splits. V-anchor was abandoned — anchor set is
+# always empty now (kept in the return tuple for legacy call-sites).
+NEW_FOLDS_PQ = Path("birdclef/splits/folds_5_strat.parquet")
 _NEW_FOLDS_CACHE = {"loaded": False, "map": None, "n": None, "anchor": None}
 
 
 def _load_new_fold_map():
     """Return (filename -> fold, n_folds, anchor_filenames) from the new
-    site×date split parquet. Returns (None, None, None) if the parquet is
+    file-level split parquet. Returns (None, None, None) if the parquet is
     absent so callers can fall back to GroupKFold(filename)."""
     if _NEW_FOLDS_CACHE["loaded"]:
         return _NEW_FOLDS_CACHE["map"], _NEW_FOLDS_CACHE["n"], _NEW_FOLDS_CACHE["anchor"]
@@ -165,14 +167,12 @@ def _load_new_fold_map():
     folds_df = pd.read_parquet(NEW_FOLDS_PQ)
     fmap = dict(zip(folds_df["filename"].astype(str), folds_df["fold"].astype(int)))
     n_folds = int(folds_df["fold"].max()) + 1 if len(folds_df) else 0
-    anchor = set()
-    if NEW_VANCHOR_TXT.exists():
-        anchor = {ln.strip() for ln in NEW_VANCHOR_TXT.read_text(encoding="utf-8").splitlines() if ln.strip()}
+    anchor: set = set()  # V-anchor abandoned — kept as empty set for legacy callers
     _NEW_FOLDS_CACHE["map"] = fmap
     _NEW_FOLDS_CACHE["n"] = n_folds
     _NEW_FOLDS_CACHE["anchor"] = anchor
-    print(f"[folds] using site×date splits from {NEW_FOLDS_PQ} "
-          f"(n_folds={n_folds}, non_anchor_files={len(fmap)}, v_anchor={len(anchor)})")
+    print(f"[folds] using file-level StratifiedKFold from {NEW_FOLDS_PQ} "
+          f"(n_folds={n_folds}, files={len(fmap)})")
     return fmap, n_folds, anchor
 
 

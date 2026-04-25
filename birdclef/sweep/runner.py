@@ -30,12 +30,15 @@ def _config_hash(cfg: dict) -> str:
 
 
 def _extract_summary_row(name: str, cfg: dict, result: dict, path: Path) -> dict:
-    """Flatten a stage-fn result into the lean CSV schema."""
+    """Flatten a stage-fn result into the lean CSV schema.
+
+    Primary metric = stitched-OOF macro AUC minus site_auc_std penalty.
+    `mean_oof_auc` is the unweighted mean of per-fold AUCs (informational —
+    higher variance than the stitched metric, included for inspection).
+    """
     metrics = result.get("metrics", {}) or {}
     m_global = metrics.get("global", metrics) or {}
-    m_vanchor = metrics.get("v_anchor", {}) or {}
     m_global_fp = metrics.get("global_first_pass", {}) or {}
-    m_vanchor_fp = metrics.get("v_anchor_first_pass", {}) or {}
     per_fold = metrics.get("per_fold", {}) or {}
     if per_fold:
         def _fold_auc(v):
@@ -46,21 +49,14 @@ def _extract_summary_row(name: str, cfg: dict, result: dict, path: Path) -> dict
         mean_oof = float(np.mean([_fold_auc(v) for v in per_fold.values()]))
     else:
         mean_oof = float(m_global.get("macro_auc", float("nan")))
-    v_auc = float(m_vanchor.get("macro_auc", float("nan"))) if m_vanchor else float("nan")
     site_std = float(m_global.get("site_auc_std", 0.0))
-    if not np.isnan(v_auc):
-        primary = v_auc - 1.0 * (site_std or 0.0)
-    else:
-        primary = primary_score(m_global, std_penalty=1.0)
+    primary = primary_score(m_global, std_penalty=1.0)
     fp_global = float(m_global_fp.get("macro_auc", m_global.get("first_pass_auc", float("nan"))))
-    fp_vanchor = float(m_vanchor_fp.get("macro_auc", m_vanchor.get("first_pass_auc", float("nan"))))
     return {
         "config_name": name,
         "primary": primary,
         "macro_auc": m_global.get("macro_auc", float("nan")),
         "first_pass_auc": fp_global,
-        "v_anchor_auc": v_auc,
-        "v_anchor_first_pass_auc": fp_vanchor,
         "site_auc_std": site_std,
         "mean_oof_auc": mean_oof,
         "rare_auc": m_global.get("rare_auc", float("nan")),

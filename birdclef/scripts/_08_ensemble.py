@@ -1,7 +1,8 @@
 """Build ensemble from a set of probability-member files and persist a recipe.
 
-Each member is a .npz with keys {probs: (N_rows, C)} aligned to the V-anchor
-rows. Quick sanity: expects a y_true.npy and a meta.parquet siblings.
+Each member is a .npz with keys {probs: (N_rows, C)} aligned to the
+stitched-OOF rows (all labeled soundscape windows in canonical order).
+Quick sanity: expects a y_true.npy and a meta.parquet siblings.
 """
 from __future__ import annotations
 
@@ -20,7 +21,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--members", nargs="+", required=True,
                     help="List of .npz files with a 'probs' array")
-    ap.add_argument("--y-true", required=True, help=".npy of V-anchor labels")
+    ap.add_argument("--y-true", required=True,
+                    help=".npy of stitched-OOF labels (all labeled soundscape rows)")
     ap.add_argument("--meta", required=True, help=".parquet with site/hour_utc columns")
     ap.add_argument("--blend", default="sigmoid", choices=["sigmoid", "rank"])
     ap.add_argument("--step", type=float, default=0.1)

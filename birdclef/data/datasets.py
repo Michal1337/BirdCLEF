@@ -7,10 +7,10 @@ mask without special-casing pseudo vs GT samples.
 
 When `pseudo_round` is set, cache/pseudo/round{N}/ is opened and its soft
 targets replace (or merge with) the ground-truth soundscape labels:
-    - labeled non-anchor soundscape → target = max(GT, pseudo)  (2024 #2 recipe)
-    - unlabeled soundscape         → target = pseudo,  mask = keep_mask
-    - V-anchor soundscape          → excluded from the training pool
-    - train_audio                   → unchanged (GT multi-hot, mask = all ones)
+    - labeled soundscape (non-val-fold) → target = max(GT, pseudo)
+    - unlabeled soundscape              → target = pseudo,  mask = keep_mask
+    - train_audio                       → unchanged (GT multi-hot, mask = all ones)
+The val fold (if `fold` is provided) is held out from training.
 
 InferenceDataset: streams 60 s soundscape OGGs from disk for final prediction.
 """
@@ -127,15 +127,15 @@ class SEDTrainDataset(Dataset):
     def __init__(
         self,
         fold: Optional[int] = None,
-        exclude_v_anchor: bool = True,
         soundscape_fraction: float = 0.5,
         first_window_prob: float = 0.7,
         window_seconds: int = 5,
         include_secondary: bool = True,
         pseudo_round: Optional[int] = None,
+        n_splits: int = 5,
         seed: int = 42,
     ):
-        from birdclef.data.splits import load_folds, load_v_anchor
+        from birdclef.data.splits import load_folds
         from birdclef.data.train_audio import build_train_audio_labels, load_train_audio_meta
 
         self.win = window_seconds * SR
@@ -160,14 +160,13 @@ class SEDTrainDataset(Dataset):
 
         self._n_classes = len(label_to_idx())
 
-        # Labeled soundscape pool (window-level GT)
+        # Labeled soundscape pool (window-level GT). With V-anchor abandoned,
+        # the only filtering is by fold (if provided): hold out the val fold,
+        # train on the other n-1 folds.
         sc = load_soundscape_meta()
         sc = sc[sc["fully_labeled"]]
-        anchor = set(load_v_anchor()) if exclude_v_anchor else set()
-        if exclude_v_anchor:
-            sc = sc[~sc["filename"].isin(anchor)]
         if fold is not None:
-            folds_df = load_folds()
+            folds_df = load_folds(n_splits=int(n_splits))
             fold_of = dict(zip(folds_df["filename"], folds_df["fold"].astype(int)))
             keep_filenames = {fn for fn, fld in fold_of.items() if fld != int(fold)}
             sc = sc[sc["filename"].isin(keep_filenames)]
@@ -190,15 +189,9 @@ class SEDTrainDataset(Dataset):
             self._pseudo_info = info
 
             # Soundscape pool grows to include every file covered by the
-            # pseudo-label cache, minus V-anchor files (held out for eval).
-            # We use .get + flag to skip V-anchor even if exclude_v_anchor is False.
-            if "is_v_anchor" in meta.columns:
-                va_mask_per_file = meta.groupby("filename")["is_v_anchor"].max()
-                eligible_files = va_mask_per_file[va_mask_per_file == 0].index.astype(str).tolist()
-            else:
-                eligible_files = sorted(file_to_start.keys())
-                if exclude_v_anchor:
-                    eligible_files = [f for f in eligible_files if f not in anchor]
+            # pseudo-label cache. With V-anchor gone, every file in the
+            # pseudo cache that isn't in the labeled GT pool is eligible.
+            eligible_files = sorted(file_to_start.keys())
             labeled_set = set(labeled_sc_files)
             unlabeled_sc_files = [f for f in eligible_files if f not in labeled_set]
 

@@ -72,8 +72,14 @@ SOUNDSCAPE_INDEX = SOUNDSCAPE_CACHE_DIR / "soundscapes_index.parquet"
 
 PSEUDO_DIR = CACHE_ROOT / "pseudo"
 
-FOLDS_PQ = SPLIT_ROOT / "folds_site_date.parquet"
-VANCHOR = SPLIT_ROOT / "v_anchor_files.txt"
+def folds_path(n_splits: int) -> Path:
+    """Path to the static StratifiedKFold parquet for `n_splits` folds.
+
+    Materialized by `python -m birdclef.scripts._02_build_splits`.
+    Both 5-fold and 10-fold variants live alongside each other; downstream
+    scripts pick via `--n-splits`.
+    """
+    return SPLIT_ROOT / f"folds_{int(n_splits)}_strat.parquet"
 
 SUBMIT_DIR = OUTPUT_ROOT / "submit"
 

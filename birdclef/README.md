@@ -17,7 +17,7 @@ the old `birdclef_example/`. Two worlds kept strictly apart:
 | [config/pp_configs.py](config/pp_configs.py) | Post-processing-only sweep grids. |
 | [data/soundscapes.py](data/soundscapes.py) | Parse `train_soundscapes_labels.csv` → per-window metadata + filename regex (site, date, hour). |
 | [data/train_audio.py](data/train_audio.py) | Parse `train.csv`, multi-hot label matrix, rare/frequent class support. |
-| [data/splits.py](data/splits.py) | Build site×date GroupKFold + V-anchor hold-out; persist to `splits/`. |
+| [data/splits.py](data/splits.py) | File-level StratifiedKFold (5 + 10) over all 59 labeled soundscapes; persist to `splits/`. |
 | [data/datasets.py](data/datasets.py) | `SEDTrainDataset` (memmap reader), `InferenceDataset` (OGG streamer). |
 | [data/augment.py](data/augment.py) | `SpecAugment`, `WaveformAug`, `mixup(max)`, `background_mix`. |
 | [models/losses.py](models/losses.py) | `FocalBCE`, `BCEFocalMean`, `BCEPosWeight`. Secondary-label masking. |
@@ -27,8 +27,7 @@ the old `birdclef_example/`. Two worlds kept strictly apart:
 | [cache/build_perch_cache.py](cache/build_perch_cache.py) | Regenerate `cache/perch/{meta.parquet,arrays.npz,labels.npy,proxy_map.json}`. |
 | [cache/build_waveform_cache.py](cache/build_waveform_cache.py) | Decode `train_audio` → single memmap `.npy` (float16 32 kHz mono) + index parquet. |
 | [eval/metrics.py](eval/metrics.py) | Macro-AUC + per-site / per-hour / rare / frequent subgroup AUC. |
-| [eval/oof.py](eval/oof.py) | Generic fold-safe OOF runner. |
-| [eval/v_anchor.py](eval/v_anchor.py) | V-anchor scoring (primary selection metric). |
+| [eval/oof.py](eval/oof.py) | Generic fold-safe OOF runner; computes stitched-OOF macro AUC. |
 | [postproc/smoothing.py](postproc/smoothing.py) | Gaussian `[0.1,0.2,0.4,0.2,0.1]` + adaptive-delta smoothing. |
 | [postproc/boost.py](postproc/boost.py) | Hard soundscape-wide probability boost (2024 #1 trick). |
 | [postproc/tta.py](postproc/tta.py) | Sub-window waveform shift TTA (±1.25 s, ±2.5 s) + legacy window-roll. |
@@ -36,10 +35,10 @@ the old `birdclef_example/`. Two worlds kept strictly apart:
 | [sweep/runner.py](sweep/runner.py) | Generic sweep runner (resume, atomic CSV writes). |
 | [sweep/writer.py](sweep/writer.py) | Lean summary CSV + per-config JSON + hparams-diff CSV. |
 | [sweep/schema.py](sweep/schema.py) | Declares lean-CSV columns and rounding rules. |
-| [train/train_ssm_head.py](train/train_ssm_head.py) | Perch+SSM head trainer — fold-safe OOF + V-anchor eval. |
-| [train/train_sed_ddp.py](train/train_sed_ddp.py) | DDP SED trainer with EMA + AMP + periodic V-anchor eval. |
+| [train/train_ssm_head.py](train/train_ssm_head.py) | Perch+SSM head trainer — fold-safe stitched OOF (n_splits configurable). |
+| [train/train_sed_ddp.py](train/train_sed_ddp.py) | DDP SED trainer with EMA + AMP + periodic per-fold val eval. |
 | [train/pseudo_label.py](train/pseudo_label.py) | Teacher-SED ensemble → pseudo-labels for all soundscapes. |
-| [ensemble/blend.py](ensemble/blend.py) | Weighted/rank blending, weight search on V-anchor, correlation check. |
+| [ensemble/blend.py](ensemble/blend.py) | Weighted/rank blending, weight search on stitched-OOF probs, correlation check. |
 | [submit/inference_template.py](submit/inference_template.py) | Kaggle CPU inference pipeline (inlined into the notebook). |
 | [submit/build_notebook.py](submit/build_notebook.py) | Assemble `submission_bold.ipynb` / `submission_safe.ipynb`. |
 | [submit/export_onnx.py](submit/export_onnx.py) | Export trained SED checkpoint to ONNX (FP16 optional). |
@@ -55,7 +54,7 @@ birdclef/
 │   ├── perch/{meta.parquet, arrays.npz, labels.npy, proxy_map.json}
 │   ├── waveforms/{train_audio_f16_32k.npy, train_audio_index.parquet}
 │   └── pseudo/round{N}/{probs.npz, meta.parquet, info.json}
-├── splits/{folds_site_date.parquet, v_anchor_files.txt}
+├── splits/{folds_5_strat.parquet, folds_10_strat.parquet}
 ├── models_ckpt/
 │   └── sed/<name>/fold{k}/{best.pt, best.onnx, best.fp16.onnx, final_metrics.json}
 └── outputs/
@@ -97,13 +96,15 @@ python -m birdclef.scripts._01_build_caches --stage perch
 python -m birdclef.scripts._01_build_caches --stage waveform
 ```
 
-### 2 · Build site×date folds + V-anchor
+### 2 · Build static 5-fold + 10-fold splits
 
 ```bash
 python -m birdclef.scripts._02_build_splits
 ```
-Inspect the stratification summary it prints. Should show each site × hour-bucket
-present in both non-anchor and V-anchor columns.
+Outputs both `splits/folds_5_strat.parquet` and `splits/folds_10_strat.parquet`.
+Inspect the per-fold stratification summary it prints — should show every fold
+hosting a balanced share of common species (rare classes fall into a
+`_RARE_` bucket and distribute wherever they fit).
 
 ### 3 · Regression sanity — reproduce current 0.91 OOF with new splits
 
@@ -178,21 +179,33 @@ python -m torch.distributed.run --standalone --nproc_per_node=$N_GPUS \
     -m birdclef.scripts._06_train_sed_student \
     --config sed_v2s --fold 0 --pseudo-round 1
 ```
-Repeat for folds 1..4. Only go for round 2 if V-anchor macro-AUC improved
+Repeat for folds 1..4. Only go for round 2 if stitched-OOF macro-AUC improved
 by ≥ 0.003.
 
-### 9 · Ensemble weight search (on V-anchor predictions)
+### 8b · Stitched-OOF metric for the SED config
 
-Produce member prob files for each candidate (SSM pipeline + each SED fold).
-Then:
+Once all folds of a SED config are trained, compute the cross-fold stitched OOF:
 ```bash
+python -m birdclef.scripts._03b_stitched_oof_sed \
+    --config sed_v2s --n-splits 5
+```
+Writes `models_ckpt/sed/sed_v2s/stitched_oof_metrics.json` (macro AUC, per-site
+breakdown) + `stitched_oof_probs.npz` for the blend search below.
+
+### 9 · Ensemble weight search (on stitched-OOF predictions)
+
+```bash
+# Dump aligned SSM + SED member probs over all 59 labeled soundscape rows
+python -m birdclef.scripts._07b_dump_oof_probs \
+    --sed-folds-glob 'birdclef/models_ckpt/sed/sed_v2s/fold*/best.onnx'
+
+# Then weight search:
 python -m birdclef.scripts._08_ensemble \
-    --members  outputs/members/ssm_baseline.npz \
-              outputs/members/sed_v2s_fold0.npz \
-              outputs/members/sed_v2s_fold1.npz \
-    --y-true   outputs/members/v_anchor_y.npy \
-    --meta     outputs/members/v_anchor_meta.parquet \
-    --blend    sigmoid \
+    --members  outputs/blend_search/oof/ssm_probs.npz \
+              outputs/blend_search/oof/sed_probs.npz \
+    --y-true   outputs/blend_search/oof/y_true.npy \
+    --meta     outputs/blend_search/oof/meta.parquet \
+    --blend    sigmoid --step 0.05 \
     --out      outputs/sweep/ensemble_final/best.json
 ```
 
@@ -229,7 +242,7 @@ first; escalate to bold only after a clean run.
 ## Troubleshooting
 
 - `FileNotFoundError: cache/perch/meta.parquet` → run step 1 first.
-- `RuntimeError: V-anchor file is empty` → run step 2 first.
+- `FileNotFoundError: folds_5_strat.parquet` (or `_10_strat`) → run step 2 first.
 - `MemoryError` from waveform cache → not enough RAM. Rerun with
   `BIRDCLEF_CACHE_ROOT=<fast SSD>` and accept page-cache speed instead of
   true RAM.

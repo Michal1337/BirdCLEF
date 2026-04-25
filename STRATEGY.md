@@ -116,14 +116,15 @@ One extra dataset trick recommended across 2021–22 writeups: download and hand
 Final‑submission deadline is **2026‑06‑03**; entry deadline **2026‑05‑27**. ~5–6 weeks from today (2026‑04‑23).
 
 ### Week 1 (now → 2026‑04‑30): validation & cheap wins
-- [ ] Change GroupKFold groups from `filename` to `site|date_block` in [sota_oof_two_pass_ssm_advanced_pp.py](birdclef_example/sota_oof_two_pass_ssm_advanced_pp.py). Re‑run the current sweep, record the new baseline OOF.
-- [ ] Build the **V‑anchor**: 15 % site‑stratified hold‑out of labeled `train_soundscapes`. Persist the file list to `data/v_anchor_files.txt` and assert it's excluded everywhere.
-- [ ] Extend metrics JSON with per‑site, per‑hour, rare/frequent subgroup AUC.
-- [ ] Wire the already‑declared `focal_gamma` into the ProtoSSM loss — replace BCE+pos_weight with FocalBCE. A/B on V‑anchor.
-- [ ] Add sub‑window TTA (±1.25 s, ±2.5 s waveform shifts *before* Perch), compare vs current window‑rolling TTA.
-- [ ] Add Gaussian kernel `[0.1,0.2,0.4,0.2,0.1]` smoothing and hard soundscape‑wide probability boost as post‑processing variants. A/B on V‑anchor.
+> **2026-04-25 update**: V-anchor was abandoned after empirical LB calibration failed (see [STRATEGY_V2.md](STRATEGY_V2.md) §11). All A/B testing below now runs against **stitched 5-fold OOF macro AUC** built by `_02_build_splits.py` — file-level `StratifiedKFold` over all 59 labeled soundscapes, no permanent hold-out.
+- [x] Change GroupKFold groups from `filename` to `site|date_block` (later replaced again by file-level StratifiedKFold — see V2).
+- [x] V-anchor was built as a permanent stratified hold-out, then removed. Now folds 0..n−1 are the only validation infrastructure.
+- [x] Extend metrics JSON with per‑site, per‑hour, rare/frequent subgroup AUC.
+- [x] Wire the already‑declared `focal_gamma` into the ProtoSSM loss — replace BCE+pos_weight with FocalBCE. A/B on stitched OOF.
+- [x] Add sub‑window TTA (±1.25 s, ±2.5 s waveform shifts *before* Perch), compare vs current window‑rolling TTA.
+- [x] Add Gaussian kernel `[0.1,0.2,0.4,0.2,0.1]` smoothing and hard soundscape‑wide probability boost as post‑processing variants. A/B on stitched OOF.
 - [ ] Measure end‑to‑end CPU runtime on a full 60‑file synthetic test. Record headroom vs 90 min.
-- [ ] Make one baseline submission with the V‑anchor‑selected config to establish LB↔V‑anchor calibration.
+- [x] Make one baseline submission to establish LB↔local calibration. (Result: legacy SSM = 0.93 LB; SED 5-fold = 0.747; gap is real.)
 
 ### Week 2–3 (2026‑05‑01 → 2026‑05‑14): trained SED backbone
 - [ ] Stand up a clean SED trainer on `train_audio` + labeled `train_soundscapes`. Start from [train_ddp_sota_perch.py](birdclef_example/train_ddp_sota_perch.py) as scaffold, target `tf_efficientnetv2_s_in21k` SED head.

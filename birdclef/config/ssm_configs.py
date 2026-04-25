@@ -3,8 +3,9 @@
 Each config is merged with BASELINE. The hparams-diff CSV auto-drops fields
 that are constant across the sweep — so you only see the knobs that move.
 
-Current BASELINE winners (from cheap_wins):
-    baseline: v_anchor=0.8730, site_std=0.1212, macro_oof=0.9160, primary=0.7518
+Current BASELINE numbers (legacy v_anchor era; rerun under stitched OOF when
+the new metric is the primary ranker):
+    baseline: site_std=0.1212, macro_oof=0.9160
 Findings carried forward:
     loss="focal_bce"    (beats bce_posw and bce_focal_mean)
     tta="window_roll"   (beats waveform_shift at 46-file scale)
@@ -74,6 +75,67 @@ def _make(**kwargs):
 
 
 SWEEP_BASELINE = [_make(name="baseline")]
+
+
+# ── LB_093 port ────────────────────────────────────────────────────────────
+# Exact knobs from LB_093.ipynb (the load-bearing 0.93 LB notebook), mapped
+# onto our config surface. See STRATEGY_V2.md §10 for the full reference
+# table. Only fields where LB_093 differs from BASELINE are listed below;
+# everything else (focal_alpha, label_smoothing, mlp_alpha_blend, etc.)
+# inherits from BASELINE since the LB_093 values match.
+#
+# Knobs that DO NOT MAP onto our current surface (silently dropped):
+#   - mixup_alpha=0.4  (ProtoSSM training-time mixup; not exposed)
+#   - use_cosine_restart=True, restart_period=20
+#   - proto_margin=0.15, val_ratio=0.15  (internal ProtoSSM regulariser)
+# If sweeping shows LB_093 substantially beats BASELINE on stitched OOF,
+# wire these into models/ssm.py and re-add them here.
+LB_093 = _make(
+    name="lb_093_port",
+    # Site/hour prior: LB_093 lifts raw Perch logits with a 0.4-weighted
+    # log-odds shift. BASELINE has prior=0 since it hurt v_anchor (which we
+    # now know was a misleading metric).
+    lambda_prior=0.4,
+    # ResidualSSM: LB_093 trains it and applies at correction_weight=0.30.
+    # BASELINE neutralised it (=0) for the same v_anchor reason.
+    correction_weight=0.30,
+    # Loss: LB_093 uses BCE + focal combo with focal_gamma=2.5. Closest
+    # match in our registry is `bce_focal_mean` (50/50 BCE+Focal, 2024 #2).
+    loss="bce_focal_mean",
+    focal_gamma=2.5,
+    # MLP probes: LB_093 uses smaller PCA but same alpha_blend / min_pos.
+    mlp_pca_dim=64,
+    # Post-processing: LB_093 chains
+    #   file_confidence_scale(top_k=2, power=0.4)
+    #   rank_aware_scaling(power=0.4)
+    #   adaptive_delta_smooth(base_alpha=0.20)
+    #   apply_per_class_thresholds (isotonic + grid [0.25..0.70])
+    # No "hard soundscape boost" — that's a different 2024-winner trick we
+    # added under our `use_boost`. LB_093 doesn't use it.
+    smoothing="adaptive",
+    smoothing_alpha=0.20,
+    use_boost=False,
+    threshold_grid=(0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70),
+    # Training schedules: LB_093 ProtoSSM call site overrides cfg defaults
+    # to n_epochs=40, lr=1e-3, patience=8 (cell 25). ResidualSSM call site
+    # uses n_epochs=30, lr=1e-3, patience=8.
+    proto_n_epochs=40,
+    proto_lr=1e-3,
+    proto_patience=8,
+    residual_n_epochs=30,
+    residual_lr=1e-3,
+    residual_patience=8,
+)
+
+
+# Direct A/B: LB_093 port vs current BASELINE under the new stitched-OOF
+# metric. If LB_093 wins by ≥0.005 on stitched-OOF, the prior=0/corr=0
+# cleanups were genuinely a regression and we should ship the LB_093 port
+# as the new baseline. If they tie, BASELINE is preferred (simpler).
+SWEEP_LB_093 = [
+    _make(name="baseline"),
+    LB_093,
+]
 
 
 SWEEP_CHEAP_WINS = [

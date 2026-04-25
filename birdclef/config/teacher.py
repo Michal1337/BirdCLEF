@@ -59,10 +59,11 @@ TEACHER_V0 = dict(
     name="ssm_pca128_teacher",
 )
 
-# Multi-seed ensemble — averages out the ±0.02 seed variance we measured on
-# V-anchor AUC. Each seed trains its own SSM pipeline on the non-anchor
-# labeled rows and runs inference on every soundscape file; the final
-# pseudo-label is the mean across seeds.
+# Multi-seed ensemble — averages out the ±0.02 seed variance we previously
+# measured on V-anchor AUC (now expected to be smaller under stitched-OOF
+# but still non-zero). Each seed trains its own SSM pipeline on ALL labeled
+# rows (V-anchor was abandoned) and runs inference on every soundscape file;
+# the final pseudo-label is the mean across seeds.
 TEACHER_V0_SEEDS = (42, 7, 13)
 TEACHER_V0_NAME = "ssm_pca128_ens3"
 

@@ -1,42 +1,39 @@
-"""SOTA timm-spectrogram trainer — site×date 5-fold + V-anchor variant.
+"""SOTA timm-spectrogram trainer — file-level 5/10-fold variant.
 
-This is `train_ddp_sota.py` with two surgical changes:
+This is `train_ddp_sota.py` with one surgical change:
 
-  1. The leaky GroupShuffleSplit-by-filename for the train/val cut is replaced
-     by `birdclef.data.splits.load_folds()` (site×date GroupKFold) so the same
-     site can't appear in train and val at once. The historical 0.84 LB was
-     produced with the leaky split — V-anchor + a clean 5-fold tells us
-     whether that number was real signal or a CV artefact.
-  2. Every epoch additionally evaluates on the permanent V-anchor
-     (`load_v_anchor()`), in PARALLEL to the per-fold val. V-anchor is the
-     cross-fold-stable yardstick; per-fold val tracks OOF generalization
-     within the non-anchor pool. We save the checkpoint that maximises the
-     V-anchor mapped AUC (NOT the per-fold AUC) — V-anchor correlates better
-     with LB at this scale.
+  The leaky GroupShuffleSplit-by-filename for the train/val cut is replaced
+  by `birdclef.data.splits.load_folds(n_splits)` — file-level StratifiedKFold
+  by primary species over all 59 fully-labeled soundscapes (no V-anchor).
+  Per-fold val is the only validation signal; the cross-fold stitched OOF
+  metric is computed at the end of an `--all-folds` run and appended to the
+  experiments_summary.csv as the new ranking column.
 
 Everything else (architecture, loss, augmentations, optimizer, sweep grid)
 is imported from `train_ddp_sota.py` verbatim. If a hyperparameter changes
 upstream, this file picks it up.
 
+V-anchor was dropped after the 0.747 SED LB result confirmed it didn't
+predict LB — see plan file. Selection metric per fold = `val_mapped_auc`.
+For ranking ACROSS configs, use the appended stitched-OOF column.
+
 Single-(exp, fold) invocation pattern matches `birdclef.scripts._03_train_sed`:
 
     torchrun --standalone --nproc_per_node=2 \\
-        -m birdclef_example.train_ddp_sota_5fold_vanchor \\
-        --exp sota01_nfnet_lr8e-04_1e-04 --fold 0
+        -m birdclef_example.train_ddp_sota_5fold \\
+        --exp sota11_nfnet_lr8e-04_1e-04 --fold 0
 
-Wrapping for all 5 folds:
+Wrapping for all 5 folds (the deep-dive after a no-arg sweep finds a winner):
 
-    for f in 0 1 2 3 4; do
-      torchrun --standalone --nproc_per_node=2 \\
-          -m birdclef_example.train_ddp_sota_5fold_vanchor \\
-          --exp sota01_nfnet_lr8e-04_1e-04 --fold $f
-    done
+    torchrun --standalone --nproc_per_node=2 \\
+        -m birdclef_example.train_ddp_sota_5fold \\
+        --exp sota11_nfnet_lr8e-04_1e-04 --all-folds
 
 Outputs:
-    birdclef_example/outputs/sota_5fold_vanchor/<exp_name>/fold{f}/
-        best_model.pt      # selected on V-anchor mapped AUC
+    birdclef_example/outputs/sota_5fold/<exp_name>/fold{f}/
+        best_model.pt      # selected on per-fold val_mapped_auc
         label_map.json
-        metrics.csv        # per-epoch history with both fold-val and v-anchor
+        metrics.csv        # per-epoch history (val_* columns only)
         summary.json
 """
 from __future__ import annotations
@@ -85,10 +82,10 @@ from birdclef_example.train_ddp_sota import (  # noqa: E402
     evaluate_validation_metrics,
     train_one_epoch_ddp,
 )
-from birdclef_example.utils import is_better_score, save_model, set_seed  # noqa: E402
+from birdclef_example.utils import birdclef_roc_auc, is_better_score, save_model, set_seed  # noqa: E402
 
 # New-package splits — the whole point of this file.
-from birdclef.data.splits import load_folds, load_v_anchor
+from birdclef.data.splits import load_folds
 
 
 def _select_experiments(name_filter: Optional[str]) -> List[Dict[str, Any]]:
@@ -112,41 +109,36 @@ def _select_experiments(name_filter: Optional[str]) -> List[Dict[str, Any]]:
 def _split_meta_by_fold(
     soundscape_meta: pd.DataFrame,
     folds_df: pd.DataFrame,
-    v_anchor_files: List[str],
     fold: int,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Carve soundscape_meta into (train, val, vanchor) row sets.
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Carve soundscape_meta into (train, val) row sets.
 
-    train   = labeled non-anchor rows where folds[filename] != fold
-    val     = labeled non-anchor rows where folds[filename] == fold
-    vanchor = rows whose filename is in v_anchor_files (independent of fold)
+    train = labeled rows where folds[filename] != fold
+    val   = labeled rows where folds[filename] == fold
 
-    Files not in either folds_df or v_anchor_files are dropped — they're
-    unlabeled or not fully labeled, neither use case applies here.
+    Files not in folds_df are dropped (unlabeled / not fully labeled).
+    With V-anchor abandoned, every labeled file is in exactly one fold's val.
     """
     fold_of = dict(zip(folds_df["filename"].astype(str), folds_df["fold"].astype(int)))
-    anchor_set = set(v_anchor_files)
 
     fnames = soundscape_meta["filename"].astype(str)
-    in_anchor = fnames.isin(anchor_set)
     fold_assign = fnames.map(fold_of)
-    is_non_anchor_labeled = (~in_anchor) & fold_assign.notna()
+    in_split = fold_assign.notna()
 
-    train_mask = is_non_anchor_labeled & (fold_assign != fold)
-    val_mask = is_non_anchor_labeled & (fold_assign == fold)
+    train_mask = in_split & (fold_assign != fold)
+    val_mask = in_split & (fold_assign == fold)
 
     train = soundscape_meta[train_mask].reset_index(drop=True)
     val = soundscape_meta[val_mask].reset_index(drop=True)
-    vanchor = soundscape_meta[in_anchor].reset_index(drop=True)
-    return train, val, vanchor
+    return train, val
 
 
 def run_one_fold(
     experiment: Dict[str, Any],
     fold: int,
+    n_splits: int,
     train_rank_meta: pd.DataFrame,
     val_meta: pd.DataFrame,
-    vanchor_meta: pd.DataFrame,
     label_map: Dict[str, int],
     mapped_label_indices: np.ndarray,
     base_model_config: Dict[str, Any],
@@ -167,8 +159,9 @@ def run_one_fold(
 ) -> Dict[str, Any]:
     """One (experiment, fold) training run.
 
-    Selects the best checkpoint by V-anchor mapped AUC since V-anchor
-    correlates better with LB than per-fold val (lesson from STRATEGY_V2.md).
+    Selects the best checkpoint by per-fold `val_mapped_auc`. (V-anchor was
+    abandoned — the cross-fold stitched-OOF metric is computed separately
+    after all folds finish, not here.)
     """
     exp_name = experiment["name"]
     exp_output_dir = output_dir / exp_name / f"fold{fold}"
@@ -199,7 +192,7 @@ def run_one_fold(
     )
 
     val_loader = None
-    vanchor_loader = None
+    val_dataset = None
     if _is_main_process(rank):
         val_dataset = BirdCLEFDataset(
             metadata=val_meta, label_map=label_map,
@@ -210,17 +203,6 @@ def run_one_fold(
         )
         val_loader = DataLoader(
             val_dataset, batch_size=batch_size, shuffle=False,
-            num_workers=num_workers, pin_memory=torch.cuda.is_available(),
-        )
-        vanchor_dataset = BirdCLEFDataset(
-            metadata=vanchor_meta, label_map=label_map,
-            sample_rate=int(base_model_config["sample_rate"]),
-            duration=float(base_model_config["duration"]),
-            training=False, preload_audio=preload_audio,
-            preload_workers=preload_workers,
-        )
-        vanchor_loader = DataLoader(
-            vanchor_dataset, batch_size=batch_size, shuffle=False,
             num_workers=num_workers, pin_memory=torch.cuda.is_available(),
         )
 
@@ -270,24 +252,16 @@ def run_one_fold(
     amp_enabled = use_bf16 and device.type == "cuda"
 
     _print_main(rank, "")
-    _print_main(rank, f"=== {exp_name} | fold {fold} ===")
+    _print_main(rank, f"=== {exp_name} | fold {fold}/{n_splits-1} ===")
     _print_main(rank, f"Backbone: {experiment['backbone_name']} | image_size={experiment['image_size']}")
     _print_main(rank, f"DDP enabled: {distributed} (world_size="
                       f"{dist.get_world_size() if dist.is_initialized() else 1})")
     _print_main(rank, f"Train rows: {train_meta_len}  (rank shard: {train_rank_meta_len})")
     _print_main(rank, f"Val rows (fold {fold}): {len(val_meta)}")
-    _print_main(rank, f"V-anchor rows: {len(vanchor_meta)}")
     _print_main(rank, f"Num labels: {len(label_map)}  Mapped val labels: {len(mapped_label_indices)}")
 
-    # Selection: best V-anchor mapped AUC. Why V-anchor: per-fold val sits
-    # inside the same site×date distribution as train; V-anchor is the
-    # held-out cross-distribution probe and tracks LB more honestly per
-    # STRATEGY_V2.md lesson.
-    best_vanchor_auc = float("nan")
     best_val_auc = float("nan")
     best_val_full_auc = float("nan")
-    best_vanchor_full_auc = float("nan")
-    best_vanchor_loss = float("inf")
     best_val_loss = float("inf")
     best_epoch = -1
     history: List[Dict[str, Any]] = []
@@ -309,13 +283,9 @@ def run_one_fold(
 
         if _is_main_process(rank):
             eval_model = model.module if isinstance(model, DDP) else model
-            assert val_loader is not None and vanchor_loader is not None
+            assert val_loader is not None
             val_loss, val_mapped_auc, val_full_auc = evaluate_validation_metrics(
                 eval_model, val_loader, torch.nn.BCEWithLogitsLoss(),
-                device, mapped_label_indices=mapped_label_indices, use_bf16=use_bf16,
-            )
-            van_loss, van_mapped_auc, van_full_auc = evaluate_validation_metrics(
-                eval_model, vanchor_loader, torch.nn.BCEWithLogitsLoss(),
                 device, mapped_label_indices=mapped_label_indices, use_bf16=use_bf16,
             )
 
@@ -324,29 +294,23 @@ def run_one_fold(
                 "train_loss": avg_train_loss,
                 "val_loss": val_loss, "val_mapped_auc": val_mapped_auc,
                 "val_full_auc": val_full_auc,
-                "vanchor_loss": van_loss, "vanchor_mapped_auc": van_mapped_auc,
-                "vanchor_full_auc": van_full_auc,
             }
             history.append(row)
             print(
                 f"{exp_name}/f{fold} | ep {epoch:02d} | "
                 f"train={avg_train_loss:.4f} | "
-                f"val_loss={val_loss:.4f} val_auc={val_mapped_auc:.4f} val_full={val_full_auc:.4f} | "
-                f"VAN_loss={van_loss:.4f} VAN_auc={van_mapped_auc:.4f} VAN_full={van_full_auc:.4f}"
+                f"val_loss={val_loss:.4f} val_auc={val_mapped_auc:.4f} val_full={val_full_auc:.4f}"
             )
 
             should_save = False
-            if is_better_score(van_mapped_auc, best_vanchor_auc):
-                best_vanchor_auc = van_mapped_auc
-                best_vanchor_full_auc = van_full_auc
-                best_vanchor_loss = van_loss
+            if is_better_score(val_mapped_auc, best_val_auc):
                 best_val_auc = val_mapped_auc
                 best_val_full_auc = val_full_auc
                 best_val_loss = val_loss
                 should_save = True
-            elif pd.isna(van_mapped_auc) and val_loss < best_val_loss:
-                # Pathological case: V-anchor AUC undefined (no positives in
-                # mapped labels). Fall back to val_loss to break ties.
+            elif pd.isna(val_mapped_auc) and val_loss < best_val_loss:
+                # Pathological case: val mapped AUC undefined. Fall back to
+                # val_loss to break ties.
                 should_save = True
 
             if should_save:
@@ -359,8 +323,7 @@ def run_one_fold(
                         "model_config": model_config,
                         "epoch": epoch,
                         "fold": fold,
-                        "best_vanchor_mapped_auc": van_mapped_auc,
-                        "best_vanchor_full_auc": van_full_auc,
+                        "n_splits": n_splits,
                         "best_val_mapped_auc": val_mapped_auc,
                         "best_val_full_auc": val_full_auc,
                         "fused_adamw": fused_enabled,
@@ -375,13 +338,10 @@ def run_one_fold(
             dist.barrier()
 
     summary: Dict[str, Any] = {
-        "experiment": exp_name, "fold": fold,
-        "architecture": "sota_timm_spectrogram_5fold_vanchor",
+        "experiment": exp_name, "fold": fold, "n_splits": n_splits,
+        "architecture": "sota_timm_spectrogram_5fold",
         "backbone_name": experiment["backbone_name"],
         "best_epoch": best_epoch,
-        "best_vanchor_mapped_auc": best_vanchor_auc,
-        "best_vanchor_full_auc": best_vanchor_full_auc,
-        "best_vanchor_loss": best_vanchor_loss,
         "best_val_mapped_auc": best_val_auc,
         "best_val_full_auc": best_val_full_auc,
         "best_val_loss": best_val_loss,
@@ -405,19 +365,106 @@ def run_one_fold(
     return summary
 
 
+def _stitched_oof_for_exp(
+    exp_name: str,
+    fold_list: List[int],
+    output_dir: Path,
+    soundscape_meta: pd.DataFrame,
+    folds_df: pd.DataFrame,
+    label_map: Dict[str, int],
+    mapped_label_indices: np.ndarray,
+    base_model_config: Dict[str, Any],
+    device: torch.device,
+    use_bf16: bool,
+    batch_size: int,
+    num_workers: int,
+) -> Dict[str, float]:
+    """Stitched-OOF macro AUC over all folds of one experiment.
+
+    Loads each fold's `best_model.pt`, predicts on its val rows, concatenates
+    across folds, computes one global AUC. Replaces V-anchor as the
+    cross-config ranker. Only computed when the user passes --all-folds and
+    every fold completed.
+    """
+    if len(fold_list) <= 1:
+        return {}
+    exp_dir = output_dir / exp_name
+    targets_chunks: List[np.ndarray] = []
+    preds_chunks: List[np.ndarray] = []
+    for fold in fold_list:
+        ckpt = exp_dir / f"fold{fold}" / "best_model.pt"
+        if not ckpt.exists():
+            print(f"[stitched-oof] WARN: missing {ckpt}; skipping fold {fold}")
+            continue
+        state = torch.load(ckpt, map_location="cpu")
+        model_config = state["model_config"]
+        model = TimmSpectrogramClassifier(**model_config).to(device)
+        # State dict may be saved as 'model_state' (new) — use that key.
+        sd = state.get("model_state") or state.get("state_dict")
+        model.load_state_dict(sd, strict=False)
+        model.eval()
+
+        _train, val_meta = _split_meta_by_fold(soundscape_meta, folds_df, fold)
+        if val_meta.empty:
+            continue
+        val_dataset = BirdCLEFDataset(
+            metadata=val_meta, label_map=label_map,
+            sample_rate=int(base_model_config["sample_rate"]),
+            duration=float(base_model_config["duration"]),
+            training=False, preload_audio=True, preload_workers=8,
+        )
+        loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False,
+                            num_workers=num_workers, pin_memory=torch.cuda.is_available())
+        with torch.no_grad():
+            for inputs, targets in loader:
+                inputs = inputs.to(device, non_blocking=True)
+                with torch.autocast(device_type=device.type, dtype=torch.bfloat16,
+                                    enabled=use_bf16 and device.type == "cuda"):
+                    logits = model(inputs)
+                preds_chunks.append(torch.sigmoid(logits).float().cpu().numpy())
+                targets_chunks.append(targets.float().cpu().numpy())
+        del model
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    if not targets_chunks:
+        return {}
+    Y = np.concatenate(targets_chunks, axis=0)
+    P = np.concatenate(preds_chunks, axis=0)
+    try:
+        full_auc = birdclef_roc_auc(Y, P)
+    except ValueError:
+        full_auc = float("nan")
+    if len(mapped_label_indices) > 0:
+        try:
+            mapped_auc = birdclef_roc_auc(Y[:, mapped_label_indices], P[:, mapped_label_indices])
+        except ValueError:
+            mapped_auc = float("nan")
+    else:
+        mapped_auc = float("nan")
+    return {
+        "stitched_oof_mapped_auc": float(mapped_auc),
+        "stitched_oof_full_auc": float(full_auc),
+        "stitched_oof_n_rows": int(Y.shape[0]),
+    }
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--exp", default=None,
                     help="Experiment name from build_experiment_configs(). "
                          "Substring match supported. Default: sweep all 23 configs.")
     ap.add_argument("--fold", type=int, default=0,
-                    help="Single fold (0..4). Default: 0. Use --all-folds to loop. "
+                    help="Single fold (0..n_splits-1). Default: 0. Use --all-folds to loop. "
                          "A no-arg run = all 23 experiments × fold 0 (= same compute "
                          "as old leaky-split sweep). After a winner is picked, re-run "
                          "with --exp <winner> --all-folds for the deep dive.")
     ap.add_argument("--all-folds", action="store_true",
-                    help="Loop fold 0..4 (overrides --fold). Use only for the winning "
-                         "config — 5x compute.")
+                    help="Loop fold 0..n_splits-1 (overrides --fold). Triggers stitched-OOF "
+                         "metric computation at the end. Use only for the winning config.")
+    ap.add_argument("--n-splits", type=int, default=5, choices=[5, 10],
+                    help="Static fold parquet to use. Default 5. "
+                         "Build them via `python -m birdclef.scripts._02_build_splits`.")
     ap.add_argument("--epochs", type=int, default=15)
     ap.add_argument("--batch-size", type=int, default=24)
     ap.add_argument("--num-workers", type=int, default=4)
@@ -430,7 +477,7 @@ def main() -> None:
     ap.add_argument("--use-bf16", action="store_true", default=True)
     ap.add_argument("--grad-clip-norm", type=float, default=1.0)
     ap.add_argument("--out-dir", default=None,
-                    help="Override output dir. Default: birdclef_example/outputs/sota_5fold_vanchor")
+                    help="Override output dir. Default: birdclef_example/outputs/sota_5fold")
     args = ap.parse_args()
 
     distributed, world_size, rank, local_rank = _get_distributed_context()
@@ -446,18 +493,21 @@ def main() -> None:
     repo_root = Path(__file__).resolve().parents[1]
     data_dir = repo_root / "data"
     output_dir = Path(args.out_dir) if args.out_dir else \
-        repo_root / "birdclef_example" / "outputs" / "sota_5fold_vanchor"
+        repo_root / "birdclef_example" / "outputs" / "sota_5fold"
 
     # Hard guard against accidentally clobbering the old leaky-split sweep
-    # results. Both scripts write `experiments_summary.csv` at the root and
-    # checkpoints under `<exp_name>/...`, so pointing this script at
-    # `experiments_sota/` would silently overwrite history.
-    legacy_root = (repo_root / "birdclef_example" / "outputs" / "experiments_sota").resolve()
-    if output_dir.resolve() == legacy_root:
+    # results. The legacy script writes to `experiments_sota/`; the
+    # vanchor-era script wrote to `sota_5fold_vanchor/`. Refuse if pointed
+    # at either.
+    legacy_roots = {
+        (repo_root / "birdclef_example" / "outputs" / "experiments_sota").resolve(),
+        (repo_root / "birdclef_example" / "outputs" / "sota_5fold_vanchor").resolve(),
+    }
+    if output_dir.resolve() in legacy_roots:
         raise SystemExit(
-            f"--out-dir points at the legacy SOTA sweep directory:\n  {legacy_root}\n"
+            f"--out-dir points at a legacy SOTA sweep directory:\n  {output_dir}\n"
             "Refusing to overwrite. Pick a different --out-dir (default is "
-            "birdclef_example/outputs/sota_5fold_vanchor)."
+            "birdclef_example/outputs/sota_5fold)."
         )
 
     soundscape_labels_path = data_dir / "train_soundscapes_labels.csv"
@@ -473,15 +523,11 @@ def main() -> None:
     soundscape_df = pd.read_csv(soundscape_labels_path)
     soundscape_meta = prepare_soundscape_metadata(soundscape_df, train_soundscape_dir)
 
-    folds_df = load_folds()
-    v_anchor_files = load_v_anchor()
-    if not v_anchor_files:
-        raise SystemExit(
-            "V-anchor file list is empty. Run scripts/_02_build_splits.py first."
-        )
+    folds_df = load_folds(n_splits=int(args.n_splits))
     if folds_df.empty:
         raise SystemExit(
-            "Folds parquet is empty. Run scripts/_02_build_splits.py first."
+            f"Folds parquet is empty. Run `python -m birdclef.scripts._02_build_splits` "
+            f"to build the {args.n_splits}-fold split first."
         )
     n_folds = int(folds_df["fold"].max()) + 1
 
@@ -507,6 +553,7 @@ def main() -> None:
     fold_list = list(range(n_folds)) if args.all_folds else [int(args.fold)]
     _print_main(rank, f"=== sweep plan ===")
     _print_main(rank, f"  experiments     : {len(selected_exps)}  (--exp filter: {args.exp or '<all>'})")
+    _print_main(rank, f"  n_splits        : {args.n_splits}")
     _print_main(rank, f"  folds per exp   : {len(fold_list)}  (folds={fold_list})")
     _print_main(rank, f"  total runs      : {len(selected_exps) * len(fold_list)}")
     _print_main(rank, f"  output root     : {output_dir}")
@@ -517,15 +564,13 @@ def main() -> None:
     all_summaries: List[Dict[str, Any]] = []
     for experiment in selected_exps:
         for fold in fold_list:
-            train_meta, val_meta, vanchor_meta = _split_meta_by_fold(
-                soundscape_meta, folds_df, v_anchor_files, fold,
-            )
+            train_meta, val_meta = _split_meta_by_fold(soundscape_meta, folds_df, fold)
             train_rank_meta = build_rank_metadata_shard(train_meta, world_size=world_size, rank=rank)
             try:
                 summary = run_one_fold(
-                    experiment=experiment, fold=fold,
+                    experiment=experiment, fold=fold, n_splits=int(args.n_splits),
                     train_rank_meta=train_rank_meta,
-                    val_meta=val_meta, vanchor_meta=vanchor_meta,
+                    val_meta=val_meta,
                     label_map=label_map,
                     mapped_label_indices=mapped_label_indices,
                     base_model_config=base_model_config,
@@ -561,12 +606,47 @@ def main() -> None:
                 with open(output_dir / "experiments_summary.json", "w", encoding="utf-8") as f:
                     json.dump(all_summaries, f, indent=2, sort_keys=True, default=str)
                 df = pd.DataFrame(all_summaries)
-                if "best_vanchor_mapped_auc" in df.columns:
-                    df = df.sort_values(
-                        by=["best_vanchor_mapped_auc", "best_val_mapped_auc"],
-                        ascending=[False, False],
-                    )
+                if "best_val_mapped_auc" in df.columns:
+                    df = df.sort_values(by=["best_val_mapped_auc"], ascending=[False])
                 df.to_csv(output_dir / "experiments_summary.csv", index=False)
+
+        # Stitched OOF (only meaningful when all folds of this experiment
+        # completed in this run — i.e. --all-folds was passed and rank 0).
+        if args.all_folds and _is_main_process(rank):
+            try:
+                stitched = _stitched_oof_for_exp(
+                    exp_name=experiment["name"],
+                    fold_list=fold_list,
+                    output_dir=output_dir,
+                    soundscape_meta=soundscape_meta,
+                    folds_df=folds_df,
+                    label_map=label_map,
+                    mapped_label_indices=mapped_label_indices,
+                    base_model_config=base_model_config,
+                    device=device,
+                    use_bf16=args.use_bf16,
+                    batch_size=int(args.batch_size),
+                    num_workers=int(args.num_workers),
+                )
+            except Exception as ex:
+                print(f"[WARN] stitched-OOF for {experiment['name']} FAILED: {ex}")
+                stitched = {}
+            if stitched:
+                stitched_record = {"experiment": experiment["name"], **stitched}
+                # Append a single stitched-OOF row per experiment to the
+                # summary CSV / JSON so it ranks alongside per-fold entries.
+                all_summaries.append({"_kind": "stitched_oof", **stitched_record})
+                with open(output_dir / "experiments_summary.json", "w", encoding="utf-8") as f:
+                    json.dump(all_summaries, f, indent=2, sort_keys=True, default=str)
+                df = pd.DataFrame(all_summaries)
+                if "stitched_oof_mapped_auc" in df.columns:
+                    df = df.sort_values(by=["stitched_oof_mapped_auc"],
+                                        ascending=[False], na_position="last")
+                df.to_csv(output_dir / "experiments_summary.csv", index=False)
+                print(f"[stitched-oof] {experiment['name']}  "
+                      f"mapped={stitched.get('stitched_oof_mapped_auc'):.4f}  "
+                      f"full={stitched.get('stitched_oof_full_auc'):.4f}  "
+                      f"rows={stitched.get('stitched_oof_n_rows')}")
 
     _cleanup_distributed(distributed)
 

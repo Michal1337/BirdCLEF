@@ -5,7 +5,7 @@ soft-target probabilities that the SED student consumes via
 Output layout — `cache/pseudo/round{N}/`:
     probs.npz     : {'probs': (N_rows, C) float32,
                      'keep_mask': (N_rows, C) uint8}
-    meta.parquet  : row_id, filename, window, is_labeled, is_v_anchor
+    meta.parquet  : row_id, filename, window, is_labeled
                     (same row ordering as the Perch cache meta)
     info.json     : teacher name, seeds, confidence filter, coverage stats
 
@@ -46,7 +46,6 @@ from birdclef.config.paths import (
     WINDOW_SAMPLES,
 )
 from birdclef.data.soundscapes import primary_labels
-from birdclef.data.splits import load_v_anchor
 from birdclef.utils.seed import seed_everything
 
 
@@ -128,7 +127,6 @@ def pseudo_label_with_sed(
         models.append(m)
 
     paths = sorted(SOUNDSCAPES.glob("*.ogg"))
-    anchor = set(load_v_anchor())
     meta_rows = []
     probs_rows = []
     for p in tqdm(paths, desc="pseudo[sed]"):
@@ -147,7 +145,6 @@ def pseudo_label_with_sed(
                 "row_id": f"{p.stem}_{(w + 1) * 5}",
                 "filename": p.name,
                 "window": w,
-                "is_v_anchor": p.name in anchor,
             })
         probs_rows.append(ensemble)
     meta = pd.DataFrame(meta_rows)
@@ -178,11 +175,10 @@ def pseudo_label_with_ssm_pipeline(
 ) -> None:
     """Round-0-capable teacher: SSM pipeline as an ensemble over `seeds`.
 
-    Each seed independently (a) trains proto+MLP+residual on all non-anchor
-    labeled rows, (b) predicts final-stage probs on every soundscape row in
-    the Perch cache (labeled + V-anchor + unlabeled). Probs averaged across
-    seeds. V-anchor rows are emitted but flagged so the SED trainer can
-    exclude them from training.
+    Each seed independently (a) trains proto+MLP+residual on ALL labeled
+    rows, (b) predicts final-stage probs on every soundscape row in
+    the Perch cache (labeled + unlabeled). Probs averaged across seeds.
+    V-anchor was abandoned — every labeled file is now training-eligible.
     """
     from birdclef.train.train_ssm_head import (
         PerchCache,
@@ -199,13 +195,11 @@ def pseudo_label_with_ssm_pipeline(
     cache = load_perch_cache()
     n_rows, n_classes = cache.scores.shape
 
-    anchor_files = set(load_v_anchor())
-    in_anchor = cache.meta["filename"].isin(anchor_files).to_numpy()
     is_labeled = cache.labeled_mask
-    train_mask = is_labeled & ~in_anchor
+    train_mask = is_labeled
     train_idx = np.where(train_mask)[0]
     all_idx = np.arange(n_rows)
-    print(f"[pseudo:ssm] train rows={len(train_idx)} (labeled non-anchor), "
+    print(f"[pseudo:ssm] train rows={len(train_idx)} (all labeled), "
           f"predict rows={len(all_idx)} (every soundscape window)")
 
     labels = primary_labels()
@@ -233,7 +227,6 @@ def pseudo_label_with_ssm_pipeline(
     meta = cache.meta[["row_id", "filename"]].copy()
     meta["window"] = np.tile(np.arange(N_WINDOWS), n_rows // N_WINDOWS)
     meta["is_labeled"] = cache.meta["is_labeled"].astype(int)
-    meta["is_v_anchor"] = in_anchor.astype(int)
 
     out_dir = _round_dir(output_round)
     np.savez_compressed(
@@ -250,7 +243,6 @@ def pseudo_label_with_ssm_pipeline(
         "n_files": int(n_rows // N_WINDOWS),
         "n_rows": int(n_rows),
         "n_train_rows": int(len(train_idx)),
-        "n_v_anchor_rows": int(in_anchor.sum()),
         "keep_fraction": float(keep_mask.mean()),
         "runtime_min": round(elapsed, 2),
     }

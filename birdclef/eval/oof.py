@@ -1,4 +1,4 @@
-"""Fold-safe OOF orchestration using the persisted site×date folds.
+"""Fold-safe OOF orchestration using the persisted file-level folds.
 
 The OOF runner is generic: you pass a `train_predict_fn(train_idx, val_idx,
 train_ctx) -> val_probs[len(val_idx), n_classes]` and this module handles
@@ -26,11 +26,11 @@ def oof_predict(
 ) -> Dict:
     """
     X_meta must have `filename` column — fold assignment is looked up by
-    filename against `folds_site_date.parquet`.
+    filename against `folds_{n_splits}_strat.parquet`.
     y_true: (N_rows, n_classes) ground-truth multi-hot.
     train_predict_fn(train_idx, val_idx) -> val_probs (N_val, n_classes).
     """
-    folds = load_folds()
+    folds = load_folds(n_splits=n_splits)
     fold_of = dict(zip(folds["filename"], folds["fold"].astype(int)))
     row_fold = X_meta["filename"].map(fold_of).fillna(-1).astype(int).to_numpy()
 
@@ -48,7 +48,8 @@ def oof_predict(
         print(f"[oof] fold {f}  macro_auc={m_fold['macro_auc']:.4f}  "
               f"site_std={m_fold['site_auc_std']:.4f}")
 
-    # Only score rows that were assigned a fold (-1 = outside folds, eg anchor).
+    # Only score rows that were assigned a fold (-1 = outside folds, eg
+    # rows whose filename isn't in the fold parquet for any reason).
     keep = row_fold >= 0
     global_metrics = compute_stage_metrics(
         y_true[keep], oof[keep], X_meta.iloc[keep].reset_index(drop=True),

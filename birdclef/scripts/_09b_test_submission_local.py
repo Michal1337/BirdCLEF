@@ -1,14 +1,14 @@
 """Run the Kaggle inference template locally on a sample of train_soundscapes.
 
 Catches inference bugs (dtype mismatch, missing keys, wrong shape) without
-burning a Kaggle daily submission quota. When the chosen files are labeled
-(V-anchor or fully_labeled), it also computes macro AUC against ground truth
-so you can compare to training-time numbers.
+burning a Kaggle daily submission quota. When the chosen files are labeled,
+it also computes macro AUC against ground truth so you can compare to
+training-time numbers.
 
-Defaults: 13 V-anchor soundscapes, write to outputs/submit/local_test/. The
-13 V-anchor files are exactly what the SED trainer reported `vanchor auc=...`
-on, so the AUC printed here should match those numbers within ~0.005 (the
-difference is float16 ONNX vs float32 PyTorch).
+Defaults: all 59 fully-labeled soundscapes, write to outputs/submit/local_test/.
+This is the new default after V-anchor was abandoned — see plan file. The AUC
+printed here should match the stitched-OOF AUC reported by the SED trainer
+within ~0.005 (the difference is float16 ONNX vs float32 PyTorch).
 """
 from __future__ import annotations
 
@@ -33,17 +33,11 @@ from birdclef.data.soundscapes import (
     load_soundscape_meta,
     primary_labels,
 )
-from birdclef.data.splits import load_v_anchor
 from birdclef.eval.metrics import compute_stage_metrics
 
 
 def _pick_files(source: str, n_files: int) -> List[Path]:
-    if source == "anchor":
-        names = load_v_anchor()
-        if not names:
-            raise SystemExit("V-anchor file list is empty. Run scripts/_02_build_splits.py first.")
-        files = [SOUNDSCAPES / n for n in names]
-    elif source == "labeled":
+    if source == "labeled":
         sc = load_soundscape_meta()
         names = sorted(set(sc[sc["fully_labeled"]]["filename"]))
         files = [SOUNDSCAPES / n for n in names]
@@ -76,7 +70,7 @@ def _stage_files(files: List[Path], stage_dir: Path) -> None:
             shutil.copy2(f, dst)
 
 
-def _score_v_anchor_csv(out_csv: Path, n_files_in_test: int) -> dict:
+def _score_against_labels(out_csv: Path, n_files_in_test: int) -> dict:
     """If the test pool overlapped labeled soundscapes, score against ground truth.
 
     Returns metrics dict (or empty dict if nothing scoreable).
@@ -141,15 +135,13 @@ def main():
                     help="Optional local Perch ONNX path. None = skip Perch.")
     ap.add_argument("--recipe", default=None,
                     help="Path to recipe JSON. Omit for uniform-weight blend.")
-    ap.add_argument("--source", default="anchor",
-                    choices=["anchor", "labeled", "all"],
-                    help=("'anchor' = V-anchor files (13, exact match to SED logs), "
-                          "'labeled' = all fully-labeled soundscapes, "
+    ap.add_argument("--source", default="labeled",
+                    choices=["labeled", "all"],
+                    help=("'labeled' = all 59 fully-labeled soundscapes "
+                          "(matches stitched-OOF target row set), "
                           "'all' = every soundscape OGG (slow)."))
-    ap.add_argument("--n-files", type=int, default=20,
-                    help="Cap on files. 0 = no cap (use whole source). "
-                         "For source='anchor', defaults to 20 but caps at the "
-                         "13 V-anchor files automatically.")
+    ap.add_argument("--n-files", type=int, default=0,
+                    help="Cap on files. 0 (default) = no cap.")
     ap.add_argument("--out-dir", default=str(OUTPUT_ROOT / "submit" / "local_test"),
                     help="Where to write submission.csv + staged files.")
     args = ap.parse_args()
@@ -201,7 +193,7 @@ def main():
     elapsed_min = (time.time() - t0) / 60.0
 
     # Score against ground truth if any of the staged files happen to be labeled
-    metrics = _score_v_anchor_csv(out_csv, n_files_in_test=len(files))
+    metrics = _score_against_labels(out_csv, n_files_in_test=len(files))
     if metrics:
         print()
         print(f"[local-test] === scored {metrics['n_files_scored']} files "
