@@ -41,12 +41,27 @@ def main():
     keys = list(arrs.keys())
     print(f"[refilter] loaded {src}  keys={keys}  shapes={ {k: arrs[k].shape for k in keys} }")
 
+    # Schema differences across teachers:
+    #   SSM teacher  (round 0/1): writes {final, first_pass, keep_mask}
+    #   SED teacher  (round 2+): writes {probs, keep_mask}
+    #   This refilter (re-run):  writes {probs, keep_mask, final, first_pass}
+    # `--emit final` for a SED-teacher round means "use the only probs array we
+    # have" — alias `final` → `probs` rather than crash.
     if args.emit == "first_pass" and "first_pass" not in arrs:
-        raise SystemExit("first_pass array missing from this round; regen with the SSM teacher.")
+        raise SystemExit("first_pass array missing from this round (SED-teacher round?). "
+                         "Use --emit final or regen with the SSM teacher.")
+    if args.emit == "final" and "final" not in arrs:
+        if "probs" not in arrs:
+            raise SystemExit(f"Neither `final` nor `probs` in {src}; cannot refilter.")
+        print("[refilter] note: `final` not present (SED-teacher round); aliasing to `probs`")
+        emit_probs = arrs["probs"].astype(np.float32)
+    else:
+        emit_probs = arrs[args.emit].astype(np.float32)
 
-    emit_probs = arrs[args.emit].astype(np.float32)
-    first_pass = arrs.get("first_pass", arrs.get("probs")).astype(np.float32)
-    final = arrs.get("probs").astype(np.float32) if "probs" in arrs else emit_probs
+    first_pass = arrs.get("first_pass")
+    first_pass = first_pass.astype(np.float32) if first_pass is not None else emit_probs
+    final = arrs.get("final")
+    final = final.astype(np.float32) if final is not None else emit_probs
 
     print(f"[refilter] emitting `{args.emit}` as probs  "
           f"mean={emit_probs.mean():.4f}  p99={np.percentile(emit_probs, 99):.4f}")
