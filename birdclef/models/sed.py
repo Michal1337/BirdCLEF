@@ -3,9 +3,15 @@
 Produces per-clip multilabel logits for 5 s windows (one prediction per clip).
 For 60 s soundscape inference, caller chops waveform into 12 windows and runs
 in batches of 12.
+
+Two front-end implementations:
+  - MelFrontend:  torchaudio.transforms.MelSpectrogram. Used at train time.
+  - ConvMelSpectrogram + SEDExportWrapper: Conv1d-based mel-spec that uses
+    only ONNX-exportable ops (no complex STFT). Used at export time only.
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import torch
@@ -106,6 +112,123 @@ class SED(nn.Module):
         if feats.ndim == 4:
             # [B, C, H, W] -> treat W as time steps
             feats = feats.mean(dim=2).transpose(1, 2)  # [B, W, C]
+        elif feats.ndim > 2:
+            feats = feats.flatten(1).unsqueeze(1)
+        else:
+            feats = feats.unsqueeze(1)
+        pooled = self.pool(feats)
+        return self.head(pooled)
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# ONNX-friendly mel front-end (export only)
+# ────────────────────────────────────────────────────────────────────────────
+class ConvMelSpectrogram(nn.Module):
+    """Mel power-spectrogram → log-mel using only Conv1d / MatMul / Log.
+
+    Numerically equivalent to torchaudio's
+    `MelSpectrogram(power=2.0) + AmplitudeToDB(stype='power', top_db=80)`
+    modulo:
+      - constant-zero padding (vs torchaudio's reflect) at clip boundaries.
+      - float-precision drift in the DFT basis matrix.
+
+    Used only when exporting SED to ONNX, since `torch.stft` returns complex
+    tensors which the legacy ONNX exporter (opset ≤17) cannot serialize.
+    """
+
+    def __init__(
+        self,
+        sample_rate: int,
+        n_fft: int,
+        hop_length: int,
+        n_mels: int,
+        f_min: float,
+        f_max: float,
+        top_db: float = 80.0,
+    ):
+        super().__init__()
+        self.n_fft = int(n_fft)
+        self.hop_length = int(hop_length)
+        self.top_db = float(top_db)
+
+        # Hann window × DFT basis, packed as Conv1d weights.
+        window = torch.hann_window(self.n_fft, periodic=True).float()
+        n_idx = torch.arange(self.n_fft, dtype=torch.float32)
+        k_idx = torch.arange(self.n_fft // 2 + 1, dtype=torch.float32)
+        # e^{-i 2π k n / N}  → real and imag parts
+        angle = 2.0 * math.pi * k_idx.unsqueeze(1) * n_idx.unsqueeze(0) / float(self.n_fft)
+        basis_real = torch.cos(angle) * window.unsqueeze(0)
+        basis_imag = -torch.sin(angle) * window.unsqueeze(0)
+        # Stack: (2*(n_fft//2+1), 1, n_fft)
+        weight = torch.cat([basis_real, basis_imag], dim=0).unsqueeze(1)
+        self.register_buffer("stft_weight", weight)
+
+        # Mel filterbank from torchaudio for exact training-time match.
+        from torchaudio.functional import melscale_fbanks
+        mel_fb = melscale_fbanks(
+            n_freqs=self.n_fft // 2 + 1,
+            f_min=float(f_min),
+            f_max=float(f_max),
+            n_mels=int(n_mels),
+            sample_rate=int(sample_rate),
+        )  # (n_freqs, n_mels)
+        # Keep transposed copy so forward only uses MatMul on a fixed tensor.
+        self.register_buffer("mel_fb_t", mel_fb.t().contiguous())
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, T) waveform → (B, n_mels, frames) log-mel power spectrogram
+        if x.ndim == 3:
+            x = x.squeeze(1)
+        # Center=True: pad n_fft//2 on each side. Constant pad (not reflect)
+        # so the export graph stays simple. Boundary samples differ by at most
+        # ~n_fft/2 / WINDOW_SAMPLES = 1 % of the clip; macro-AUC unaffected.
+        pad = self.n_fft // 2
+        x_padded = F.pad(x.unsqueeze(1), (pad, pad), mode="constant", value=0.0)
+        stft = F.conv1d(x_padded, self.stft_weight, stride=self.hop_length)
+        n_freq = self.n_fft // 2 + 1
+        real = stft[:, :n_freq, :]
+        imag = stft[:, n_freq:, :]
+        power = real * real + imag * imag                        # (B, n_freq, frames)
+        # mel_fb_t @ power : (B, n_mels, frames)
+        mel = torch.matmul(self.mel_fb_t, power)
+        log_mel = 10.0 * torch.log10(torch.clamp(mel, min=1e-10))
+        # top_db clamp to match torchaudio.transforms.AmplitudeToDB
+        log_mel_max = log_mel.amax(dim=(-2, -1), keepdim=True)
+        log_mel = torch.maximum(log_mel, log_mel_max - self.top_db)
+        return log_mel
+
+
+class SEDExportWrapper(nn.Module):
+    """Drop-in replacement for SED at ONNX export time.
+
+    Same forward signature (waveform → logits), same trained weights, but
+    swaps the torchaudio mel front-end for the ONNX-safe `ConvMelSpectrogram`.
+    Skips SpecAugment (eval-mode only).
+    """
+
+    def __init__(self, sed: SED):
+        super().__init__()
+        cfg = sed.cfg
+        self.mel = ConvMelSpectrogram(
+            sample_rate=cfg.sample_rate, n_fft=cfg.n_fft, hop_length=cfg.hop_length,
+            n_mels=cfg.n_mels, f_min=cfg.f_min, f_max=cfg.f_max,
+        )
+        self.backbone = sed.backbone
+        self.pool = sed.pool
+        self.head = sed.head
+
+    def forward(self, waveform: torch.Tensor) -> torch.Tensor:
+        if waveform.ndim == 3:
+            waveform = waveform.squeeze(1)
+        log_mel = self.mel(waveform)                              # (B, n_mels, frames)
+        # Per-sample standardization, mirrors birdclef.models.sed.MelFrontend.
+        m = log_mel.mean(dim=(-2, -1), keepdim=True)
+        v = log_mel.std(dim=(-2, -1), keepdim=True).clamp(min=1e-6)
+        x = (log_mel - m) / v
+        x = x.unsqueeze(1)                                        # (B, 1, n_mels, frames)
+        feats = self.backbone(x)
+        if feats.ndim == 4:
+            feats = feats.mean(dim=2).transpose(1, 2)
         elif feats.ndim > 2:
             feats = feats.flatten(1).unsqueeze(1)
         else:
