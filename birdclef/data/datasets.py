@@ -31,6 +31,8 @@ from birdclef.config.paths import (
     FILE_SAMPLES,
     N_WINDOWS,
     PSEUDO_DIR,
+    SOUNDSCAPE_INDEX,
+    SOUNDSCAPE_NPY,
     SOUNDSCAPES,
     SR,
     WAVEFORM_INDEX,
@@ -38,6 +40,26 @@ from birdclef.config.paths import (
     WINDOW_SAMPLES,
 )
 from birdclef.data.soundscapes import label_to_idx, load_soundscape_meta
+
+
+def _load_soundscape_store():
+    """Open the soundscape memmap (n_files, FILE_SAMPLES) f16 if present.
+
+    Returns (memmap, {filename: row_idx}) or (None, {}) when the cache hasn't
+    been built. The dataset falls back to on-the-fly OGG decode in that case.
+    """
+    if not SOUNDSCAPE_NPY.exists() or not SOUNDSCAPE_INDEX.exists():
+        return None, {}
+    try:
+        store = np.load(SOUNDSCAPE_NPY, mmap_mode="r")
+    except Exception as exc:
+        print(f"[SEDTrainDataset] soundscape memmap load failed ({exc}); fallback to OGG decode")
+        return None, {}
+    idx = pd.read_parquet(SOUNDSCAPE_INDEX)
+    if "ok" in idx.columns:
+        idx = idx[idx["ok"] == 1]
+    row_by_file = dict(zip(idx["filename"].astype(str), idx["row_idx"].astype(int)))
+    return store, row_by_file
 
 
 @dataclass
@@ -200,6 +222,14 @@ class SEDTrainDataset(Dataset):
                     y[j] = 1.0
             self._gt_by_key[(str(row["filename"]), wi)] = y
 
+        # Soundscape memmap cache (n_files, FILE_SAMPLES) f16. If the build
+        # script hasn't run yet, _sc_store is None and we fall back to per-call
+        # OGG decode in _get_soundscape — slower, but the dataset still works.
+        self._sc_store, self._sc_row_by_file = _load_soundscape_store()
+        if self._sc_store is not None:
+            print(f"[SEDTrainDataset] soundscape memmap cache active "
+                  f"({len(self._sc_row_by_file)} files indexed)")
+
         self._rng = np.random.default_rng(int(seed))
         # Length heuristic: enough iterations per epoch to sweep both pools once.
         self._length = max(
@@ -257,16 +287,26 @@ class SEDTrainDataset(Dataset):
             window_idx = int(self._rng.integers(N_WINDOWS))
 
         start_sec = max(0, window_idx * 5)
-        try:
-            y_wav, _sr = sf.read(str(SOUNDSCAPES / fn), dtype="float32", always_2d=False)
-        except Exception:
-            return self._get_train_audio()
-        if y_wav.ndim == 2:
-            y_wav = y_wav.mean(axis=1)
         off = start_sec * SR
-        x = y_wav[off : off + self.win]
-        if x.shape[0] < self.win:
-            x = np.pad(x, (0, self.win - x.shape[0]))
+        # Fast path: if the soundscape memmap cache is loaded and contains
+        # this file, slice directly instead of decoding the OGG.
+        sc_row = self._sc_row_by_file.get(fn) if self._sc_store is not None else None
+        if sc_row is not None:
+            x = np.asarray(self._sc_store[sc_row, off : off + self.win], dtype=np.float32)
+            if x.shape[0] < self.win:
+                x = np.pad(x, (0, self.win - x.shape[0]))
+        else:
+            # Slow fallback: per-call OGG decode (used when the soundscape
+            # cache hasn't been built yet).
+            try:
+                y_wav, _sr = sf.read(str(SOUNDSCAPES / fn), dtype="float32", always_2d=False)
+            except Exception:
+                return self._get_train_audio()
+            if y_wav.ndim == 2:
+                y_wav = y_wav.mean(axis=1)
+            x = y_wav[off : off + self.win]
+            if x.shape[0] < self.win:
+                x = np.pad(x, (0, self.win - x.shape[0]))
 
         gt = self._gt_by_key.get((fn, window_idx))
         pseudo_row = self._pseudo_row_for(fn, window_idx)

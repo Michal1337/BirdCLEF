@@ -63,6 +63,13 @@ WAVEFORM_DIR = CACHE_ROOT / "waveforms"
 WAVEFORM_NPY = WAVEFORM_DIR / "train_audio_f16_32k.npy"
 WAVEFORM_INDEX = WAVEFORM_DIR / "train_audio_index.parquet"
 
+# Soundscape cache: every soundscape OGG decoded once to a single fixed-shape
+# memmap (n_files, FILE_SAMPLES) float16 32 kHz mono. SEDTrainDataset reads
+# from this when present, falls back to on-the-fly OGG decode otherwise.
+SOUNDSCAPE_CACHE_DIR = CACHE_ROOT / "soundscapes"
+SOUNDSCAPE_NPY = SOUNDSCAPE_CACHE_DIR / "soundscapes_f16_32k.npy"
+SOUNDSCAPE_INDEX = SOUNDSCAPE_CACHE_DIR / "soundscapes_index.parquet"
+
 PSEUDO_DIR = CACHE_ROOT / "pseudo"
 
 FOLDS_PQ = SPLIT_ROOT / "folds_site_date.parquet"
@@ -91,7 +98,7 @@ def ensure_dirs() -> None:
     if _MODE == "kaggle":
         OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
         return
-    for p in [CACHE_ROOT, PERCH_DIR, WAVEFORM_DIR, PSEUDO_DIR, MODEL_ROOT,
+    for p in [CACHE_ROOT, PERCH_DIR, WAVEFORM_DIR, SOUNDSCAPE_CACHE_DIR, PSEUDO_DIR, MODEL_ROOT,
               OUTPUT_ROOT, SPLIT_ROOT, SUBMIT_DIR]:
         p.mkdir(parents=True, exist_ok=True)
 
