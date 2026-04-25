@@ -1,6 +1,8 @@
 data/
 models/
 outputs/
+cache/
+!birdclef/cache
 !birdclef/data
 !birdclef/models
 !birdclef/outputs
@@ -10,5 +12,5 @@ __pycache__
 .venv
 *.pt
 *.npz
-cache/
+
 *.pt
