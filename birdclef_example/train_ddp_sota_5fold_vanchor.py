@@ -409,9 +409,15 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--exp", default=None,
                     help="Experiment name from build_experiment_configs(). "
-                         "Substring match supported. Default: run all.")
-    ap.add_argument("--fold", type=int, default=None,
-                    help="Single fold (0..4). Default: loop over all 5.")
+                         "Substring match supported. Default: sweep all 23 configs.")
+    ap.add_argument("--fold", type=int, default=0,
+                    help="Single fold (0..4). Default: 0. Use --all-folds to loop. "
+                         "A no-arg run = all 23 experiments × fold 0 (= same compute "
+                         "as old leaky-split sweep). After a winner is picked, re-run "
+                         "with --exp <winner> --all-folds for the deep dive.")
+    ap.add_argument("--all-folds", action="store_true",
+                    help="Loop fold 0..4 (overrides --fold). Use only for the winning "
+                         "config — 5x compute.")
     ap.add_argument("--epochs", type=int, default=15)
     ap.add_argument("--batch-size", type=int, default=24)
     ap.add_argument("--num-workers", type=int, default=4)
@@ -441,6 +447,18 @@ def main() -> None:
     data_dir = repo_root / "data"
     output_dir = Path(args.out_dir) if args.out_dir else \
         repo_root / "birdclef_example" / "outputs" / "sota_5fold_vanchor"
+
+    # Hard guard against accidentally clobbering the old leaky-split sweep
+    # results. Both scripts write `experiments_summary.csv` at the root and
+    # checkpoints under `<exp_name>/...`, so pointing this script at
+    # `experiments_sota/` would silently overwrite history.
+    legacy_root = (repo_root / "birdclef_example" / "outputs" / "experiments_sota").resolve()
+    if output_dir.resolve() == legacy_root:
+        raise SystemExit(
+            f"--out-dir points at the legacy SOTA sweep directory:\n  {legacy_root}\n"
+            "Refusing to overwrite. Pick a different --out-dir (default is "
+            "birdclef_example/outputs/sota_5fold_vanchor)."
+        )
 
     soundscape_labels_path = data_dir / "train_soundscapes_labels.csv"
     taxonomy_path = data_dir / "taxonomy.csv"
@@ -486,9 +504,15 @@ def main() -> None:
     base_model_config = {"dropout": 0.35, "sample_rate": 32000, "duration": 5.0}
 
     selected_exps = _select_experiments(args.exp)
-    fold_list = [int(args.fold)] if args.fold is not None else list(range(n_folds))
-    _print_main(rank, f"Will run {len(selected_exps)} experiment(s) × {len(fold_list)} fold(s) = "
-                      f"{len(selected_exps) * len(fold_list)} training run(s)")
+    fold_list = list(range(n_folds)) if args.all_folds else [int(args.fold)]
+    _print_main(rank, f"=== sweep plan ===")
+    _print_main(rank, f"  experiments     : {len(selected_exps)}  (--exp filter: {args.exp or '<all>'})")
+    _print_main(rank, f"  folds per exp   : {len(fold_list)}  (folds={fold_list})")
+    _print_main(rank, f"  total runs      : {len(selected_exps) * len(fold_list)}")
+    _print_main(rank, f"  output root     : {output_dir}")
+    _print_main(rank, f"  per-run dir     : {{exp_name}}/fold{{f}}/")
+    _print_main(rank, f"  summary CSV     : {output_dir / 'experiments_summary.csv'}")
+    _print_main(rank, "")
 
     all_summaries: List[Dict[str, Any]] = []
     for experiment in selected_exps:

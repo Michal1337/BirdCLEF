@@ -886,7 +886,7 @@ def main() -> None:
     experiments = build_experiment_configs()
     all_summaries: List[Dict[str, Any]] = []
 
-    for experiment in experiments[10:]:
+    for experiment in experiments:
         summary: Dict[str, Any]
         try:
             summary = run_experiment(
