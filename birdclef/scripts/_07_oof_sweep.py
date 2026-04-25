@@ -19,10 +19,18 @@ PRESETS = {
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--sweep", default="cheap_wins", choices=list(PRESETS))
+    ap.add_argument("--n-splits", type=int, default=5, choices=[5, 10],
+                    help="Static fold parquet to use. Default 5. Build via "
+                         "`python -m birdclef.scripts._02_build_splits`.")
     args = ap.parse_args()
-    configs = PRESETS[args.sweep]
+
+    # Stamp n_splits onto every config in the preset so train_ssm_head picks
+    # the right fold parquet. Output dir suffixed with the fold count so
+    # 5-fold and 10-fold sweep results don't clobber each other.
+    configs = [{**c, "n_splits": int(args.n_splits)} for c in PRESETS[args.sweep]]
+    sweep_name = args.sweep if args.n_splits == 5 else f"{args.sweep}_10fold"
     run_sweep(
-        name=args.sweep,
+        name=sweep_name,
         configs=configs,
         stage_fn=run_full_evaluation,
         output_root=OUTPUT_ROOT / "sweep",
