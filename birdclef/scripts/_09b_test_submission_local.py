@@ -106,10 +106,23 @@ def _score_v_anchor_csv(out_csv: Path, n_files_in_test: int) -> dict:
     P = merged[label_cols].to_numpy(dtype=np.float32)
     Y = Y_all[merged["_y_idx"].to_numpy()]
     meta = merged[["site", "hour_utc"]].reset_index(drop=True)
+
+    n_nan = int(np.isnan(P).sum())
+    n_inf = int(np.isinf(P).sum())
+    if n_nan or n_inf:
+        print(f"[local-test] WARNING: predictions contain {n_nan} NaN and {n_inf} Inf values "
+              f"(out of {P.size} cells). Likely cause: FP16 mel-FFT overflow in the ONNX. "
+              "Re-export with the patched birdclef/submit/export_onnx.py "
+              "(opset=17, dynamo=False, op_block_list keeps frontend in fp32).")
+        # Coerce so we still produce a usable AUC; treat NaN as 0 (= 'no info').
+        P = np.where(np.isfinite(P), P, 0.0)
+
     m = compute_stage_metrics(Y, P, meta)
     m["n_files_scored"] = int(merged["filename"].nunique())
     m["n_rows_scored"] = int(len(merged))
     m["n_files_in_test_pool"] = int(n_files_in_test)
+    m["n_nan_in_predictions"] = n_nan
+    m["n_inf_in_predictions"] = n_inf
     return m
 
 

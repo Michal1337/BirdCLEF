@@ -1,4 +1,14 @@
-"""Export a trained SED PyTorch checkpoint to ONNX (optionally FP16-cast).
+"""Export a trained SED PyTorch checkpoint to ONNX (FP32 + optional FP16 cast).
+
+Two important hardening steps vs. naive `torch.onnx.export(...)`:
+
+1. `dynamo=False` — pin the legacy TorchScript exporter. PyTorch 2.5+ defaults
+   to the dynamo-based exporter which is still maturing and trips on the mel
+   front-end's Pad op when version-converting to opset 17.
+2. The FP16 cast `op_block_list` keeps the audio front-end (STFT/FFT, mel
+   matmul, log) in FP32. FP16 FFT routinely overflows on real audio and emits
+   NaN/Inf — the exact symptom you'd see as `ValueError: Input contains NaN`
+   downstream.
 
 Usage:
     python -m birdclef.submit.export_onnx \
@@ -8,17 +18,35 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import math
 from pathlib import Path
 
 import torch
 
-from birdclef.config.paths import SR, WINDOW_SAMPLES
+from birdclef.config.paths import WINDOW_SAMPLES
 
 
-def export(ckpt: Path, out: Path, fp16: bool = True, opset: int = 17) -> None:
-    # Defer training-dep imports to this function so the submit-side import
-    # guard only trips on the guarded module chain.
+# Ops that must stay in FP32 — these overflow / underflow at fp16 precision
+# and produce NaN, sometimes silently. Conservatively block every op that
+# touches the audio frontend.
+FP16_OP_BLOCK_LIST = [
+    "Pad",        # zero-pad before STFT
+    "STFT",       # complex twiddle factors
+    "MatMul",     # too aggressive globally? — see below
+    "Mul",
+    "Sub",
+    "Div",
+    "Log",        # log-mel
+    "ReduceMean", # variance / std normalization
+    "ReduceMax",
+    "ReduceMin",
+    "Sqrt",
+    "Pow",
+    "Erf",
+]
+
+
+def export(ckpt: Path, out: Path, fp16: bool = True, opset: int = 17,
+           fp16_block_list=None) -> None:
     from birdclef.models.sed import SED, SEDConfig
 
     state = torch.load(ckpt, map_location="cpu")
@@ -46,24 +74,29 @@ def export(ckpt: Path, out: Path, fp16: bool = True, opset: int = 17) -> None:
         input_names=["wave"], output_names=["logits"],
         dynamic_axes={"wave": {0: "batch"}, "logits": {0: "batch"}},
         opset_version=opset, do_constant_folding=True,
+        dynamo=False,                  # pin legacy TorchScript exporter
     )
-    print(f"[onnx] exported {out}")
+    print(f"[onnx] exported {out}  (opset={opset})")
 
     if fp16:
         try:
             from onnxconverter_common import float16
             import onnx
 
+            block = list(fp16_block_list) if fp16_block_list is not None else list(FP16_OP_BLOCK_LIST)
             m = onnx.load(str(out))
-            # keep_io_types=True leaves the model's input/output tensors as
-            # float32 even though weights and intermediate ops cast down to
-            # float16. Saves a `wins.astype(np.float16)` dance in the
-            # inference template and avoids the "Unexpected input data type"
-            # crash at submission time.
-            m16 = float16.convert_float_to_float16(m, keep_io_types=True)
+            # keep_io_types=True : input/output tensors stay float32 (no caller-
+            # side dtype dance). op_block_list : keep frontend ops in fp32 so
+            # the FFT doesn't overflow into NaN.
+            m16 = float16.convert_float_to_float16(
+                m,
+                keep_io_types=True,
+                op_block_list=block,
+            )
             out16 = out.with_suffix(".fp16.onnx")
             onnx.save(m16, str(out16))
-            print(f"[onnx] FP16 cast saved to {out16}")
+            print(f"[onnx] FP16 cast saved to {out16}  "
+                  f"(fp32 ops kept: {len(block)})")
         except Exception as exc:
             print(f"[onnx] FP16 cast failed ({exc}); keep FP32 model.")
 
@@ -74,8 +107,13 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--no-fp16", action="store_true")
     ap.add_argument("--opset", type=int, default=17)
+    ap.add_argument("--fp16-block", nargs="*", default=None,
+                    help=f"ONNX op types to keep in fp32 during the FP16 cast. "
+                         f"Default: {FP16_OP_BLOCK_LIST}")
     args = ap.parse_args()
-    export(Path(args.ckpt), Path(args.out), fp16=not args.no_fp16, opset=args.opset)
+    export(Path(args.ckpt), Path(args.out),
+           fp16=not args.no_fp16, opset=args.opset,
+           fp16_block_list=args.fp16_block)
 
 
 if __name__ == "__main__":
