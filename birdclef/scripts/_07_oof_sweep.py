@@ -4,21 +4,15 @@ from __future__ import annotations
 import argparse
 
 from birdclef.config.paths import OUTPUT_ROOT
-from birdclef.config.ssm_configs import (
-    SWEEP_BASELINE,
-    SWEEP_BEST_SSM,
-    SWEEP_CHEAP_WINS,
-    SWEEP_LB_093,
-)
+from birdclef.config.ssm_configs import SWEEP_BEST_SSM, SWEEP_CHEAP_WINS, SWEEP_LB_093
 from birdclef.sweep.runner import run_sweep
 from birdclef.train.train_ssm_head import run_full_evaluation
 
 
 PRESETS = {
-    "baseline": SWEEP_BASELINE,
     "cheap_wins": SWEEP_CHEAP_WINS,
     "best_ssm": SWEEP_BEST_SSM,
-    "lb_093": SWEEP_LB_093,
+    "lb": SWEEP_LB_093,
 }
 
 
