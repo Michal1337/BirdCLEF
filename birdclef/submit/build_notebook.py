@@ -36,8 +36,19 @@ def _nbcell(source: str, cell_type: str = "code") -> dict:
     }
 
 
-def build(out_ipynb: Path, recipe_json: Path, sed_onnx_paths: list[str],
-          perch_onnx_path: str | None = None, variant: str = "bold") -> None:
+DEFAULT_TEST_DIR = "/kaggle/input/birdclef-2026/test_soundscapes"
+DEFAULT_SAMPLE_SUB = "/kaggle/input/birdclef-2026/sample_submission.csv"
+
+
+def build(
+    out_ipynb: Path,
+    recipe_json: Path,
+    sed_onnx_paths: list[str],
+    perch_onnx_path: str | None = None,
+    variant: str = "bold",
+    test_dir: str = DEFAULT_TEST_DIR,
+    sample_sub_csv: str = DEFAULT_SAMPLE_SUB,
+) -> None:
     tpl = (Path(__file__).parent / "inference_template.py").read_text(encoding="utf-8")
 
     # Inline the recipe so the notebook needs no separate JSON file uploaded
@@ -67,8 +78,8 @@ from pathlib import Path
 recipe = {_py_literal(recipe)}
 
 run_submission(
-    test_dir=Path('/kaggle/input/birdclef-2026/test_soundscapes'),
-    sample_sub_csv=Path('/kaggle/input/birdclef-2026/sample_submission.csv'),
+    test_dir=Path({_py_literal(test_dir)}),
+    sample_sub_csv=Path({_py_literal(sample_sub_csv)}),
     perch_onnx={_py_literal(perch_onnx_path)},
     sed_onnx_paths={_py_literal(list(sed_onnx_paths))},
     recipe=recipe,
@@ -104,8 +115,18 @@ def main():
     ap.add_argument("--sed-onnx", nargs="+", default=[])
     ap.add_argument("--perch-onnx", default=None)
     ap.add_argument("--variant", default="bold")
+    ap.add_argument("--test-dir", default=DEFAULT_TEST_DIR,
+                    help=f"Kaggle path to test soundscape OGGs. Default: {DEFAULT_TEST_DIR}")
+    ap.add_argument("--sample-sub", default=DEFAULT_SAMPLE_SUB,
+                    help=f"Kaggle path to sample_submission.csv. Default: {DEFAULT_SAMPLE_SUB}")
     args = ap.parse_args()
-    build(Path(args.out), Path(args.recipe), args.sed_onnx, args.perch_onnx, args.variant)
+    build(
+        Path(args.out), Path(args.recipe), args.sed_onnx,
+        perch_onnx_path=args.perch_onnx,
+        variant=args.variant,
+        test_dir=args.test_dir,
+        sample_sub_csv=args.sample_sub,
+    )
 
 
 if __name__ == "__main__":
