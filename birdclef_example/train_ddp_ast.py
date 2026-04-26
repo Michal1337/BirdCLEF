@@ -104,6 +104,33 @@ _FBANK_MEAN = -4.2677
 _FBANK_STD = 4.5689
 
 
+def _interpolate_position_embeddings(
+    old_pe: torch.Tensor, n_freq: int, n_time_old: int, n_time_new: int,
+    n_special: int = 2,
+) -> torch.Tensor:
+    """2D bicubic interpolation of AST position embeddings along the time axis.
+
+    AST checkpoint at max_length=1024 has position_embeddings of shape
+    (1, 1214, 768) = (1, n_special + n_freq*n_time_old, embed_dim) where
+    n_special=2 (CLS + distillation token), n_freq=12, n_time_old=101.
+
+    When we change max_length (e.g. to 512 → n_time_new=50), the naive
+    `from_pretrained` flow REINITIALIZES this Parameter randomly because
+    of the size mismatch — throwing away the pretrained temporal priors.
+    Interpolating preserves them.
+    """
+    embed_dim = old_pe.shape[-1]
+    special = old_pe[:, :n_special, :]                     # (1, n_special, embed)
+    patches = old_pe[:, n_special:, :]                     # (1, n_freq*n_time_old, embed)
+    # Reshape to spatial grid: (1, embed, n_freq, n_time_old)
+    grid = patches.transpose(1, 2).reshape(1, embed_dim, n_freq, n_time_old).float()
+    new_grid = torch.nn.functional.interpolate(
+        grid, size=(n_freq, n_time_new), mode="bicubic", align_corners=False,
+    )                                                      # (1, embed, n_freq, n_time_new)
+    new_patches = new_grid.reshape(1, embed_dim, n_freq * n_time_new).transpose(1, 2)
+    return torch.cat([special, new_patches.to(old_pe.dtype)], dim=1)
+
+
 class ASTSpectrogramClassifier(nn.Module):
     """AST wrapper: raw 32kHz waveform in, 234-class logits out.
 
@@ -140,15 +167,42 @@ class ASTSpectrogramClassifier(nn.Module):
                 "transformers package required. Install: pip install transformers>=4.35"
             ) from e
 
+        # 1) Pull the pretrained config + state_dict at the ORIGINAL max_length
+        #    (1024 by default) so we get the full-size pretrained position
+        #    embeddings (1, 1214, 768). Without this step `from_pretrained` at
+        #    a different max_length silently REINITIALIZES the position
+        #    embeddings — wiping out the AudioSet temporal priors.
+        orig_cfg = ASTConfig.from_pretrained(hf_model_name)
+        tmp_model = ASTForAudioClassification.from_pretrained(
+            hf_model_name,
+            num_labels=int(n_classes),
+            ignore_mismatched_sizes=True,  # only the classifier head mismatches; PE matches
+        )
+        state = tmp_model.state_dict()
+        del tmp_model
+
+        # 2) Interpolate the position embeddings to our target time length.
+        n_freq = (int(num_mel_bins) - orig_cfg.patch_size) // orig_cfg.frequency_stride + 1
+        n_time_old = (orig_cfg.max_length - orig_cfg.patch_size) // orig_cfg.time_stride + 1
+        n_time_new = (int(max_length) - orig_cfg.patch_size) // orig_cfg.time_stride + 1
+        pe_key = "audio_spectrogram_transformer.embeddings.position_embeddings"
+        if n_time_new != n_time_old and pe_key in state:
+            state[pe_key] = _interpolate_position_embeddings(
+                state[pe_key], n_freq=n_freq,
+                n_time_old=n_time_old, n_time_new=n_time_new, n_special=2,
+            )
+
+        # 3) Build the actual model with the target config + load interpolated weights.
         cfg = ASTConfig.from_pretrained(hf_model_name)
         cfg.num_labels = int(n_classes)
         cfg.max_length = int(max_length)
         cfg.num_mel_bins = int(num_mel_bins)
-        # `ignore_mismatched_sizes` lets us swap the 527-class AudioSet head
-        # for a fresh n_classes head; positional embeddings interpolate.
-        self.model = ASTForAudioClassification.from_pretrained(
-            hf_model_name, config=cfg, ignore_mismatched_sizes=True,
-        )
+        self.model = ASTForAudioClassification(cfg)
+        # The classifier in `state` has fresh-init weights (right shape) from the
+        # tmp_model build above. Loading non-strict is fine; remaining fresh-init
+        # is just the patch embeddings shape if num_mel_bins changed, which it
+        # didn't here. strict=True after popping classifier keys would also work.
+        self.model.load_state_dict(state, strict=False)
 
         self.input_sample_rate = int(input_sample_rate)
         self.target_sample_rate = int(target_sample_rate)
@@ -171,6 +225,10 @@ class ASTSpectrogramClassifier(nn.Module):
 
         AST's pretraining used these exact settings (10ms hop, 25ms window,
         128 mel bins, no dither). We must match.
+
+        torchaudio.compliance.kaldi.fbank does NOT support bf16/fp16 inputs
+        (raises 'Unsupported dtype BFloat16'). The caller `_compute_fbanks`
+        wraps this in an autocast-disabled block + casts to float32.
         """
         fbank = torchaudio.compliance.kaldi.fbank(
             waveform_1xT,
@@ -193,9 +251,14 @@ class ASTSpectrogramClassifier(nn.Module):
         return fbank  # (max_length, num_mel_bins)
 
     def _compute_fbanks(self, waveform_BxT: torch.Tensor) -> torch.Tensor:
-        # kaldi.fbank doesn't batch; loop is cheap at typical batch sizes.
-        out = [self._fbank_one(waveform_BxT[i : i + 1]) for i in range(waveform_BxT.size(0))]
-        return torch.stack(out, dim=0)  # (B, max_length, num_mel_bins)
+        # kaldi.fbank requires float32 + isn't autocast-compatible; force fp32
+        # context for the preprocessing stage. The model body still runs in
+        # whatever dtype the outer autocast specifies.
+        device_type = waveform_BxT.device.type
+        with torch.autocast(device_type=device_type, enabled=False):
+            wav_f32 = waveform_BxT.float()
+            out = [self._fbank_one(wav_f32[i : i + 1]) for i in range(wav_f32.size(0))]
+            return torch.stack(out, dim=0)  # (B, max_length, num_mel_bins)
 
     def _apply_specaugment(self, fbank: torch.Tensor) -> torch.Tensor:
         # fbank: (B, T, F) — torchaudio masks expect (..., F, T), so transpose
