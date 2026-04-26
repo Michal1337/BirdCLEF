@@ -16,6 +16,7 @@ BASELINE = dict(
     seed=42,
     ensemble_w=0.50,
     lambda_prior=0.40,
+    lambda_prior_texture=1.00,
     correction_weight=0.30,
     loss="bce_focal_mean",
     focal_alpha=0.25,
@@ -93,10 +94,12 @@ SWEEP_BEST_SSM = [
     _make(name="corr_off", correction_weight=0.0),
     _make(name="corr_strong", correction_weight=0.50),
     _make(name="residual_long", residual_n_epochs=60, residual_patience=15),
-    # Prior strength (BASELINE lambda=0.40)
-    _make(name="prior_off", lambda_prior=0.0),
-    _make(name="prior_weak", lambda_prior=0.20),
-    _make(name="prior_strong", lambda_prior=0.60),
+    # Prior strength (BASELINE lambda=0.40, lambda_texture=1.00)
+    _make(name="prior_off", lambda_prior=0.0, lambda_prior_texture=0.0),
+    _make(name="prior_weak", lambda_prior=0.20, lambda_prior_texture=0.50),
+    _make(name="prior_strong", lambda_prior=0.60, lambda_prior_texture=1.50),
+    _make(name="prior_texture_off", lambda_prior_texture=0.40),
+    _make(name="prior_texture_15", lambda_prior_texture=1.50),
     # Loss shape (BASELINE bce_focal_mean, focal_gamma=2.5)
     _make(name="focal_g15", focal_gamma=1.5),
     _make(name="focal_g35", focal_gamma=3.5),

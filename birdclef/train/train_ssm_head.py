@@ -334,6 +334,21 @@ def _temperature_vector(labels: list, class_map: Dict[str, str]) -> np.ndarray:
     return t
 
 
+def _lambda_prior_vector(
+    labels: list, class_map: Dict[str, str],
+    lambda_birds: float, lambda_texture: float,
+) -> np.ndarray:
+    """Per-class prior strength: stronger λ for continuous callers (frogs/insects)
+    where Perch is weak, weaker λ for birds where Perch is reliable.
+    Matches the LB_0931_seed.ipynb cell-26 split that boosted LB by ~0.005.
+    """
+    lam = np.full(len(labels), float(lambda_birds), dtype=np.float32)
+    for i, lb in enumerate(labels):
+        if class_map.get(lb, "Aves") in {"Amphibia", "Insecta"}:
+            lam[i] = float(lambda_texture)
+    return lam
+
+
 def _postproc(
     first_pass_logits: np.ndarray, temperatures: np.ndarray, cfg: dict,
 ) -> np.ndarray:
@@ -363,6 +378,7 @@ def _labeled_file_meta(meta_rows: pd.DataFrame) -> pd.DataFrame:
 def run_pipeline_for_split(
     cache: PerchCache, train_idx: np.ndarray, val_idx: np.ndarray, cfg: dict,
     temperatures: np.ndarray,
+    lambda_prior_vec: np.ndarray | None = None,
 ) -> dict:
     """Train on train_idx rows, predict on val_idx rows.
 
@@ -386,7 +402,8 @@ def run_pipeline_for_split(
 
     probe_models, scaler, pca = _train_mlp_probes(emb_tr, sc_tr, Y_tr, cfg)
     prior_tables = build_prior_tables(meta_tr, Y_tr)
-    sc_va_prior = logit_prior_shift(sc_va, meta_va, prior_tables, lambda_prior=float(cfg["lambda_prior"]))
+    lam = lambda_prior_vec if lambda_prior_vec is not None else float(cfg["lambda_prior"])
+    sc_va_prior = logit_prior_shift(sc_va, meta_va, prior_tables, lambda_prior=lam)
     sc_va_mlp = _apply_mlp_probes(emb_va, sc_va_prior, probe_models, scaler, pca,
                                   float(cfg["mlp_alpha_blend"]))
     first_pass_va = float(cfg["ensemble_w"]) * proto_va + (1.0 - float(cfg["ensemble_w"])) * sc_va_mlp
@@ -396,7 +413,7 @@ def run_pipeline_for_split(
     tr_site_ids, tr_hour_ids = _site_hour_ids(tr_files, tr_site2i, int(cfg["n_sites_cap"]))
     va_site_ids, va_hour_ids = _site_hour_ids(va_files, tr_site2i, int(cfg["n_sites_cap"]))
     proto_tr = _predict_proto(proto, emb_tr, sc_tr, tr_files, cfg)
-    sc_tr_prior = logit_prior_shift(sc_tr, meta_tr, prior_tables, lambda_prior=float(cfg["lambda_prior"]))
+    sc_tr_prior = logit_prior_shift(sc_tr, meta_tr, prior_tables, lambda_prior=lam)
     sc_tr_mlp = _apply_mlp_probes(emb_tr, sc_tr_prior, probe_models, scaler, pca,
                                   float(cfg["mlp_alpha_blend"]))
     first_pass_tr = float(cfg["ensemble_w"]) * proto_tr + (1.0 - float(cfg["ensemble_w"])) * sc_tr_mlp
@@ -447,6 +464,11 @@ def run_full_evaluation(cfg: dict) -> Dict:
     class_map = tax.set_index("primary_label")["class_name"].to_dict()
     labels = primary_labels()
     temperatures = _temperature_vector(labels, class_map)
+    lambda_prior_vec = _lambda_prior_vector(
+        labels, class_map,
+        lambda_birds=float(cfg["lambda_prior"]),
+        lambda_texture=float(cfg.get("lambda_prior_texture", cfg["lambda_prior"])),
+    )
 
     # Rare/frequent split (support from LABELED rows only — that's what we
     # have for this comparative sweep).
@@ -469,7 +491,8 @@ def run_full_evaluation(cfg: dict) -> Dict:
         if len(va) == 0:
             continue
         seed_everything(base_seed + int(f) + 1)
-        out = run_pipeline_for_split(cache_sub, tr, va, cfg, temperatures)
+        out = run_pipeline_for_split(cache_sub, tr, va, cfg, temperatures,
+                                     lambda_prior_vec=lambda_prior_vec)
         oof_final[va] = out["final"]
         oof_fp[va] = out["first_pass"]
         va_meta = cache_meta.iloc[va].reset_index(drop=True)

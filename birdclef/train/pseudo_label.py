@@ -182,6 +182,7 @@ def pseudo_label_with_ssm_pipeline(
     """
     from birdclef.train.train_ssm_head import (
         PerchCache,
+        _lambda_prior_vector,
         _temperature_vector,
         load_perch_cache,
         run_pipeline_for_split,
@@ -206,6 +207,11 @@ def pseudo_label_with_ssm_pipeline(
     tax = load_taxonomy()
     class_map = tax.set_index("primary_label")["class_name"].to_dict()
     temperatures = _temperature_vector(labels, class_map)
+    lambda_prior_vec = _lambda_prior_vector(
+        labels, class_map,
+        lambda_birds=float(teacher_cfg["lambda_prior"]),
+        lambda_texture=float(teacher_cfg.get("lambda_prior_texture", teacher_cfg["lambda_prior"])),
+    )
 
     t0 = time.time()
     agg_final = np.zeros((n_rows, n_classes), dtype=np.float64)
@@ -215,7 +221,8 @@ def pseudo_label_with_ssm_pipeline(
         seed_everything(int(seed))
         cfg_seed = {**teacher_cfg, "seed": int(seed),
                     "name": f"{teacher_cfg.get('name', 'teacher')}_s{seed}"}
-        out = run_pipeline_for_split(cache, train_idx, all_idx, cfg_seed, temperatures)
+        out = run_pipeline_for_split(cache, train_idx, all_idx, cfg_seed, temperatures,
+                                     lambda_prior_vec=lambda_prior_vec)
         agg_final += out["final"].astype(np.float64)
         agg_first_pass += out["first_pass"].astype(np.float64)
     agg_final = (agg_final / len(seeds)).astype(np.float32)

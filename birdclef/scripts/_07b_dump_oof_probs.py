@@ -59,6 +59,7 @@ def _dump_ssm(out_dir: Path, ssm_config_name: str, n_splits: int) -> tuple[np.nd
     from birdclef.data.soundscapes import load_taxonomy, primary_labels
     from birdclef.train.train_ssm_head import (
         PerchCache,
+        _lambda_prior_vector,
         _temperature_vector,
         load_perch_cache,
         run_pipeline_for_split,
@@ -85,6 +86,11 @@ def _dump_ssm(out_dir: Path, ssm_config_name: str, n_splits: int) -> tuple[np.nd
     class_map = tax.set_index("primary_label")["class_name"].to_dict()
     labels = primary_labels()
     temperatures = _temperature_vector(labels, class_map)
+    lambda_prior_vec = _lambda_prior_vector(
+        labels, class_map,
+        lambda_birds=float(cfg["lambda_prior"]),
+        lambda_texture=float(cfg.get("lambda_prior_texture", cfg["lambda_prior"])),
+    )
 
     folds_df = load_folds(n_splits=int(n_splits))
     fold_of = dict(zip(folds_df["filename"], folds_df["fold"].astype(int)))
@@ -100,7 +106,8 @@ def _dump_ssm(out_dir: Path, ssm_config_name: str, n_splits: int) -> tuple[np.nd
             print(f"[ssm-oof]   fold {f}: empty val set, skipping")
             continue
         seed_everything(cfg["seed"] + int(f) + 1)
-        out = run_pipeline_for_split(cache_sub, tr, va, cfg, temperatures)
+        out = run_pipeline_for_split(cache_sub, tr, va, cfg, temperatures,
+                                     lambda_prior_vec=lambda_prior_vec)
         oof_final[va] = out["final"]
         print(f"[ssm-oof]   fold {f}: train={len(tr)} val={len(va)} done")
 

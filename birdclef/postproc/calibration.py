@@ -61,9 +61,14 @@ def logit_prior_shift(
     scores: np.ndarray,
     meta,  # DataFrame with site, hour_utc
     prior_tables: dict,
-    lambda_prior: float = 0.4,
+    lambda_prior=0.4,
 ) -> np.ndarray:
-    """Additive prior shift in logit space (site + hour empirical rates)."""
+    """Additive prior shift in logit space (site + hour empirical rates).
+
+    `lambda_prior` may be a scalar (uniform across classes) or a 1D array of
+    length n_classes (per-class strength — e.g. stronger for Amphibia/Insecta
+    where Perch is weak, weaker for birds where Perch is reliable).
+    """
     eps = 1e-4
     n = len(scores)
     out = scores.copy()
@@ -87,7 +92,10 @@ def logit_prior_shift(
             p[i] = w * prior_tables["site_p"][j] + (1 - w) * p[i]
     p = np.clip(p, eps, 1 - eps)
     logit_prior = np.log(p) - np.log1p(-p)
-    return out + lambda_prior * logit_prior
+    lam = np.asarray(lambda_prior, dtype=np.float32)
+    if lam.ndim == 0:
+        return out + float(lam) * logit_prior
+    return out + lam[None, :] * logit_prior
 
 
 def build_prior_tables(meta, y_labels: np.ndarray) -> dict:
