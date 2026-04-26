@@ -6,7 +6,7 @@ import warnings
 warnings.filterwarnings("ignore")
 
 from birdclef.config.paths import OUTPUT_ROOT
-from birdclef.config.ssm_configs import SWEEP_BEST_SSM, SWEEP_CHEAP_WINS, SWEEP_LB_093
+from birdclef.config.ssm_configs import SWEEP_BEST_SSM, SWEEP_CHEAP_WINS
 from birdclef.sweep.runner import run_sweep
 from birdclef.train.train_ssm_head import run_full_evaluation
 
@@ -14,7 +14,6 @@ from birdclef.train.train_ssm_head import run_full_evaluation
 PRESETS = {
     "cheap_wins": SWEEP_CHEAP_WINS,
     "best_ssm": SWEEP_BEST_SSM,
-    "lb": SWEEP_LB_093,
 }
 
 
