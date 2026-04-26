@@ -77,6 +77,21 @@ API_V3 = "https://www.xeno-canto.org/api/3/recordings"
 API_V2 = "https://www.xeno-canto.org/api/2/recordings"
 
 
+_DEBUG = False
+
+
+def _tag_value(s: str) -> str:
+    """Format a single tag value for the v3 query string.
+
+    XC v3 tag values: lowercase, no quotes for single tokens, double-quoted
+    only for multi-token values (rare for genus/species).
+    """
+    s = s.strip().lower()
+    if " " in s:
+        return f'"{s}"'
+    return s
+
+
 def _query_xc(scientific_name: str, page: int = 1, sleep: float = 1.0,
               quality: str = "A,B", api_key: str | None = None) -> Dict[str, Any]:
     """One paginated Xeno-Canto query.
@@ -92,12 +107,11 @@ def _query_xc(scientific_name: str, page: int = 1, sleep: float = 1.0,
     """
     parts = str(scientific_name).split()
     if api_key:
-        # v3: tag syntax. genus + species; if there's only one token treat
-        # it as genus (rare: catches taxa named to genus only).
+        # v3 tag syntax: lowercase, no quotes for single-token values.
         if len(parts) >= 2:
-            q = f'gen:"{parts[0]}" sp:"{parts[1]}" q:{quality}'
+            q = f"gen:{_tag_value(parts[0])} sp:{_tag_value(parts[1])} q:{quality}"
         else:
-            q = f'gen:"{parts[0]}" q:{quality}'
+            q = f"gen:{_tag_value(parts[0])} q:{quality}"
         params = {"query": q, "page": page, "key": api_key}
         url = API_V3
     else:
@@ -105,6 +119,11 @@ def _query_xc(scientific_name: str, page: int = 1, sleep: float = 1.0,
         q = f'"{scientific_name}" q:{quality}'
         params = {"query": q, "page": page}
         url = API_V2
+    if _DEBUG:
+        prep = requests.Request("GET", url, params=params).prepare()
+        # Mask the API key in the printed URL
+        printable = prep.url.replace(api_key or "", "***") if api_key else prep.url
+        print(f"[xc-debug] GET {printable}")
     r = requests.get(url, params=params, timeout=30)
     if r.status_code == 401:
         raise RuntimeError(
@@ -206,7 +225,11 @@ def main() -> None:
                          "without warning.")
     ap.add_argument("--dry-run", action="store_true",
                     help="Query only, count results, no downloads or CSV write.")
+    ap.add_argument("--debug", action="store_true",
+                    help="Print every API request URL (key masked).")
     args = ap.parse_args()
+    global _DEBUG
+    _DEBUG = bool(args.debug)
 
     api_key = args.api_key or os.environ.get("XENO_CANTO_API_KEY")
     if api_key:
