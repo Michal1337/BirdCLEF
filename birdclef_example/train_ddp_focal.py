@@ -94,8 +94,104 @@ from birdclef_example.train_ddp_sota import (  # noqa: E402
 from birdclef_example.utils import birdclef_roc_auc, is_better_score, save_model, set_seed  # noqa: E402
 
 
+def build_focal_experiment_configs() -> List[Dict[str, Any]]:
+    """Extended config grid for the focal trainer.
+
+    Includes the existing 23 nfnet variants from `build_experiment_configs()`
+    plus focal-specific extensions:
+
+      - **Backbone diversity**: efficientnet_v2_s, convnext_pico, regnety_032,
+        eca_nfnet_l1 (one notch up). Beats Perch on focal classes likely
+        requires architecture diversity, not just LR tuning.
+      - **Longer training**: 30 / 50 epochs for the most promising bases —
+        focal→soundscape domain transfer benefits from more updates.
+      - **Heavier augmentation**: mixup α=1.0 + spec_noise_std=0.05–0.10
+        + larger SpecAug masks. Reduces train→val domain gap.
+
+    Each config can override CLI `--epochs` via the `epochs` key (read by
+    `run_one_experiment`). Configs without an `epochs` key inherit from CLI.
+    """
+    base_configs = list(build_experiment_configs())
+
+    # Common defaults shared across the new backbone variants
+    common = {
+        "image_size": 288,
+        "n_mels": 160,
+        "n_fft": 2048,
+        "hop_length": 512,
+        "freq_mask_param": 12,
+        "time_mask_param": 24,
+        "specaugment_masks": 2,
+        "spec_noise_std": 0.0,
+        "mixup_alpha": 0.2,
+        "mixup_probability": 1.0,
+        "label_smoothing": 0.03,
+        "weight_decay": 4e-4,
+        "warmup_epochs": 3,
+        "min_lr_ratio": 0.02,
+        "bce_weight": 0.7,
+        "focal_weight": 0.3,
+        "focal_gamma": 2.0,
+        "sampling_power": 0.5,
+        "lr_head": 8e-4,
+        "lr_backbone": 1e-4,
+    }
+
+    extensions: List[Dict[str, Any]] = []
+
+    # --- Backbone diversity (each at default 30 epochs) ---
+    for backbone, lr_b, lr_h, img in [
+        ("eca_nfnet_l1",     8e-5,  6e-4, 320),
+        ("efficientnet_v2_s", 1e-4, 8e-4, 288),
+        ("convnext_pico",    1e-4,  8e-4, 288),
+        ("regnety_032",      1e-4,  8e-4, 288),
+    ]:
+        cfg = dict(common)
+        cfg.update({
+            "name": f"focal_{backbone}_e30",
+            "backbone_name": backbone,
+            "image_size": img,
+            "lr_backbone": lr_b,
+            "lr_head": lr_h,
+            "epochs": 30,
+        })
+        extensions.append(cfg)
+
+    # --- Longer training on the strongest base (eca_nfnet_l0, sota02 lr) ---
+    for n_epochs in (30, 50):
+        cfg = dict(common)
+        cfg.update({
+            "name": f"focal_nfnet_l0_e{n_epochs}",
+            "backbone_name": "eca_nfnet_l0",
+            "lr_backbone": 6e-5,  # sota02
+            "lr_head": 7e-4,      # sota02
+            "epochs": n_epochs,
+        })
+        extensions.append(cfg)
+
+    # --- Heavy aug variants (longer training to let the model exploit it) ---
+    for tag, overrides in [
+        ("mixupA10",   {"mixup_alpha": 1.0}),
+        ("specnoise",  {"spec_noise_std": 0.08, "freq_mask_param": 16, "time_mask_param": 32}),
+        ("heavyaug",   {"mixup_alpha": 0.6, "spec_noise_std": 0.05,
+                        "freq_mask_param": 14, "time_mask_param": 28, "specaugment_masks": 3}),
+    ]:
+        cfg = dict(common)
+        cfg.update({
+            "name": f"focal_nfnet_l0_e30_{tag}",
+            "backbone_name": "eca_nfnet_l0",
+            "lr_backbone": 6e-5,
+            "lr_head": 7e-4,
+            "epochs": 30,
+        })
+        cfg.update(overrides)
+        extensions.append(cfg)
+
+    return base_configs + extensions
+
+
 def _select_experiments(name_filter: Optional[str]) -> List[Dict[str, Any]]:
-    all_exp = build_experiment_configs()
+    all_exp = build_focal_experiment_configs()
     if not name_filter:
         return all_exp
     matches = [e for e in all_exp if e["name"] == name_filter]
@@ -129,6 +225,96 @@ def _build_focal_class_indices(
     return np.array(sorted(label_map[lb] for lb in seen), dtype=np.int64)
 
 
+def _build_taxa_indices(label_map: Dict[str, int],
+                        taxonomy_path: Path) -> Dict[str, np.ndarray]:
+    """Per-taxonomic-class label indices (Aves / Amphibia / Insecta /
+    Mammalia / Reptilia). Lets us split macro AUC by taxon and surface
+    where the CNN actually moves the needle (e.g. Amphibia after XC,
+    Mammalia/Reptilia where Perch is blind).
+    """
+    tax = pd.read_csv(taxonomy_path)
+    label_to_taxon = dict(zip(
+        tax["primary_label"].astype(str), tax["class_name"].astype(str),
+    ))
+    out: Dict[str, list[int]] = {}
+    for lb, idx in label_map.items():
+        taxon = label_to_taxon.get(str(lb), "Unknown")
+        out.setdefault(taxon, []).append(int(idx))
+    return {k: np.array(sorted(v), dtype=np.int64) for k, v in out.items()}
+
+
+def _r4(x) -> float | None:
+    """Round-or-None: round to 4 decimal places, propagate NaN as None for
+    JSON-friendliness. Pandas handles None as NaN cleanly in DataFrames.
+    """
+    try:
+        if x is None:
+            return None
+        f = float(x)
+        if f != f:  # NaN
+            return None
+        return round(f, 4)
+    except (TypeError, ValueError):
+        return None
+
+
+@torch.no_grad()
+def _evaluate_full(
+    model: nn.Module,
+    dataloader: DataLoader,
+    criterion,
+    device: torch.device,
+    focal_class_indices: np.ndarray,
+    taxa_indices: Dict[str, np.ndarray],
+    use_bf16: bool = False,
+) -> Dict[str, Any]:
+    """One forward pass over the val loader → loss, val_auc_seen,
+    val_auc_focal_seen, and per-taxon macro AUCs. All AUCs use
+    `birdclef_roc_auc` which auto-skips classes with zero positives.
+    """
+    model.eval()
+    losses: List[float] = []
+    targets_chunks: List[torch.Tensor] = []
+    preds_chunks: List[torch.Tensor] = []
+    amp_enabled = use_bf16 and device.type == "cuda"
+
+    for inputs, targets in dataloader:
+        inputs = inputs.to(device, non_blocking=True)
+        targets = targets.to(device, non_blocking=True)
+        with torch.autocast(device_type=device.type, dtype=torch.bfloat16,
+                            enabled=amp_enabled):
+            logits = model(inputs)
+            loss = criterion(logits, targets)
+        losses.append(loss.item())
+        targets_chunks.append(targets.float().cpu())
+        preds_chunks.append(torch.sigmoid(logits).float().cpu())
+
+    avg_loss = float(np.mean(losses)) if losses else float("nan")
+    if not targets_chunks:
+        return {"val_loss": avg_loss}
+
+    Y = torch.cat(targets_chunks, dim=0).numpy()
+    P = torch.cat(preds_chunks, dim=0).numpy()
+
+    def _auc(idx: np.ndarray) -> float:
+        if len(idx) == 0:
+            return float("nan")
+        try:
+            return float(birdclef_roc_auc(Y[:, idx], P[:, idx]))
+        except ValueError:
+            return float("nan")
+
+    out: Dict[str, Any] = {
+        "val_loss":           avg_loss,
+        "val_auc_seen":       _auc(np.arange(Y.shape[1], dtype=np.int64)),
+        "val_auc_focal_seen": _auc(focal_class_indices),
+    }
+    for taxon, idx in taxa_indices.items():
+        # Stable lowercase keys: "val_auc_aves", "val_auc_amphibia", etc.
+        out[f"val_auc_{taxon.lower()}"] = _auc(idx)
+    return out
+
+
 def run_one_experiment(
     experiment: Dict[str, Any],
     train_dataset: BirdCLEFDataset,
@@ -137,6 +323,7 @@ def run_one_experiment(
     val_meta: pd.DataFrame,
     label_map: Dict[str, int],
     focal_class_indices: np.ndarray,
+    taxa_indices: Dict[str, np.ndarray],
     base_model_config: Dict[str, Any],
     output_dir: Path,
     device: torch.device,
@@ -160,7 +347,13 @@ def run_one_experiment(
     classes with positives — same shape as LB). The diagnostic
     `val_auc_focal_seen` (~48-class AUC) comes for free from
     evaluate_validation_metrics's mapped_auc slot.
+
+    Per-experiment overrides:
+      - `experiment["epochs"]` — overrides CLI `--epochs` (lets the extended
+        sweep mix 15-epoch quick runs with 50-epoch deep dives in one
+        invocation). Falls back to the `epochs` arg if not present.
     """
+    epochs = int(experiment.get("epochs", epochs))
     exp_name = experiment["name"]
     exp_output_dir = output_dir / exp_name
     if _is_main_process(rank):
@@ -241,9 +434,13 @@ def run_one_experiment(
     _print_main(rank, f"Total label-map classes: {len(label_map)}  "
                       f"focal-trained classes: {len(focal_class_indices)}")
 
-    best_val_auc = float("nan")
+    # Selection metric is val_auc_focal_seen (NOT val_auc_seen). The 28 val
+    # classes the CNN can't possibly learn (sonotypes etc., absent from
+    # train.csv) sit at ~0.5 in val_auc_seen and add only noise to the
+    # ranking. val_auc_focal_seen restricts to classes the CNN actually
+    # trained on — cleaner ranker, same shape as the LB-relevant subset.
+    best_metrics: Dict[str, Any] = {}
     best_val_loss = float("inf")
-    best_val_auc_focal = float("nan")
     best_epoch = -1
     history: List[Dict[str, Any]] = []
 
@@ -265,39 +462,43 @@ def run_one_experiment(
         if _is_main_process(rank):
             eval_model = model.module if isinstance(model, DDP) else model
             assert val_loader is not None
-            # evaluate_validation_metrics returns (loss, mapped_auc, full_auc).
-            # Wiring: pass focal_class_indices as mapped_label_indices →
-            #   mapped_auc = AUC over focal-trained-AND-val-seen classes  (~48)
-            #   full_auc   = AUC over ALL val-seen classes               (~75)
-            val_loss, val_auc_focal, val_auc_seen = evaluate_validation_metrics(
+            metrics = _evaluate_full(
                 eval_model, val_loader, torch.nn.BCEWithLogitsLoss(),
-                device, mapped_label_indices=focal_class_indices, use_bf16=use_bf16,
+                device, focal_class_indices=focal_class_indices,
+                taxa_indices=taxa_indices, use_bf16=use_bf16,
             )
 
+            # All floats rounded to 4 decimals on write; NaNs → None
             row = {
                 "config_name": exp_name, "epoch": epoch,
-                "train_loss": avg_train_loss,
-                "val_loss": val_loss,
-                "val_auc_seen": val_auc_seen,
-                "val_auc_focal_seen": val_auc_focal,
+                "train_loss": _r4(avg_train_loss),
+                **{k: _r4(v) for k, v in metrics.items()},
             }
             history.append(row)
+            taxa_log = "  ".join(
+                f"{taxon[:3].lower()}={row.get(f'val_auc_{taxon.lower()}'):.4f}"
+                for taxon in sorted(taxa_indices)
+                if row.get(f"val_auc_{taxon.lower()}") is not None
+            )
             print(
                 f"{exp_name} | ep {epoch:02d} | "
-                f"train={avg_train_loss:.4f} | "
-                f"val_loss={val_loss:.4f} "
-                f"val_auc_seen={val_auc_seen:.4f} "
-                f"val_auc_focal_seen={val_auc_focal:.4f}"
+                f"train={row['train_loss']} | "
+                f"loss={row['val_loss']} "
+                f"focal_seen={row['val_auc_focal_seen']} "
+                f"seen={row['val_auc_seen']} | {taxa_log}"
             )
 
+            # PRIMARY = val_auc_focal_seen
+            current_primary = metrics.get("val_auc_focal_seen", float("nan"))
+            best_primary = best_metrics.get("val_auc_focal_seen", float("nan"))
             should_save = False
-            if is_better_score(val_auc_seen, best_val_auc):
-                best_val_auc = val_auc_seen
-                best_val_auc_focal = val_auc_focal
-                best_val_loss = val_loss
+            if is_better_score(current_primary, best_primary):
+                best_metrics = dict(metrics)
+                best_val_loss = float(metrics.get("val_loss", float("inf")))
                 should_save = True
-            elif pd.isna(val_auc_seen) and val_loss < best_val_loss:
-                # Pathological: no val positives anywhere. Tie-break on loss.
+            elif pd.isna(current_primary) and metrics.get("val_loss", float("inf")) < best_val_loss:
+                # Pathological: no val positives in focal subset. Tie-break on loss.
+                best_val_loss = float(metrics.get("val_loss", float("inf")))
                 should_save = True
 
             if should_save:
@@ -309,8 +510,7 @@ def run_one_experiment(
                         "label_map": label_map,
                         "model_config": model_config,
                         "epoch": epoch,
-                        "best_val_auc_seen": val_auc_seen,
-                        "best_val_auc_focal_seen": val_auc_focal,
+                        **{f"best_{k}": _r4(v) for k, v in metrics.items()},
                         "fused_adamw": fused_enabled,
                         "experiment": experiment,
                     },
@@ -322,18 +522,16 @@ def run_one_experiment(
         if dist.is_initialized():
             dist.barrier()
 
+    # Build final summary — `primary` = best val_auc_focal_seen (same ranker
+    # used for selection above). All floats rounded to 4 decimals.
     summary: Dict[str, Any] = {
         "_kind": "focal_run",
         "config_name": exp_name,
         "architecture": "sota_timm_spectrogram_focal",
         "backbone_name": experiment["backbone_name"],
         "best_epoch": best_epoch,
-        # `primary` mirrors the SSM/SOTA-5fold convention so a single sort key
-        # works across all sweep summary CSVs.
-        "primary": best_val_auc,
-        "best_val_auc_seen": best_val_auc,
-        "best_val_auc_focal_seen": best_val_auc_focal,
-        "best_val_loss": best_val_loss,
+        "primary": _r4(best_metrics.get("val_auc_focal_seen")),
+        **{f"best_{k}": _r4(v) for k, v in best_metrics.items()},
         "n_focal_classes": int(len(focal_class_indices)),
         "experiment_config": experiment,
         "model_config": model_config,
@@ -374,6 +572,11 @@ def main() -> None:
     ap.add_argument("--grad-clip-norm", type=float, default=1.0)
     ap.add_argument("--out-dir", default=None,
                     help="Override output dir. Default: birdclef_example/outputs/focal")
+    ap.add_argument("--include-xc", action="store_true",
+                    help="Also load Xeno-Canto recordings (data/train_audio_xc.csv + "
+                         "data/train_audio_xc/) on top of train.csv. Targets the weak "
+                         "Amphibia/Aves classes from the per-class audit. Build via "
+                         "`python -m birdclef.scripts._xc_fetch`.")
     args = ap.parse_args()
 
     distributed, world_size, rank, local_rank = _get_distributed_context()
@@ -410,8 +613,28 @@ def main() -> None:
     # Train: train.csv (focal recordings, ~35.5k rows × 206 classes)
     train_csv_df = pd.read_csv(train_csv_path)
     train_meta = prepare_train_audio_metadata(train_csv_df, train_audio_dir)
-    # Drop rows whose ogg is missing on disk (the cache build step might have
-    # been partial). Avoids hard-fail in BirdCLEFDataset.__getitem__.
+
+    # Optional: extend with Xeno-Canto recordings for the weak-class targets.
+    # XC rows live in a parallel data/train_audio_xc/ tree; we rewrite
+    # audio_filepath against that root so they coexist with train.csv rows
+    # downstream without changing anything else (source="train_audio" is
+    # preserved so secondary-label handling stays consistent).
+    if args.include_xc:
+        xc_csv = data_dir / "train_audio_xc.csv"
+        xc_audio_dir = data_dir / "train_audio_xc"
+        if not xc_csv.exists():
+            raise FileNotFoundError(
+                f"--include-xc requested but {xc_csv} missing. "
+                f"Build it: python -m birdclef.scripts._xc_fetch"
+            )
+        xc_df = pd.read_csv(xc_csv)
+        xc_meta = prepare_train_audio_metadata(xc_df, xc_audio_dir)
+        _print_main(rank, f"[setup] including Xeno-Canto: +{len(xc_meta)} rows from {xc_csv}")
+        train_meta = pd.concat([train_meta, xc_meta], ignore_index=True)
+
+    # Drop rows whose audio file is missing on disk (the cache build step
+    # might have been partial, or XC downloads may have failed).
+    # Avoids hard-fail in BirdCLEFDataset.__getitem__.
     train_meta = train_meta[train_meta["audio_filepath"].apply(lambda p: Path(p).exists())]
     train_meta = train_meta.reset_index(drop=True)
 
@@ -429,6 +652,7 @@ def main() -> None:
         )
 
     focal_class_indices = _build_focal_class_indices(train_meta, label_map)
+    taxa_indices = _build_taxa_indices(label_map, taxonomy_path)
 
     if hasattr(torch, "set_float32_matmul_precision"):
         torch.set_float32_matmul_precision("high")
@@ -487,6 +711,7 @@ def main() -> None:
                 val_meta=val_meta,
                 label_map=label_map,
                 focal_class_indices=focal_class_indices,
+                taxa_indices=taxa_indices,
                 base_model_config=base_model_config,
                 output_dir=output_dir, device=device,
                 rank=rank, local_rank=local_rank, distributed=distributed,
