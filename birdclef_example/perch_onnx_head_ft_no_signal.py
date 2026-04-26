@@ -195,12 +195,31 @@ def build_no_signal_targets(
     return mapped_positions, no_signal_positions, proxy_map, no_signal_labels
 
 
+_FLAT_FALLBACK_SHAPE = (0, 1536)
+_SPATIAL_FALLBACK_SHAPE = (0, 16, 4, 1536)
+
+
+def _empty_fallback(output_name: str) -> np.ndarray:
+    if output_name == "embedding":
+        return np.zeros(_FLAT_FALLBACK_SHAPE, dtype=np.float32)
+    if output_name == "spatial_embedding":
+        return np.zeros(_SPATIAL_FALLBACK_SHAPE, dtype=np.float32)
+    raise ValueError(f"Unknown output_name: {output_name}")
+
+
 def extract_spatial_embeddings(
     onnx_path: Path,
     soundscape_paths: Sequence[Path],
     batch_files: int,
     verbose: bool,
+    output_name: str = "spatial_embedding",
 ) -> Tuple[pd.DataFrame, np.ndarray]:
+    """Extract Perch features for the soundscape val pool.
+
+    `output_name` selects which ONNX output to pull:
+      - "spatial_embedding" → (N, 16, 4, 1536)  pre-pooled time × frequency × channels
+      - "embedding"         → (N, 1536)         the global-pooled vector the SSM uses
+    """
     so = ort.SessionOptions()
     so.intra_op_num_threads = int(os.environ.get("ORT_INTRA_OP_THREADS", "1"))
     so.inter_op_num_threads = int(os.environ.get("ORT_INTER_OP_THREADS", "8"))
@@ -209,17 +228,18 @@ def extract_spatial_embeddings(
     session = ort.InferenceSession(str(onnx_path), sess_options=so, providers=["CPUExecutionProvider"])
     input_name = session.get_inputs()[0].name
     out_map = {o.name: i for i, o in enumerate(session.get_outputs())}
-    if "spatial_embedding" not in out_map:
-        raise RuntimeError(f"ONNX output 'spatial_embedding' not found. Available: {list(out_map.keys())}")
+    if output_name not in out_map:
+        raise RuntimeError(f"ONNX output {output_name!r} not found. Available: {list(out_map.keys())}")
 
     paths = [Path(p) for p in soundscape_paths]
     row_ids: List[str] = []
     filenames: List[str] = []
-    spatial_chunks: List[np.ndarray] = []
+    chunks: List[np.ndarray] = []
 
     iterator = range(0, len(paths), batch_files)
     if verbose:
-        iterator = tqdm(iterator, total=(len(paths) + batch_files - 1) // batch_files, desc="Perch extract")
+        iterator = tqdm(iterator, total=(len(paths) + batch_files - 1) // batch_files,
+                        desc=f"Perch extract ({output_name})")
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as io_executor:
         next_paths = paths[0:batch_files]
@@ -245,11 +265,11 @@ def extract_spatial_embeddings(
                 x_pos += N_WINDOWS
 
             outs = session.run(None, {input_name: x})
-            spatial_chunks.append(outs[out_map["spatial_embedding"]].astype(np.float32, copy=False))
+            chunks.append(outs[out_map[output_name]].astype(np.float32, copy=False))
 
     meta = pd.DataFrame({"row_id": row_ids, "filename": filenames})
-    spatial_all = np.concatenate(spatial_chunks, axis=0)
-    return meta, spatial_all
+    arr_all = np.concatenate(chunks, axis=0) if chunks else _empty_fallback(output_name)
+    return meta, arr_all
 
 
 def extract_spatial_embeddings_clips(
@@ -257,7 +277,12 @@ def extract_spatial_embeddings_clips(
     clip_paths: Sequence[Path],
     batch_size: int,
     verbose: bool,
+    output_name: str = "spatial_embedding",
 ) -> np.ndarray:
+    """Extract Perch features for the extra train.csv clips.
+
+    `output_name` semantics match `extract_spatial_embeddings`.
+    """
     so = ort.SessionOptions()
     so.intra_op_num_threads = int(os.environ.get("ORT_INTRA_OP_THREADS", "1"))
     so.inter_op_num_threads = int(os.environ.get("ORT_INTER_OP_THREADS", "1"))
@@ -266,14 +291,15 @@ def extract_spatial_embeddings_clips(
     session = ort.InferenceSession(str(onnx_path), sess_options=so, providers=["CPUExecutionProvider"])
     input_name = session.get_inputs()[0].name
     out_map = {o.name: i for i, o in enumerate(session.get_outputs())}
-    if "spatial_embedding" not in out_map:
-        raise RuntimeError(f"ONNX output 'spatial_embedding' not found. Available: {list(out_map.keys())}")
+    if output_name not in out_map:
+        raise RuntimeError(f"ONNX output {output_name!r} not found. Available: {list(out_map.keys())}")
 
     paths = [Path(p) for p in clip_paths]
-    spatial_chunks: List[np.ndarray] = []
+    chunks: List[np.ndarray] = []
     iterator = range(0, len(paths), batch_size)
     if verbose:
-        iterator = tqdm(iterator, total=(len(paths) + batch_size - 1) // batch_size, desc="Perch extra clips")
+        iterator = tqdm(iterator, total=(len(paths) + batch_size - 1) // batch_size,
+                        desc=f"Perch extra clips ({output_name})")
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as io_executor:
         next_paths = paths[0:batch_size]
@@ -290,14 +316,23 @@ def extract_spatial_embeddings_clips(
 
             x = np.stack(batch_audio, axis=0).astype(np.float32, copy=False)
             outs = session.run(None, {input_name: x})
-            spatial_chunks.append(outs[out_map["spatial_embedding"]].astype(np.float32, copy=False))
+            chunks.append(outs[out_map[output_name]].astype(np.float32, copy=False))
 
-    if len(spatial_chunks) == 0:
-        return np.zeros((0, 16, 4, 1536), dtype=np.float32)
-    return np.concatenate(spatial_chunks, axis=0)
+    if not chunks:
+        return _empty_fallback(output_name)
+    return np.concatenate(chunks, axis=0)
 
 
 class RandomPerchSpatialHead(nn.Module):
+    """L2-normed projection of (B, 16, 4, 1536) spatial embeddings into
+    (B, n_classes, 4) per-class scores, max-pooled over the 16×4 spatial
+    grid, then weighted-summed across the 4 sub-heads. Preserves time-
+    frequency localization — the right inductive bias for sonotypes whose
+    calls live in specific frequency bands.
+    """
+
+    INPUT_RANK = 4  # (B, 16, 4, 1536)
+
     def __init__(self, n_classes: int, emb_dim: int = 1536, eps: float = 1e-5):
         super().__init__()
         self.weight = nn.Parameter(torch.empty(emb_dim, n_classes * 4))
@@ -319,6 +354,58 @@ class RandomPerchSpatialHead(nn.Module):
         z = torch.amax(z, dim=(1, 2))
         logits = (z * self.alpha).sum(dim=2) + self.bias
         return logits
+
+
+class RandomPerchFlatHead(nn.Module):
+    """L2-normed linear head over the 1536-dim global-pooled Perch embedding
+    (the same vector the SSM stack uses). Spatial localization is gone — the
+    pre-pool max/mean already collapsed it. Compares against the spatial
+    head as an A/B: simpler, ~16× less data, no time-frequency inductive
+    bias.
+    """
+
+    INPUT_RANK = 2  # (B, 1536)
+
+    def __init__(self, n_classes: int, emb_dim: int = 1536, eps: float = 1e-5,
+                 hidden_dim: int = 0, dropout: float = 0.1):
+        super().__init__()
+        self.eps = float(eps)
+        self.n_classes = int(n_classes)
+        if hidden_dim and hidden_dim > 0:
+            self.body = nn.Sequential(
+                nn.Linear(emb_dim, int(hidden_dim)),
+                nn.GELU(),
+                nn.Dropout(float(dropout)),
+                nn.Linear(int(hidden_dim), n_classes),
+            )
+        else:
+            self.body = nn.Linear(emb_dim, n_classes)
+        # Match the spatial head's L2-norm preconditioning so the loss/lr
+        # regimes transfer between heads without retuning.
+        self.bias = nn.Parameter(torch.zeros(1, n_classes))
+        nn.init.zeros_(self.bias)
+
+    def forward(self, embedding: torch.Tensor) -> torch.Tensor:
+        x = embedding / torch.sqrt((embedding * embedding).sum(dim=-1, keepdim=True) + self.eps)
+        logits = self.body(x) + self.bias
+        return logits
+
+
+def make_head(head_type: str, n_classes: int) -> nn.Module:
+    """Factory: pick the head class for the requested feature space.
+
+    Each head class declares its expected `INPUT_RANK` so the trainer can
+    sanity-check feature shapes before allocating tensors.
+    """
+    if head_type == "spatial":
+        return RandomPerchSpatialHead(n_classes=n_classes)
+    if head_type == "flat":
+        return RandomPerchFlatHead(n_classes=n_classes)
+    raise ValueError(f"Unknown head_type: {head_type!r} (expected 'spatial' or 'flat')")
+
+
+def head_to_output_name(head_type: str) -> str:
+    return "spatial_embedding" if head_type == "spatial" else "embedding"
 
 
 def build_target_matrix(label_lists: Sequence[Sequence[str]], labels_subset: Sequence[str]) -> np.ndarray:
@@ -475,6 +562,7 @@ def train_one_fold(
     seed: int,
     fold_id: int,
     quiet: bool,
+    head_type: str = "spatial",
 ) -> Tuple[Dict[str, float], Dict[str, torch.Tensor], List[Dict[str, float]], np.ndarray]:
     set_seed(seed + fold_id)
 
@@ -492,7 +580,13 @@ def train_one_fold(
         train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
 
-    model = RandomPerchSpatialHead(n_classes=y_train.shape[1])
+    model = make_head(head_type=head_type, n_classes=y_train.shape[1])
+    if x_train.ndim != model.INPUT_RANK:
+        raise ValueError(
+            f"head_type={head_type!r} expects rank-{model.INPUT_RANK} features, "
+            f"got x_train.shape={x_train.shape}. Re-extract embeddings with "
+            f"output_name={head_to_output_name(head_type)!r}."
+        )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
@@ -626,6 +720,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--metrics-json", type=Path, default=DEFAULT_METRICS_JSON)
     parser.add_argument("--per-class-oof-csv", type=Path, default=DEFAULT_PER_CLASS_OOF_CSV)
     parser.add_argument("--quiet", action="store_true")
+    parser.add_argument("--head-type", choices=["spatial", "flat"], default="spatial",
+                        help="Which Perch ONNX feature to read + which head to train. "
+                             "'spatial' = (16,4,1536) pre-pooled grid + RandomPerchSpatialHead "
+                             "(default; preserves time-frequency localization, ~16× more memory). "
+                             "'flat' = (1536,) global-pooled — same vector the SSM uses + "
+                             "RandomPerchFlatHead (smaller, faster, no spatial bias).")
     return parser.parse_args()
 
 
@@ -673,12 +773,17 @@ def main() -> None:
     if len(full_files) == 0:
         raise RuntimeError("No soundscape files with labels found.")
 
+    head_type = str(args.head_type)
+    onnx_output_name = head_to_output_name(head_type)
+    print(f"[head] head_type={head_type!r}  pulling Perch ONNX output {onnx_output_name!r}")
+
     soundscape_paths = [args.soundscape_dir / fn for fn in full_files]
     pred_meta, spatial_all = extract_spatial_embeddings(
         onnx_path=args.onnx_path,
         soundscape_paths=soundscape_paths,
         batch_files=args.batch_files,
         verbose=not args.quiet,
+        output_name=onnx_output_name,
     )
 
     pred_rows_before = len(pred_meta)
@@ -698,7 +803,8 @@ def main() -> None:
     if n_soundscape_pos_classes == 0:
         raise RuntimeError("No positives for no-signal classes in selected soundscape data.")
 
-    x_extra = np.zeros((0, 16, 4, 1536), dtype=np.float32)
+    # Empty-extra fallback shape mirrors the Perch ONNX output rank we'll use.
+    x_extra = _empty_fallback(onnx_output_name)
     y_extra = np.zeros((0, len(target_labels)), dtype=np.float32)
     n_extra_rows_raw = 0
     n_extra_rows_used = 0
@@ -727,6 +833,7 @@ def main() -> None:
                     clip_paths=extra_paths,
                     batch_size=args.extra_batch_size,
                     verbose=not args.quiet,
+                    output_name=onnx_output_name,
                 )
                 y_extra = np.zeros((n_extra_rows_used, len(target_labels)), dtype=np.float32)
                 extra_secondary = (
@@ -841,9 +948,11 @@ def main() -> None:
                 seed=args.seed,
                 fold_id=fold_id,
                 quiet=args.quiet,
+                head_type=head_type,
             )
-            metrics["n_train_soundscape_rows"] = float(len(tr_idx))
-            metrics["n_train_extra_rows"] = float(x_extra.shape[0])
+            metrics["n_train_soundscape_rows"] = int(len(tr_idx))
+            metrics["n_train_extra_rows"] = int(x_extra.shape[0])
+            metrics["head_type"] = head_type
             fold_metrics.append(metrics)
             all_history.extend(history)
             fold_states.append(state)
@@ -886,6 +995,7 @@ def main() -> None:
         # focal trainer summaries so a single sort across all sweep CSVs works.
         sweep_row = {
             "config_id": int(cfg_idx),
+            "head_type": head_type,
             "loss": cfg["loss_name"],
             "focal_gamma": _r4(cfg["focal_gamma"]),
             "sampler_power": _r4(cfg["sampler_power"]),
