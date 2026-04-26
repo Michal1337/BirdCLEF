@@ -3,18 +3,23 @@
 Stages files into `data/train_audio_xc/<primary_label>/` and writes a
 parallel CSV (`data/train_audio_xc.csv`) with the same schema as
 `data/train.csv`. The focal trainer can then concat the two CSVs at
-load time without further plumbing — the new rows look identical to
-existing train.csv rows.
+load time via `--include-xc`.
 
 Targeted at the Group A/B weak Amphibia + thin Aves from the per-class
 audit (outputs/eda/per_class_audit.csv). Default target list lives in
 `DEFAULT_TARGETS` at the top of this file — edit there or pass
 `--targets` to override.
 
-API: https://xeno-canto.org/api/3/recordings  (open, no key required as of 2026)
+API auth (REQUIRED for v3 since 2025):
+    Get a key at https://xeno-canto.org/account → "API access token"
+    Pass via `--api-key <KEY>` or env var `XENO_CANTO_API_KEY`.
+    Without a key, the script falls back to the (deprecated) v2 endpoint
+    which may or may not work.
+
 Rate limit: 1 req/s by request — script sleeps 1s between API calls.
 
 Run:
+    export XENO_CANTO_API_KEY=...
     python -m birdclef.scripts._xc_fetch --max-per-species 80
     python -m birdclef.scripts._xc_fetch --targets bunibi1 strher2 --max-per-species 50
     python -m birdclef.scripts._xc_fetch --dry-run    # query only, no download
@@ -23,17 +28,13 @@ Output:
     data/train_audio_xc/<primary_label>/<XCID>.<ext>
     data/train_audio_xc.csv
 
-To use in training, modify `prepare_train_audio_metadata` callers to
-concat both CSVs (or pass a merged CSV via `--train-csv`):
-    train_df = pd.concat([
-        pd.read_csv('data/train.csv'),
-        pd.read_csv('data/train_audio_xc.csv'),
-    ], ignore_index=True)
+To use in training, run focal trainer with --include-xc.
 """
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 import urllib.parse
@@ -72,32 +73,46 @@ DEFAULT_TARGETS = [
     "litnig1", # Setopagis parvula          (already 109 but val weak)
 ]
 
-API_URL = "https://www.xeno-canto.org/api/3/recordings"
+API_V3 = "https://www.xeno-canto.org/api/3/recordings"
+API_V2 = "https://www.xeno-canto.org/api/2/recordings"
 
 
 def _query_xc(scientific_name: str, page: int = 1, sleep: float = 1.0,
-              quality: str = "A,B") -> Dict[str, Any]:
+              quality: str = "A,B", api_key: str | None = None) -> Dict[str, Any]:
     """One paginated Xeno-Canto query.
 
-    `quality=A,B` filters to highest-rated recordings — XC quality grades
-    are A (best) through E. We default to A+B which is what most BirdCLEF
-    top solutions use as their external-data filter.
+    Uses v3 (with `key` param) if `api_key` provided, else falls back to
+    v2 which historically required no auth. `quality=A,B` filters to
+    highest-rated recordings (A=best..E=worst) — what most BirdCLEF top
+    solutions use.
     """
     q = f'"{scientific_name}" q:{quality}'
     params = {"query": q, "page": page}
-    r = requests.get(API_URL, params=params, timeout=30)
+    if api_key:
+        params["key"] = api_key
+        url = API_V3
+    else:
+        url = API_V2
+    r = requests.get(url, params=params, timeout=30)
+    if r.status_code == 401:
+        raise RuntimeError(
+            "XC API 401 Unauthorized. Get a key at https://xeno-canto.org/account "
+            "and pass via --api-key or env XENO_CANTO_API_KEY."
+        )
     if r.status_code != 200:
         raise RuntimeError(f"XC API status {r.status_code}: {r.text[:200]}")
-    time.sleep(sleep)  # be polite
+    time.sleep(sleep)
     return r.json()
 
 
 def _all_results(scientific_name: str, sleep: float = 1.0,
-                 quality: str = "A,B", max_pages: int = 20) -> List[Dict[str, Any]]:
+                 quality: str = "A,B", max_pages: int = 20,
+                 api_key: str | None = None) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     page = 1
     while page <= max_pages:
-        data = _query_xc(scientific_name, page=page, sleep=sleep, quality=quality)
+        data = _query_xc(scientific_name, page=page, sleep=sleep,
+                         quality=quality, api_key=api_key)
         recs = data.get("recordings", []) or []
         out.extend(recs)
         npages = int(data.get("numPages", 1))
@@ -165,9 +180,20 @@ def main() -> None:
                     help="XC quality grades to include (comma-sep). Default 'A,B'.")
     ap.add_argument("--sleep", type=float, default=1.0,
                     help="Seconds between API calls (politeness).")
+    ap.add_argument("--api-key", default=None,
+                    help="Xeno-Canto API key. Alternatively set env XENO_CANTO_API_KEY. "
+                         "Required for the v3 endpoint as of 2025; v2 fallback may break "
+                         "without warning.")
     ap.add_argument("--dry-run", action="store_true",
                     help="Query only, count results, no downloads or CSV write.")
     args = ap.parse_args()
+
+    api_key = args.api_key or os.environ.get("XENO_CANTO_API_KEY")
+    if api_key:
+        print(f"[xc] using v3 endpoint with API key (last 4 chars: ...{api_key[-4:]})")
+    else:
+        print("[xc] no API key — falling back to v2 endpoint (may not work). "
+              "Get a key at https://xeno-canto.org/account")
 
     if not args.taxonomy.exists():
         raise SystemExit(f"Missing taxonomy: {args.taxonomy}")
@@ -187,7 +213,8 @@ def main() -> None:
         cls    = str(tax.loc[primary_label, "class_name"])
         print(f"\n[xc] === {primary_label}  {sci}  ({cls} — {common}) ===")
         try:
-            recs = _all_results(sci, sleep=args.sleep, quality=args.quality)
+            recs = _all_results(sci, sleep=args.sleep, quality=args.quality,
+                                api_key=api_key)
         except Exception as e:
             print(f"[xc] query failed for {sci}: {e}")
             continue
