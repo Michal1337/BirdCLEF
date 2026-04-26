@@ -118,74 +118,32 @@ def _safe_stratify_key(files: pd.DataFrame, n_splits: int) -> pd.Series:
     return files["primary_label"].where(~files["primary_label"].isin(rare), other="_RARE_")
 
 
-def _files_to_pin(files: pd.DataFrame) -> set[str]:
-    """Files that own a class with file_support=1.
-
-    The class is the SOLE representative of its species in the labeled pool.
-    If we put that file in any fold's val, the corresponding fold's training
-    set has zero positives for the class — model can't learn it, val AUC
-    collapses to <0.5 (worse than random). Audit confirmed this was the
-    failure mode for 11 of the bottom-12 broken classes.
-
-    Solution: pin those files to always-train so every fold's training set
-    sees them. We lose val coverage for those classes locally (the model
-    still trains on them; we just can't validate locally), but that's
-    cheaper than reading bogus AUC numbers from a fold that never trained
-    on the class.
-    """
-    Y = _multilabel_matrix(files)
-    file_support = Y.sum(axis=0)
-    singleton_classes = np.where(file_support == 1)[0]
-    pinned: set[str] = set()
-    for c in singleton_classes:
-        f_idx = int(np.where(Y[:, c] > 0)[0][0])
-        pinned.add(str(files.iloc[f_idx]["filename"]))
-    return pinned
-
-
 def build_folds(n_splits: int, seed: int = 42) -> pd.DataFrame:
-    """Build a single fold assignment using single-label modal stratification,
-    with file-support=1 files pinned to always-train.
+    """Build a single fold assignment using single-label modal stratification.
 
-    Returns columns (filename, primary_label, fold) where:
-        fold ∈ [0, n_splits-1]  → file is in that fold's val, others' train
-        fold == -1              → PINNED: file is in every fold's train,
-                                  never in any fold's val.
+    Returns a DataFrame with columns (filename, primary_label, fold).
+    One row per fully-labeled soundscape file. Folds are 0..n_splits-1.
 
-    Downstream consumers must treat fold=-1 as "always-in-train". Some
-    legacy consumers also use the missing-from-parquet sentinel via
-    `.fillna(-1)` — the same value is reused intentionally so the simpler
-    pattern `tr = np.where(row_fold != f)[0]` (without `& row_fold >= 0`)
-    correctly puts both pinned files and unlabeled files into train.
+    NOTE: file_support=1 classes (their only file always lands in one fold's
+    val with zero training signal in that fold) are *not* fixed here.  We
+    explicitly chose visibility-of-weakness over local-AUC-cosmetics — see
+    `outputs/eda/per_class_audit.csv` for the per-class breakdown that
+    drives data-acquisition decisions.
     """
     files = _labeled_file_frame()
     if len(files) < n_splits:
         raise RuntimeError(
             f"Only {len(files)} labeled files; cannot make {n_splits} folds."
         )
-
-    pinned = _files_to_pin(files)
-    in_cv = files[~files["filename"].isin(pinned)].reset_index(drop=True)
-    pinned_df = files[files["filename"].isin(pinned)].copy()
-    pinned_df["fold"] = np.int8(-1)
-
-    if len(in_cv) < n_splits:
-        raise RuntimeError(
-            f"Only {len(in_cv)} non-pinned files; cannot make {n_splits} folds. "
-            f"({len(pinned)} pinned). Reduce n_splits or shrink the singleton-class set."
-        )
-
     skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=int(seed))
-    fold_of = np.full(len(in_cv), -1, dtype=np.int8)
-    key = _safe_stratify_key(in_cv, n_splits)
-    for fold, (_tr, va) in enumerate(skf.split(np.zeros(len(in_cv)), key.values)):
+    fold_of = np.full(len(files), -1, dtype=np.int8)
+    key = _safe_stratify_key(files, n_splits)
+    for fold, (_tr, va) in enumerate(skf.split(np.zeros(len(files)), key.values)):
         fold_of[va] = fold
     if (fold_of < 0).any():
-        raise RuntimeError("Some non-pinned files were not assigned to any fold (bug).")
-    in_cv = in_cv.assign(fold=fold_of)
-
-    out = pd.concat([in_cv, pinned_df], ignore_index=True).sort_values("filename")
-    return out[["filename", "primary_label", "fold"]].reset_index(drop=True)
+        raise RuntimeError("Some files were not assigned to any fold (bug).")
+    files = files.assign(fold=fold_of)
+    return files[["filename", "primary_label", "fold"]].reset_index(drop=True)
 
 
 def build_and_persist_folds(n_splits: int, seed: int = 42) -> pd.DataFrame:
