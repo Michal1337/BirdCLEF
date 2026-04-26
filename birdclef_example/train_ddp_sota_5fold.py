@@ -14,8 +14,11 @@ is imported from `train_ddp_sota.py` verbatim. If a hyperparameter changes
 upstream, this file picks it up.
 
 V-anchor was dropped after the 0.747 SED LB result confirmed it didn't
-predict LB — see plan file. Selection metric per fold = `val_mapped_auc`.
-For ranking ACROSS configs, use the appended stitched-OOF column.
+predict LB. Selection metric per fold = `val_auc` (macro AUC over all
+234 BirdCLEF classes — same shape as the LB metric and the SSM sweep's
+`primary`). For ranking ACROSS configs after `--all-folds`, the appended
+cross-fold OOF row uses `mean_oof_auc` as primary, with stitched
+`macro_auc` as a calibration-drift diagnostic.
 
 Single-(exp, fold) invocation pattern matches `birdclef.scripts._03_train_sed`:
 
@@ -30,11 +33,15 @@ Wrapping for all 5 folds (the deep-dive after a no-arg sweep finds a winner):
         --exp sota11_nfnet_lr8e-04_1e-04 --all-folds
 
 Outputs:
-    birdclef_example/outputs/sota_5fold/<exp_name>/fold{f}/
-        best_model.pt      # selected on per-fold val_mapped_auc
+    birdclef_example/outputs/sota_5fold/<config_name>/fold{f}/
+        best_model.pt      # selected on per-fold val_auc (full-class macro)
         label_map.json
-        metrics.csv        # per-epoch history (val_* columns only)
+        metrics.csv        # per-epoch history (val_loss, val_auc)
         summary.json
+
+CSV summary at `birdclef_example/outputs/sota_5fold/experiments_summary.csv`:
+    sorted by `primary` desc; mixes per-fold rows (`_kind="fold"`) and
+    cross-fold OOF rows (`_kind="cross_fold_oof"`, only when --all-folds).
 """
 from __future__ import annotations
 
@@ -159,9 +166,11 @@ def run_one_fold(
 ) -> Dict[str, Any]:
     """One (experiment, fold) training run.
 
-    Selects the best checkpoint by per-fold `val_mapped_auc`. (V-anchor was
-    abandoned — the cross-fold stitched-OOF metric is computed separately
-    after all folds finish, not here.)
+    Selects the best checkpoint by per-fold `val_auc` — macro AUC over all
+    234 BirdCLEF classes (matches the official LB metric and the SSM
+    sweep's primary). The mapped-vs-full distinction was dropped to align
+    schemas across the SSM and SOTA sweeps; mapped AUC restricted predictions
+    to Perch's vocabulary which is irrelevant for LB scoring.
     """
     exp_name = experiment["name"]
     exp_output_dir = output_dir / exp_name / f"fold{fold}"
@@ -261,7 +270,6 @@ def run_one_fold(
     _print_main(rank, f"Num labels: {len(label_map)}  Mapped val labels: {len(mapped_label_indices)}")
 
     best_val_auc = float("nan")
-    best_val_full_auc = float("nan")
     best_val_loss = float("inf")
     best_epoch = -1
     history: List[Dict[str, Any]] = []
@@ -284,33 +292,34 @@ def run_one_fold(
         if _is_main_process(rank):
             eval_model = model.module if isinstance(model, DDP) else model
             assert val_loader is not None
-            val_loss, val_mapped_auc, val_full_auc = evaluate_validation_metrics(
+            # evaluate_validation_metrics returns (loss, mapped_auc, full_auc).
+            # We use full_auc as `val_auc` (matches LB scoring shape) and
+            # discard mapped_auc.
+            val_loss, _, val_auc = evaluate_validation_metrics(
                 eval_model, val_loader, torch.nn.BCEWithLogitsLoss(),
                 device, mapped_label_indices=mapped_label_indices, use_bf16=use_bf16,
             )
 
             row = {
-                "experiment": exp_name, "fold": fold, "epoch": epoch,
+                "config_name": exp_name, "fold": fold, "epoch": epoch,
                 "train_loss": avg_train_loss,
-                "val_loss": val_loss, "val_mapped_auc": val_mapped_auc,
-                "val_full_auc": val_full_auc,
+                "val_loss": val_loss, "val_auc": val_auc,
             }
             history.append(row)
             print(
                 f"{exp_name}/f{fold} | ep {epoch:02d} | "
                 f"train={avg_train_loss:.4f} | "
-                f"val_loss={val_loss:.4f} val_auc={val_mapped_auc:.4f} val_full={val_full_auc:.4f}"
+                f"val_loss={val_loss:.4f} val_auc={val_auc:.4f}"
             )
 
             should_save = False
-            if is_better_score(val_mapped_auc, best_val_auc):
-                best_val_auc = val_mapped_auc
-                best_val_full_auc = val_full_auc
+            if is_better_score(val_auc, best_val_auc):
+                best_val_auc = val_auc
                 best_val_loss = val_loss
                 should_save = True
-            elif pd.isna(val_mapped_auc) and val_loss < best_val_loss:
-                # Pathological case: val mapped AUC undefined. Fall back to
-                # val_loss to break ties.
+            elif pd.isna(val_auc) and val_loss < best_val_loss:
+                # Pathological case: val AUC undefined (no positives in val
+                # set for any class). Fall back to val_loss as tie-breaker.
                 should_save = True
 
             if should_save:
@@ -324,8 +333,7 @@ def run_one_fold(
                         "epoch": epoch,
                         "fold": fold,
                         "n_splits": n_splits,
-                        "best_val_mapped_auc": val_mapped_auc,
-                        "best_val_full_auc": val_full_auc,
+                        "best_val_auc": val_auc,
                         "fused_adamw": fused_enabled,
                         "experiment": experiment,
                     },
@@ -338,12 +346,15 @@ def run_one_fold(
             dist.barrier()
 
     summary: Dict[str, Any] = {
-        "experiment": exp_name, "fold": fold, "n_splits": n_splits,
+        "_kind": "fold",
+        "config_name": exp_name, "fold": fold, "n_splits": n_splits,
         "architecture": "sota_timm_spectrogram_5fold",
         "backbone_name": experiment["backbone_name"],
         "best_epoch": best_epoch,
-        "best_val_mapped_auc": best_val_auc,
-        "best_val_full_auc": best_val_full_auc,
+        # `primary` mirrors the SSM sweep convention so a single sort key
+        # works across both sweeps' summary CSVs.
+        "primary": best_val_auc,
+        "best_val_auc": best_val_auc,
         "best_val_loss": best_val_loss,
         "experiment_config": experiment,
         "model_config": model_config,
@@ -372,7 +383,6 @@ def _cross_fold_oof_for_exp(
     soundscape_meta: pd.DataFrame,
     folds_df: pd.DataFrame,
     label_map: Dict[str, int],
-    mapped_label_indices: np.ndarray,
     base_model_config: Dict[str, Any],
     device: torch.device,
     use_bf16: bool,
@@ -381,14 +391,11 @@ def _cross_fold_oof_for_exp(
 ) -> Dict[str, float]:
     """Cross-fold OOF metrics for one experiment.
 
-    Loads each fold's `best_model.pt`, predicts on its val rows, and
-    reports BOTH:
-      - mean_oof_mapped_auc / mean_oof_full_auc (mean of per-fold AUCs) —
-        the LB-proxy primary metric (each fold = one deployed-style model
-        on one test set, no cross-fold calibration mixing).
-      - stitched_oof_mapped_auc / stitched_oof_full_auc (single AUC over
-        concatenated val predictions) — diagnostic; large mean-vs-stitched
-        gap signals fold-local calibration drift.
+    Schema mirrors the SSM sweep:
+      - mean_oof_auc — mean of per-fold macro AUCs (primary; LB-shape proxy)
+      - macro_auc    — stitched OOF macro AUC (diagnostic)
+      - calibration_drift = mean_oof_auc - macro_auc (>0.02 = fold-local
+        calibration drift; deployed model wouldn't have it)
     Only computed when --all-folds was passed.
     """
     if len(fold_list) <= 1:
@@ -396,8 +403,7 @@ def _cross_fold_oof_for_exp(
     exp_dir = output_dir / exp_name
     targets_chunks: List[np.ndarray] = []
     preds_chunks: List[np.ndarray] = []
-    fold_mapped: List[float] = []
-    fold_full: List[float] = []
+    fold_aucs: List[float] = []
 
     for fold in fold_list:
         ckpt = exp_dir / f"fold{fold}" / "best_model.pt"
@@ -439,18 +445,10 @@ def _cross_fold_oof_for_exp(
             Yf = np.concatenate(ft_chunks, axis=0)
             Pf = np.concatenate(fp_chunks, axis=0)
             try:
-                fold_full.append(float(birdclef_roc_auc(Yf, Pf)))
+                fold_aucs.append(float(birdclef_roc_auc(Yf, Pf)))
             except ValueError:
-                fold_full.append(float("nan"))
-            if len(mapped_label_indices) > 0:
-                try:
-                    fold_mapped.append(float(birdclef_roc_auc(
-                        Yf[:, mapped_label_indices], Pf[:, mapped_label_indices])))
-                except ValueError:
-                    fold_mapped.append(float("nan"))
-            else:
-                fold_mapped.append(float("nan"))
-            print(f"[oof]   fold {fold}: mapped={fold_mapped[-1]:.4f}  full={fold_full[-1]:.4f}")
+                fold_aucs.append(float("nan"))
+            print(f"[oof]   fold {fold}: macro_auc={fold_aucs[-1]:.4f}")
 
         del model
         if device.type == "cuda":
@@ -461,35 +459,23 @@ def _cross_fold_oof_for_exp(
     Y = np.concatenate(targets_chunks, axis=0)
     P = np.concatenate(preds_chunks, axis=0)
     try:
-        stitched_full = float(birdclef_roc_auc(Y, P))
+        stitched_auc = float(birdclef_roc_auc(Y, P))
     except ValueError:
-        stitched_full = float("nan")
-    if len(mapped_label_indices) > 0:
-        try:
-            stitched_mapped = float(birdclef_roc_auc(
-                Y[:, mapped_label_indices], P[:, mapped_label_indices]))
-        except ValueError:
-            stitched_mapped = float("nan")
-    else:
-        stitched_mapped = float("nan")
+        stitched_auc = float("nan")
 
-    valid_mapped = [a for a in fold_mapped if not np.isnan(a)]
-    valid_full = [a for a in fold_full if not np.isnan(a)]
-    mean_mapped = float(np.mean(valid_mapped)) if valid_mapped else float("nan")
-    mean_full = float(np.mean(valid_full)) if valid_full else float("nan")
+    valid = [a for a in fold_aucs if not np.isnan(a)]
+    mean_auc = float(np.mean(valid)) if valid else float("nan")
+    drift = (mean_auc - stitched_auc) if not (
+        np.isnan(mean_auc) or np.isnan(stitched_auc)) else float("nan")
 
     return {
-        # Primary ranker: mean of per-fold AUCs (LB-shape proxy).
-        "mean_oof_mapped_auc": mean_mapped,
-        "mean_oof_full_auc": mean_full,
-        # Diagnostic: stitched AUC. Large `mean - stitched` gap (>0.02) =
-        # fold-local calibration drift; deployed model wouldn't have it.
-        "stitched_oof_mapped_auc": stitched_mapped,
-        "stitched_oof_full_auc": stitched_full,
-        "calibration_drift_mapped": mean_mapped - stitched_mapped if not (
-            np.isnan(mean_mapped) or np.isnan(stitched_mapped)) else float("nan"),
-        "stitched_oof_n_rows": int(Y.shape[0]),
-        "n_folds_seen": int(len(valid_mapped)),
+        # Same schema as SSM sweep `_extract_summary_row`
+        "primary": mean_auc,
+        "mean_oof_auc": mean_auc,
+        "macro_auc": stitched_auc,
+        "calibration_drift": drift,
+        "n_oof_rows": int(Y.shape[0]),
+        "n_folds_seen": int(len(valid)),
     }
 
 
@@ -650,15 +636,15 @@ def main() -> None:
                 with open(output_dir / "experiments_summary.json", "w", encoding="utf-8") as f:
                     json.dump(all_summaries, f, indent=2, sort_keys=True, default=str)
                 df = pd.DataFrame(all_summaries)
-                if "best_val_mapped_auc" in df.columns:
-                    df = df.sort_values(by=["best_val_mapped_auc"], ascending=[False])
+                if "primary" in df.columns:
+                    df = df.sort_values(by=["primary"], ascending=[False],
+                                        na_position="last")
                 df.to_csv(output_dir / "experiments_summary.csv", index=False)
 
         # Cross-fold OOF (only meaningful when all folds of this experiment
         # completed in this run — i.e. --all-folds was passed and rank 0).
-        # Reports BOTH mean of per-fold AUCs (primary, LB-shape proxy) AND
-        # stitched AUC (diagnostic — large mean-vs-stitched gap = fold-local
-        # calibration drift).
+        # Schema mirrors the SSM sweep: primary = mean_oof_auc; macro_auc
+        # is the stitched diagnostic.
         if args.all_folds and _is_main_process(rank):
             try:
                 oof = _cross_fold_oof_for_exp(
@@ -668,7 +654,6 @@ def main() -> None:
                     soundscape_meta=soundscape_meta,
                     folds_df=folds_df,
                     label_map=label_map,
-                    mapped_label_indices=mapped_label_indices,
                     base_model_config=base_model_config,
                     device=device,
                     use_bf16=args.use_bf16,
@@ -679,24 +664,24 @@ def main() -> None:
                 print(f"[WARN] cross-fold OOF for {experiment['name']} FAILED: {ex}")
                 oof = {}
             if oof:
-                # Append a single cross-fold OOF row per experiment to the
-                # summary CSV / JSON so it ranks alongside per-fold entries.
+                # Append one cross-fold row per experiment, sharing
+                # `config_name` + `primary` columns with the per-fold rows so
+                # one sort by `primary` desc surfaces the best of each kind.
                 all_summaries.append({"_kind": "cross_fold_oof",
-                                      "experiment": experiment["name"], **oof})
+                                      "config_name": experiment["name"], **oof})
                 with open(output_dir / "experiments_summary.json", "w", encoding="utf-8") as f:
                     json.dump(all_summaries, f, indent=2, sort_keys=True, default=str)
                 df = pd.DataFrame(all_summaries)
-                if "mean_oof_mapped_auc" in df.columns:
-                    df = df.sort_values(by=["mean_oof_mapped_auc"],
-                                        ascending=[False], na_position="last")
+                df = df.sort_values(by=["primary"], ascending=[False],
+                                    na_position="last")
                 df.to_csv(output_dir / "experiments_summary.csv", index=False)
-                drift = oof.get("calibration_drift_mapped", float("nan"))
+                drift = oof.get("calibration_drift", float("nan"))
                 drift_flag = "OK" if (not np.isnan(drift) and abs(drift) < 0.02) else "investigate"
                 print(f"[oof] {experiment['name']}  "
-                      f"mean_mapped={oof.get('mean_oof_mapped_auc'):.4f}  "
-                      f"stitched_mapped={oof.get('stitched_oof_mapped_auc'):.4f}  "
+                      f"mean_oof_auc={oof.get('mean_oof_auc'):.4f}  "
+                      f"macro_auc={oof.get('macro_auc'):.4f}  "
                       f"drift={drift:+.4f} ({drift_flag})  "
-                      f"rows={oof.get('stitched_oof_n_rows')}")
+                      f"rows={oof.get('n_oof_rows')}")
 
     _cleanup_distributed(distributed)
 
