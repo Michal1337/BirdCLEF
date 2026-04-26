@@ -56,6 +56,16 @@ DEFAULT_OUT_DIR  = DEFAULT_DATA_DIR / "train_audio_xc"
 DEFAULT_OUT_CSV  = DEFAULT_DATA_DIR / "train_audio_xc.csv"
 DEFAULT_TAXONOMY = DEFAULT_DATA_DIR / "taxonomy.csv"
 
+
+# Known scientific-name synonyms — XC often indexes under the older name.
+# Each entry maps current_name -> [list of older synonyms to try in order].
+# Add more as you discover them by manual XC search.
+SCIENTIFIC_SYNONYMS: Dict[str, List[str]] = {
+    "Pithecopus azureus": ["Phyllomedusa azurea"],
+    "Adenomera guarani":  ["Leptodactylus guarani"],
+    # Chiasmocleis mehelyi: no known earlier name; described 2002 directly.
+}
+
 # Default target list — weak Amphibia/Aves from the audit. Add/remove freely.
 # The actual species names are looked up from data/taxonomy.csv.
 DEFAULT_TARGETS = [
@@ -275,25 +285,38 @@ def main() -> None:
         common = str(tax.loc[primary_label, "common_name"])
         cls    = str(tax.loc[primary_label, "class_name"])
         print(f"\n[xc] === {primary_label}  {sci}  ({cls} — {common}) ===")
-        try:
-            recs = _all_results(sci, sleep=args.sleep, quality=args.quality,
-                                api_key=api_key)
-        except Exception as e:
-            print(f"[xc] query failed for {sci}: {e}")
-            continue
-        # Quality fallback: many South-American taxa have few A/B grade
-        # recordings. If the strict filter returns nothing, retry once with
-        # an extra grade looser (A,B → A,B,C) and warn so you can spot
-        # quality-degraded fetches in the per-row CSV (rating column).
-        if not recs and "C" not in args.quality:
-            relaxed = (args.quality + ",C").strip(",")
-            print(f"[xc]   0 results at q:{args.quality}, retrying with q:{relaxed}")
+        # Build the search-name list: current name first, then known synonyms
+        names_to_try = [sci] + SCIENTIFIC_SYNONYMS.get(sci, [])
+        recs: List[Dict[str, Any]] = []
+        used_name: str = sci
+        for trial in names_to_try:
             try:
-                recs = _all_results(sci, sleep=args.sleep, quality=relaxed,
+                recs = _all_results(trial, sleep=args.sleep, quality=args.quality,
                                     api_key=api_key)
             except Exception as e:
-                print(f"[xc] retry failed for {sci}: {e}")
+                print(f"[xc] query failed for {trial}: {e}")
                 continue
+            # Quality fallback: many South-American taxa have few A/B grade
+            # recordings. If 0 at strict filter, retry once with one grade
+            # looser (A,B → A,B,C). Per-row CSV preserves the actual rating.
+            if not recs and "C" not in args.quality:
+                relaxed = (args.quality + ",C").strip(",")
+                print(f"[xc]   0 at q:{args.quality} for {trial!r}, retrying q:{relaxed}")
+                try:
+                    recs = _all_results(trial, sleep=args.sleep, quality=relaxed,
+                                        api_key=api_key)
+                except Exception as e:
+                    print(f"[xc] retry failed for {trial}: {e}")
+                    continue
+            if recs:
+                used_name = trial
+                if trial != sci:
+                    print(f"[xc]   matched under synonym {trial!r}")
+                break
+            elif trial != sci:
+                print(f"[xc]   synonym {trial!r} also returned 0")
+        if not recs:
+            continue
 
         # Sort by rating + length (prefer rated A then B; mid-length 5-90s)
         def _sort_key(r: Dict[str, Any]) -> tuple:
