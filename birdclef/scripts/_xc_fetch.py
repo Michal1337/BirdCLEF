@@ -183,6 +183,14 @@ def main() -> None:
     ap.add_argument("--targets", nargs="+", default=None,
                     help="primary_label values to fetch. Default = "
                          "DEFAULT_TARGETS list inside this script.")
+    ap.add_argument("--auto-targets", action="store_true",
+                    help="Override --targets: auto-pick all classes with ZERO focal "
+                         "recordings in train.csv AND a real scientific name "
+                         "(skips the 25 sonotypes — they have no XC equivalent). "
+                         "These are the highest-leverage XC fetch targets — the "
+                         "focal CNN currently cannot learn them at all.")
+    ap.add_argument("--train-csv", type=Path, default=DEFAULT_DATA_DIR / "train.csv",
+                    help="Used by --auto-targets to find classes missing focal data.")
     ap.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR)
     ap.add_argument("--out-csv", type=Path, default=DEFAULT_OUT_CSV)
     ap.add_argument("--taxonomy", type=Path, default=DEFAULT_TAXONOMY)
@@ -211,8 +219,28 @@ def main() -> None:
         raise SystemExit(f"Missing taxonomy: {args.taxonomy}")
     tax = pd.read_csv(args.taxonomy).set_index("primary_label")
 
-    targets = args.targets or DEFAULT_TARGETS
-    targets = [str(t) for t in targets]
+    if args.auto_targets:
+        # Classes absent from train.csv AND with a real scientific name
+        # (i.e. binomial Latin name, not a "son01" sonotype placeholder)
+        if not args.train_csv.exists():
+            raise SystemExit(f"--auto-targets requires {args.train_csv}")
+        focal_classes = set(pd.read_csv(args.train_csv)["primary_label"].astype(str).unique())
+        targets = []
+        for lb, row in tax.iterrows():
+            lb = str(lb)
+            if lb in focal_classes:
+                continue  # already has focal data
+            sci = str(row.get("scientific_name", ""))
+            if not sci or sci.lower().startswith("insect son"):
+                continue  # no real binomial — sonotype, untraceable
+            targets.append(lb)
+        print(f"[xc] --auto-targets selected {len(targets)} classes "
+              f"(no focal in train.csv, has scientific name):")
+        for t in targets:
+            print(f"  - {t:<14s} {tax.loc[t, 'scientific_name']}  ({tax.loc[t, 'class_name']})")
+    else:
+        targets = args.targets or DEFAULT_TARGETS
+        targets = [str(t) for t in targets]
 
     rows: List[Dict[str, Any]] = []
     grand_total = 0
@@ -230,6 +258,19 @@ def main() -> None:
         except Exception as e:
             print(f"[xc] query failed for {sci}: {e}")
             continue
+        # Quality fallback: many South-American taxa have few A/B grade
+        # recordings. If the strict filter returns nothing, retry once with
+        # an extra grade looser (A,B → A,B,C) and warn so you can spot
+        # quality-degraded fetches in the per-row CSV (rating column).
+        if not recs and "C" not in args.quality:
+            relaxed = (args.quality + ",C").strip(",")
+            print(f"[xc]   0 results at q:{args.quality}, retrying with q:{relaxed}")
+            try:
+                recs = _all_results(sci, sleep=args.sleep, quality=relaxed,
+                                    api_key=api_key)
+            except Exception as e:
+                print(f"[xc] retry failed for {sci}: {e}")
+                continue
 
         # Sort by rating + length (prefer rated A then B; mid-length 5-90s)
         def _sort_key(r: Dict[str, Any]) -> tuple:
