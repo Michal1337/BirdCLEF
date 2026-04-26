@@ -1,0 +1,490 @@
+"""One-shot script to (re)build EDA.ipynb."""
+import json
+from pathlib import Path
+
+
+def md(text: str) -> dict:
+    return {"cell_type": "markdown", "metadata": {}, "source": text.splitlines(keepends=True)}
+
+
+def code(text: str) -> dict:
+    return {"cell_type": "code", "metadata": {}, "execution_count": None,
+            "outputs": [], "source": text.splitlines(keepends=True)}
+
+
+cells = []
+
+cells.append(md(
+    "# BirdCLEF 2026 — EDA\n"
+    "\n"
+    "Reproducible exploratory analysis of the Pantanal dataset. Each section is independent — run from top once,\n"
+    "then jump around freely.\n"
+    "\n"
+    "**Layout**\n"
+    "1. Setup\n"
+    "2. Soundscape inventory (labeled / partial / unlabeled / test)\n"
+    "3. Site distribution + (site, hour) heatmaps\n"
+    "4. Hour-of-day & date distributions\n"
+    "5. `train.csv` (focal recordings) overview\n"
+    "6. Class coverage matrix (sample_sub × Perch × train.csv × soundscapes)\n"
+    "7. The 25 zero-signal `47158sonNN` classes\n"
+    "8. Per-class positive counts on labeled soundscapes\n"
+    "9. Listen / spectrogram playground (open-ended)\n"
+    "10. Pseudo-label feasibility helpers\n"
+))
+
+# ─── 1. Setup ────────────────────────────────────────────────────────────────
+cells.append(md("## 1. Setup"))
+cells.append(code(
+    'import sys, warnings\n'
+    'warnings.filterwarnings("ignore")\n'
+    'from pathlib import Path\n'
+    'import numpy as np\n'
+    'import pandas as pd\n'
+    'import matplotlib.pyplot as plt\n'
+    '\n'
+    'pd.set_option("display.max_rows", 200)\n'
+    'pd.set_option("display.max_columns", 50)\n'
+    'pd.set_option("display.width", 200)\n'
+    '\n'
+    'DATA = Path("data")\n'
+    'assert DATA.exists(), f"Run from repo root. Got cwd={Path.cwd()}"\n'
+))
+cells.append(code(
+    '# Repo-side helpers\n'
+    'from birdclef.data.soundscapes import (\n'
+    '    parse_fname, load_soundscape_meta, list_soundscape_files,\n'
+    '    list_unlabeled_soundscape_files, list_test_files,\n'
+    '    primary_labels, load_taxonomy,\n'
+    ')\n'
+    'from birdclef.data.splits import load_folds\n'
+))
+
+# ─── 2. Soundscape inventory ────────────────────────────────────────────────
+cells.append(md(
+    "## 2. Soundscape inventory\n"
+    "\n"
+    "Three buckets:\n"
+    "- **labeled**   = file has all 12 windows labeled in `train_soundscapes_labels.csv` (`fully_labeled=True`)\n"
+    "- **partial**   = file appears in the labels CSV but with <12 labeled windows\n"
+    "- **unlabeled** = file is on disk but has zero rows in the labels CSV\n"
+))
+cells.append(code(
+    'all_paths = list_soundscape_files(labeled_only=False)\n'
+    'df_all = pd.DataFrame([parse_fname(p.name) | {"filename": p.name} for p in all_paths])\n'
+    '\n'
+    'sc_meta = load_soundscape_meta()\n'
+    'labeled_files = set(sc_meta.query("fully_labeled")["filename"])\n'
+    'csv_files     = set(sc_meta["filename"])\n'
+    'df_all["status"] = np.where(\n'
+    '    df_all["filename"].isin(labeled_files), "labeled",\n'
+    '    np.where(df_all["filename"].isin(csv_files), "partial", "unlabeled"),\n'
+    ')\n'
+    'print(df_all["status"].value_counts().to_string())\n'
+    'print(f"\\nTotal train_soundscape files = {len(df_all)}")\n'
+    '\n'
+    '# Atomic-label counts. Note: raw CSV `primary_label` is semicolon-joined multi-labels —\n'
+    '# always derive distinct labels from sc_meta.label_list, not raw CSV.\n'
+    'lbls_any  = set().union(*sc_meta["label_list"])\n'
+    'lbls_full = set().union(*sc_meta.query("fully_labeled")["label_list"])\n'
+    'print(f"distinct atomic labels in soundscapes (any rows)      = {len(lbls_any)}")\n'
+    'print(f"distinct atomic labels in soundscapes (fully_labeled) = {len(lbls_full)}")\n'
+))
+
+# ─── 3. Site distribution ───────────────────────────────────────────────────
+cells.append(md("## 3. Site distribution"))
+cells.append(code(
+    'sd = df_all.pivot_table(index="site", columns="status",\n'
+    '                        values="filename", aggfunc="count", fill_value=0)\n'
+    'sd["total"] = sd.sum(axis=1)\n'
+    'sd["lab_share"] = (sd.get("labeled", 0) / sd["total"]).round(3)\n'
+    'sd = sd.sort_values("total", ascending=False)\n'
+    'sd\n'
+))
+cells.append(code(
+    'labeled_sites   = set(df_all[df_all.status=="labeled"]["site"])\n'
+    'unlabeled_sites = set(df_all[df_all.status=="unlabeled"]["site"])\n'
+    'print(f"Sites with ANY labeled file:  {sorted(labeled_sites)}  (n={len(labeled_sites)})")\n'
+    'print(f"Sites with ZERO labeled file: {sorted(unlabeled_sites - labeled_sites)}  "\n'
+    '      f"(n={len(unlabeled_sites - labeled_sites)})")\n'
+))
+cells.append(code(
+    'fig, ax = plt.subplots(figsize=(10, 4))\n'
+    'sd_plot = sd.drop(columns=["total", "lab_share"])\n'
+    'sd_plot.plot(kind="bar", stacked=True, ax=ax,\n'
+    '             color={"labeled":"tab:green","partial":"tab:orange","unlabeled":"tab:gray"})\n'
+    'ax.set_yscale("log")\n'
+    'ax.set_title("Files per site (log scale, stacked by labeling status)")\n'
+    'ax.set_xlabel("site"); ax.set_ylabel("files")\n'
+    'plt.tight_layout(); plt.show()\n'
+))
+
+# ─── 4. Hour & date ─────────────────────────────────────────────────────────
+cells.append(md("## 4. Hour-of-day and date coverage"))
+cells.append(code(
+    'hd = df_all.pivot_table(index="hour_utc", columns="status",\n'
+    '                        values="filename", aggfunc="count", fill_value=0)\n'
+    'hd["total"] = hd.sum(axis=1)\n'
+    'hd["lab_share"] = (hd.get("labeled", 0) / hd["total"]).round(3)\n'
+    'hd\n'
+))
+cells.append(code(
+    'fig, axes = plt.subplots(1, 2, figsize=(14, 4))\n'
+    'hd.drop(columns=["total","lab_share"]).plot(kind="bar", stacked=True, ax=axes[0],\n'
+    '    color={"labeled":"tab:green","partial":"tab:orange","unlabeled":"tab:gray"})\n'
+    'axes[0].set_yscale("log"); axes[0].set_title("Files per hour (UTC, log)")\n'
+    'axes[0].set_xlabel("hour_utc"); axes[0].set_ylabel("files")\n'
+    '\n'
+    'share = (hd.get("labeled",0) / hd["total"]).fillna(0)\n'
+    'share.plot(kind="bar", ax=axes[1], color="tab:green")\n'
+    'axes[1].set_title("Labeled-share of files per hour")\n'
+    'axes[1].set_xlabel("hour_utc"); axes[1].set_ylabel("labeled / total")\n'
+    'plt.tight_layout(); plt.show()\n'
+))
+cells.append(code(
+    'def _date_summary(df, name):\n'
+    '    d = pd.to_datetime(df["date"], format="%Y%m%d", errors="coerce").dropna()\n'
+    '    if not len(d): return None\n'
+    '    return {"status": name, "n": len(d), "unique_dates": d.nunique(),\n'
+    '            "min": d.min().date(), "max": d.max().date()}\n'
+    'rows = [_date_summary(df_all[df_all.status==s], s) for s in ["labeled","partial","unlabeled"]]\n'
+    'pd.DataFrame([r for r in rows if r])\n'
+))
+cells.append(code(
+    'heat = df_all[df_all.status=="labeled"].pivot_table(\n'
+    '    index="site", columns="hour_utc", values="filename", aggfunc="count", fill_value=0)\n'
+    'print("LABELED files per (site, hour):")\n'
+    'heat\n'
+))
+cells.append(code(
+    'heat_un = df_all[df_all.status=="unlabeled"].pivot_table(\n'
+    '    index="site", columns="hour_utc", values="filename", aggfunc="count", fill_value=0)\n'
+    'print("UNLABELED files per (site, hour):")\n'
+    'heat_un\n'
+))
+
+# ─── 5. train.csv ───────────────────────────────────────────────────────────
+cells.append(md("## 5. `train.csv` (focal recordings) overview"))
+cells.append(code(
+    'train_df = pd.read_csv(DATA/"train.csv")\n'
+    'print(f"rows={len(train_df)}  unique_classes={train_df[\'primary_label\'].nunique()}")\n'
+    'print(f"unique authors={train_df[\'author\'].nunique()}  collections={train_df[\'collection\'].unique().tolist()}")\n'
+    'train_df.head(3)\n'
+))
+cells.append(code(
+    'counts = train_df["primary_label"].value_counts()\n'
+    'print(f"recordings per class — median={counts.median()}, mean={counts.mean():.1f}, "\n'
+    '      f"max={counts.max()}, min={counts.min()}")\n'
+    'print(f"  classes with <5 recordings:  {(counts<5).sum()}")\n'
+    'print(f"  classes with <20 recordings: {(counts<20).sum()}")\n'
+    'print(f"  classes with >=100:          {(counts>=100).sum()}")\n'
+    '\n'
+    'fig, ax = plt.subplots(figsize=(10,4))\n'
+    'ax.hist(counts.values, bins=50)\n'
+    'ax.set_xlabel("recordings per primary_label"); ax.set_ylabel("# classes")\n'
+    'ax.set_title("Long-tail distribution of focal recordings")\n'
+    'plt.tight_layout(); plt.show()\n'
+))
+cells.append(code(
+    '# class_name (Aves / Insecta / Amphibia / Mammalia / Reptilia) breakdown\n'
+    '# train.csv already carries a class_name column.\n'
+    'tax = load_taxonomy()\n'
+    'print("Recordings by class_name:")\n'
+    'print(train_df["class_name"].value_counts().to_string())\n'
+    'print()\n'
+    'print("Unique species per class_name:")\n'
+    'print(train_df.groupby("class_name")["primary_label"].nunique().to_string())\n'
+))
+cells.append(code(
+    '# Geographic distribution of the focal recordings (lat/lon)\n'
+    'loc = train_df.dropna(subset=["latitude","longitude"])\n'
+    'fig, ax = plt.subplots(figsize=(8,5))\n'
+    'ax.scatter(loc["longitude"], loc["latitude"], s=2, alpha=0.3)\n'
+    'ax.set_xlabel("longitude"); ax.set_ylabel("latitude")\n'
+    'ax.set_title(f"Focal recording locations  (n={len(loc)} with coords)")\n'
+    'plt.tight_layout(); plt.show()\n'
+))
+
+# ─── 6. Class coverage matrix ───────────────────────────────────────────────
+cells.append(md(
+    "## 6. Class coverage matrix\n"
+    "\n"
+    "For each of the 234 sample-submission classes, where is the training signal?\n"
+    "- **Perch direct**  — Perch model has the species in its 6,000-class head\n"
+    "- **Perch proxy**   — same genus is in Perch (reasonable transfer for Insecta/Amphibia/Aves)\n"
+    "- **train.csv**     — at least one focal recording exists\n"
+    "- **soundscape**    — at least one positive in the 59 labeled soundscapes\n"
+))
+cells.append(code(
+    'from birdclef.models.perch import build_label_mapping\n'
+    '\n'
+    'labels = primary_labels()\n'
+    'N = len(labels)\n'
+    'mapping = build_label_mapping()\n'
+    'direct  = set(mapping["mapped_pos"].tolist())\n'
+    'proxy   = set(int(k) for k in mapping["proxy_map"].keys())\n'
+    'perch_any = direct | proxy\n'
+    '\n'
+    'train_classes = set(train_df["primary_label"].unique())\n'
+    '# CSV `primary_label` cells are semicolon-joined multi-labels (e.g. "rubthr1;47158son01") —\n'
+    '# read the union of *atomic* labels via sc_meta.label_list, NOT the raw CSV column.\n'
+    'sc_classes = set()\n'
+    'for L in sc_meta["label_list"]:\n'
+    '    sc_classes.update(L)\n'
+    'sc_classes_full = set()\n'
+    'for L in sc_meta.query("fully_labeled")["label_list"]:\n'
+    '    sc_classes_full.update(L)\n'
+    'print(f"distinct atomic labels in soundscapes (any file)        : {len(sc_classes)}")\n'
+    'print(f"distinct atomic labels in soundscapes (fully_labeled)   : {len(sc_classes_full)}")\n'
+    '\n'
+    'lpos = {lb: i for i, lb in enumerate(labels)}\n'
+    'train_pos = {lpos[lb] for lb in train_classes if lb in lpos}\n'
+    'sc_pos    = {lpos[lb] for lb in sc_classes if lb in lpos}\n'
+    '\n'
+    'cov = pd.DataFrame({"primary_label": labels})\n'
+    'cov["pos"]            = np.arange(N)\n'
+    'cov["perch_direct"]   = cov["pos"].isin(direct)\n'
+    'cov["perch_proxy"]    = cov["pos"].isin(proxy)\n'
+    'cov["perch_any"]      = cov["pos"].isin(perch_any)\n'
+    'cov["in_train_csv"]   = cov["pos"].isin(train_pos)\n'
+    'cov["in_soundscape"]  = cov["pos"].isin(sc_pos)\n'
+    'cov["any_signal"]     = cov[["perch_any","in_train_csv","in_soundscape"]].any(axis=1)\n'
+    'cov = cov.merge(tax[["primary_label","class_name","scientific_name"]], on="primary_label", how="left")\n'
+    'cov.head()\n'
+))
+cells.append(code(
+    'print("=== Class coverage summary ===")\n'
+    'print(f"Total classes                            : {N}")\n'
+    'print(f"Perch direct                             : {cov[\'perch_direct\'].sum()}")\n'
+    'print(f"Perch direct + proxy                     : {cov[\'perch_any\'].sum()}")\n'
+    'print(f"In train.csv (focal)                     : {cov[\'in_train_csv\'].sum()}")\n'
+    'print(f"In soundscape labels                     : {cov[\'in_soundscape\'].sum()}")\n'
+    'print(f"In Perch ∪ train.csv                     : {(cov[\'perch_any\'] | cov[\'in_train_csv\']).sum()}")\n'
+    'print(f"In Perch ∪ soundscape                    : {(cov[\'perch_any\'] | cov[\'in_soundscape\']).sum()}")\n'
+    'print(f"In Perch ∪ train.csv ∪ soundscape        : {(cov[\'perch_any\'] | cov[\'in_train_csv\'] | cov[\'in_soundscape\']).sum()}")\n'
+    'print(f"In train.csv ∪ soundscape                : {(cov[\'in_train_csv\'] | cov[\'in_soundscape\']).sum()}")\n'
+    'print(f"In ANY source (any_signal)               : {cov[\'any_signal\'].sum()}")\n'
+    'print(f"ZERO signal anywhere                     : {(~cov[\'any_signal\']).sum()}")\n'
+    '\n'
+    '# Soundscape-ONLY classes — present in train_soundscapes but NOT in train.csv NOR Perch.\n'
+    '# These are the 25 47158sonNN sonotypes: only learnable from labeled soundscape rows,\n'
+    '# which means using the full train_soundscapes pool as validation removes their only\n'
+    '# training signal. Need a fold-aware split that keeps some sonotype-positive files in train.\n'
+    'sc_only_mask = cov["in_soundscape"] & ~cov["in_train_csv"] & ~cov["perch_any"]\n'
+    'print(f"\\nClasses present ONLY in soundscapes      : {int(sc_only_mask.sum())}")\n'
+    'print(cov.loc[sc_only_mask, [\"primary_label\",\"class_name\",\"scientific_name\"]].to_string(index=False))\n'
+))
+cells.append(code(
+    '# Cross-tab Perch vs train.csv\n'
+    'both       = perch_any & train_pos\n'
+    'perch_only = perch_any - train_pos\n'
+    'focal_only = train_pos - perch_any\n'
+    'neither    = set(range(N)) - (perch_any | train_pos)\n'
+    'print(f"in BOTH Perch and train.csv  : {len(both):3d}  -> strongest signal")\n'
+    'print(f"in Perch ONLY                : {len(perch_only):3d}")\n'
+    'print(f"in train.csv ONLY            : {len(focal_only):3d}  -> only learnable from focal")\n'
+    'print(f"in NEITHER                   : {len(neither):3d}")\n'
+    'print()\n'
+    'print("\'Focal-only\' classes (Perch can\'t see them):")\n'
+    'print(cov.loc[cov["pos"].isin(focal_only), ["primary_label","class_name","scientific_name"]].to_string(index=False))\n'
+))
+
+# ─── 7. Sonotypes ───────────────────────────────────────────────────────────
+cells.append(md(
+    "## 7. The 25 zero-signal `47158sonNN` classes\n"
+    "\n"
+    "iNat 47158 = the entire class **Insecta**. The `sonNN` suffixes are sonotypes —\n"
+    "distinct call types an annotator could distinguish but couldn't ID to species.\n"
+    "By construction there are no external recordings labeled with these IDs.\n"
+    "\n"
+    "How much *soundscape* signal exists for them?\n"
+))
+cells.append(code(
+    'sonotype_lbls = sorted([lb for lb in labels if lb.startswith("47158son")])\n'
+    'print(f"sonotype classes: {len(sonotype_lbls)}")\n'
+    '\n'
+    '# IMPORTANT: CSV `primary_label` is semicolon-joined; sonotypes appear ONLY in multi-label\n'
+    '# combos (e.g. "22973;47158son25;65380"), never standalone. Always use sc_meta.label_list,\n'
+    '# which has been split via union_labels — exact-string matching on the raw CSV silently\n'
+    '# returns zero for every sonotype.\n'
+    'rows = []\n'
+    'for lb in sonotype_lbls:\n'
+    '    mask_any  = sc_meta["label_list"].apply(lambda L: lb in L)\n'
+    '    mask_full = sc_meta.query("fully_labeled")["label_list"].apply(lambda L: lb in L)\n'
+    '    n_windows_any  = int(mask_any.sum())\n'
+    '    n_files_any    = int(sc_meta.loc[mask_any, "filename"].nunique())\n'
+    '    n_windows_full = int(mask_full.sum())\n'
+    '    n_files_full   = int(sc_meta.query("fully_labeled").loc[mask_full, "filename"].nunique())\n'
+    '    rows.append({\n'
+    '        "label": lb,\n'
+    '        "windows_any":  n_windows_any,\n'
+    '        "files_any":    n_files_any,\n'
+    '        "windows_full": n_windows_full,\n'
+    '        "files_full":   n_files_full,\n'
+    '    })\n'
+    'per_son = pd.DataFrame(rows).set_index("label").sort_values("windows_full", ascending=False)\n'
+    'per_son\n'
+))
+cells.append(code(
+    'print(f"sonotype positives in fully_labeled files:")\n'
+    'print(f"  classes with >=20 positive windows : {(per_son[\'windows_full\']>=20).sum()}  (plausibly trainable)")\n'
+    'print(f"  classes with >=5 positive windows  : {(per_son[\'windows_full\']>=5).sum()}")\n'
+    'print(f"  classes with 0 positive windows    : {(per_son[\'windows_full\']==0).sum()}  (unrecoverable)")\n'
+    'print(f"  total sonotype positive windows in fully_labeled : {per_son[\'windows_full\'].sum()}")\n'
+))
+
+# ─── 8. Per-class soundscape positives ──────────────────────────────────────
+cells.append(md("## 8. Per-class positive counts on the 59 labeled soundscapes"))
+cells.append(code(
+    'from birdclef.data.soundscapes import build_label_matrix, label_to_idx\n'
+    'sc_full = sc_meta.query("fully_labeled").reset_index(drop=True)\n'
+    'Y = build_label_matrix(sc_full)\n'
+    'idx2lbl = {v:k for k,v in label_to_idx().items()}\n'
+    'pos_per_class = Y.sum(axis=0)\n'
+    'class_support = pd.DataFrame({\n'
+    '    "primary_label": [idx2lbl[i] for i in range(len(pos_per_class))],\n'
+    '    "pos_windows":   pos_per_class,\n'
+    '})\n'
+    'class_support = class_support.merge(tax[["primary_label","class_name"]], on="primary_label", how="left")\n'
+    'class_support["pos_files"] = [\n'
+    '    sc_full[sc_full["label_list"].apply(lambda L: idx2lbl[i] in L)]["filename"].nunique()\n'
+    '    for i in range(len(pos_per_class))\n'
+    ']\n'
+    'class_support.sort_values("pos_windows", ascending=False).head(20)\n'
+))
+cells.append(code(
+    'print("Distribution of class support on the 59 labeled soundscapes:")\n'
+    'print(f"  classes with 0 positive windows : {(class_support[\'pos_windows\']==0).sum()}")\n'
+    'print(f"  with 1-4 positive windows       : {((class_support[\'pos_windows\']>=1) & (class_support[\'pos_windows\']<5)).sum()}")\n'
+    'print(f"  with 5-19 positive windows      : {((class_support[\'pos_windows\']>=5) & (class_support[\'pos_windows\']<20)).sum()}")\n'
+    'print(f"  with 20+ positive windows       : {(class_support[\'pos_windows\']>=20).sum()}")\n'
+))
+cells.append(code(
+    'fig, ax = plt.subplots(figsize=(10,4))\n'
+    'ax.hist(class_support["pos_windows"], bins=50)\n'
+    'ax.set_xlabel("positive windows in 59 labeled soundscapes")\n'
+    'ax.set_ylabel("# classes"); ax.set_title("Soundscape support histogram")\n'
+    'plt.tight_layout(); plt.show()\n'
+))
+
+# ─── 9. Audio playground ────────────────────────────────────────────────────
+cells.append(md(
+    "## 9. Listen / spectrogram playground (open-ended)\n"
+    "\n"
+    "Pick any soundscape file or focal recording and inspect the audio + label structure.\n"
+    "Modify `TARGET_FILE` and re-run.\n"
+))
+cells.append(code(
+    'import soundfile as sf\n'
+    'import IPython.display as ipd\n'
+    '\n'
+    '# pick a labeled soundscape with rich species content\n'
+    'TARGET_FILE = sc_full.groupby("filename").size().sort_values(ascending=False).index[0]\n'
+    'print(f"TARGET_FILE = {TARGET_FILE}")\n'
+    '\n'
+    'audio_path = DATA/"train_soundscapes"/TARGET_FILE\n'
+    'y, sr = sf.read(str(audio_path), dtype="float32")\n'
+    'print(f"  duration={len(y)/sr:.1f}s  sr={sr}")\n'
+    '\n'
+    'rows = sc_full[sc_full["filename"]==TARGET_FILE][["start","end","label_list","site","hour_utc"]]\n'
+    'display(rows)\n'
+    'ipd.Audio(str(audio_path))\n'
+))
+cells.append(code(
+    '# Mel spectrogram of the file\n'
+    'import librosa, librosa.display\n'
+    'mel = librosa.feature.melspectrogram(y=y, sr=sr, n_mels=128, n_fft=2048, hop_length=512, fmax=sr//2)\n'
+    'mdb = librosa.power_to_db(mel, ref=np.max)\n'
+    'fig, ax = plt.subplots(figsize=(14,4))\n'
+    'img = librosa.display.specshow(mdb, sr=sr, hop_length=512, x_axis="time", y_axis="mel", ax=ax, fmax=sr//2)\n'
+    'fig.colorbar(img, ax=ax, format="%+2.f dB")\n'
+    'ax.set_title(f"{TARGET_FILE}  —  fully_labeled={TARGET_FILE in labeled_files}")\n'
+    'plt.tight_layout(); plt.show()\n'
+))
+cells.append(code(
+    '# Pick a focal recording for any class you want to inspect\n'
+    'TARGET_CLASS = "rubthr1"   # ← change me\n'
+    'samples = train_df[train_df["primary_label"]==TARGET_CLASS].head(3)\n'
+    'for _, row in samples.iterrows():\n'
+    '    fp = DATA/"train_audio"/row["filename"]\n'
+    '    if not fp.exists():\n'
+    '        print(f"missing: {fp}"); continue\n'
+    '    y, sr = sf.read(str(fp), dtype="float32")\n'
+    '    print(f"{row[\'filename\']}  ({len(y)/sr:.1f}s)  rating={row[\'rating\']}  author={row[\'author\']}")\n'
+    '    display(ipd.Audio(str(fp)))\n'
+))
+
+# ─── 10. Pseudo-label feasibility ───────────────────────────────────────────
+cells.append(md(
+    "## 10. Pseudo-label feasibility helpers\n"
+    "\n"
+    "Two questions to inform the pseudo-labeling strategy:\n"
+    "1. How many unlabeled soundscape-windows would survive a high-confidence Perch threshold per site?\n"
+    "2. Are the unlabeled sites' acoustic characteristics similar to the labeled ones (PCA on Perch embeddings)?\n"
+    "\n"
+    "These need the cached Perch arrays — only run if `data/perch/` (or the new cache) is built.\n"
+))
+cells.append(code(
+    '# Cheap proxy: how many unlabeled WINDOWS (×12 per file) per site would pseudo-labeling target?\n'
+    'budget = (\n'
+    '    df_all.groupby(["site","status"]).size().unstack(fill_value=0)\n'
+    ')\n'
+    'budget["unlabeled_windows"] = budget.get("unlabeled", 0) * 12\n'
+    'budget["labeled_windows"]   = budget.get("labeled",   0) * 12\n'
+    'budget["leverage"] = (budget["unlabeled_windows"] /\n'
+    '                      (budget["labeled_windows"].replace(0, np.nan))).round(1)\n'
+    'budget.sort_values("unlabeled_windows", ascending=False)\n'
+))
+cells.append(code(
+    '# Optional: PCA on Perch embeddings, colour-coded by site (labeled vs unlabeled)\n'
+    '# Heavy — only enable if you have built the full Perch cache.\n'
+    'RUN_PCA = False\n'
+    'if RUN_PCA:\n'
+    '    from birdclef.train.train_ssm_head import load_perch_cache\n'
+    '    from sklearn.decomposition import PCA\n'
+    '    cache = load_perch_cache()\n'
+    '    file_emb = cache.emb.reshape(-1, 12, cache.emb.shape[1]).mean(axis=1)\n'
+    '    file_meta = cache.meta.drop_duplicates("filename").reset_index(drop=True)\n'
+    '    pca = PCA(n_components=2).fit_transform(file_emb)\n'
+    '    fig, ax = plt.subplots(figsize=(9,7))\n'
+    '    for s in sorted(file_meta["site"].unique()):\n'
+    '        m = file_meta["site"]==s\n'
+    '        ax.scatter(pca[m,0], pca[m,1], s=6, alpha=0.4, label=s)\n'
+    '    ax.legend(bbox_to_anchor=(1.02,1), fontsize=8, ncol=2)\n'
+    '    ax.set_title("PCA(2) of file-mean Perch embeddings")\n'
+    '    plt.tight_layout(); plt.show()\n'
+))
+
+cells.append(md(
+    "---\n"
+    "## Notes for further research\n"
+    "\n"
+    "- **Site domain shift**: the 15 sites with zero labels (S01, S02, S04–S07, S09–S12, S14, S16, S17, S20, S21)\n"
+    "  are where pseudo-labeling has the most to lose. Compare their unlabeled-Perch-embedding distribution to the\n"
+    "  8 labeled sites (PCA cell above). If they cluster separately, pseudo-labels there will be untrustworthy.\n"
+    "- **Date shift**: unlabeled spans 2014–2025, labeled spans 2021–2025. Older recordings might be collected\n"
+    "  on different equipment.\n"
+    "- **Hour gap**: hours 8–17 UTC are sparse in both labeled and unlabeled. If test prevalence is uniform across\n"
+    "  the day, this is a coverage problem; if test is also nocturnal, it's not.\n"
+    "- **Sonotypes**: the 25 `47158sonNN` classes are unrecoverable from external data, but most DO have\n"
+    "  positives in the 59 labeled soundscapes (Section 7) — they're plausible SED-head targets even\n"
+    "  without focal recordings. CSV uses semicolon-joined multi-labels, always read via `sc_meta.label_list`.\n"
+    "- **Long tail**: 36 of 206 covered classes have <20 focal recordings. Mixup and heavy augmentation matter\n"
+    "  more for these than architecture choice.\n"
+))
+
+
+nb = {
+    "cells": cells,
+    "metadata": {
+        "kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"},
+        "language_info": {"name": "python"},
+    },
+    "nbformat": 4,
+    "nbformat_minor": 5,
+}
+
+out = Path("EDA.ipynb")
+with open(out, "w", encoding="utf-8") as f:
+    json.dump(nb, f, indent=1, ensure_ascii=False)
+print(f"wrote {out}  ({len(cells)} cells)")

@@ -175,6 +175,12 @@ def prepare_soundscape_metadata(metadata: pd.DataFrame, soundscape_dir: Path) ->
 
     prepared = metadata.copy()
     prepared = prepared.dropna(subset=["filename", "start", "end", "primary_label"]).reset_index(drop=True)
+    # train_soundscapes_labels.csv ships every row twice; without this, every
+    # soundscape window is fed to training duplicated, which inflates support
+    # for already-frequent labels and skews per-class loss weights.
+    prepared = prepared.drop_duplicates(
+        subset=["filename", "start", "end", "primary_label"]
+    ).reset_index(drop=True)
     prepared["filename"] = prepared["filename"].astype(str)
     prepared["primary_label"] = prepared["primary_label"].astype(str)
     prepared["audio_filepath"] = prepared["filename"].map(lambda name: str(soundscape_dir / name))

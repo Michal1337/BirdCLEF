@@ -61,6 +61,10 @@ def load_soundscape_meta() -> pd.DataFrame:
              label_list (List[str]), fully_labeled (bool)
     """
     sc_labels = pd.read_csv(SCLABEL_CSV)
+    # The raw CSV ships every row twice (1478 rows = 739 unique × 2). The
+    # groupby below collapses dupes for our outputs, but dedup at the source
+    # so anything that re-reads SCLABEL_CSV directly sees the right counts.
+    sc_labels = sc_labels.drop_duplicates().reset_index(drop=True)
     sc = (
         sc_labels.groupby(["filename", "start", "end"])["primary_label"]
         .apply(union_labels)
