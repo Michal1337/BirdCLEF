@@ -332,6 +332,19 @@ def build_target_matrix(label_lists: Sequence[Sequence[str]], labels_subset: Seq
     return y
 
 
+def _r4(x) -> float | None:
+    """Round-or-None: 4 decimals, NaN→None for JSON/CSV friendliness."""
+    try:
+        if x is None:
+            return None
+        f = float(x)
+        if f != f:
+            return None
+        return round(f, 4)
+    except (TypeError, ValueError):
+        return None
+
+
 def macro_auc_from_logits(y_true: np.ndarray, logits: np.ndarray) -> Tuple[float, int]:
     pos = y_true.sum(axis=0)
     keep = (pos > 0) & (pos < y_true.shape[0])
@@ -341,6 +354,43 @@ def macro_auc_from_logits(y_true: np.ndarray, logits: np.ndarray) -> Tuple[float
     probs = 1.0 / (1.0 + np.exp(-logits))
     auc = roc_auc_score(y_true[:, keep], probs[:, keep], average="macro")
     return float(auc), n
+
+
+def taxa_auc_from_logits(
+    y_true: np.ndarray, logits: np.ndarray, target_labels: Sequence[str],
+    taxonomy_df: pd.DataFrame,
+) -> Dict[str, Dict[str, Any]]:
+    """Per-taxonomic-class macro AUC over the head's target_labels.
+
+    Returns {taxon_name: {"macro_auc": float|None, "n_eval_classes": int}}.
+    Skips classes with no positives (matches macro_auc_from_logits semantics
+    + the BirdCLEF official metric).
+    """
+    label_to_taxon = dict(zip(
+        taxonomy_df["primary_label"].astype(str),
+        taxonomy_df["class_name"].astype(str),
+    ))
+    pos = y_true.sum(axis=0)
+    out: Dict[str, Dict[str, Any]] = {}
+    # Build per-taxon column-index list (within target_labels' columns)
+    by_taxon: Dict[str, List[int]] = {}
+    for ci, lb in enumerate(target_labels):
+        by_taxon.setdefault(label_to_taxon.get(str(lb), "Unknown"), []).append(ci)
+    probs = 1.0 / (1.0 + np.exp(-logits))
+    for taxon, cols in by_taxon.items():
+        cols_arr = np.array(cols, dtype=np.int64)
+        keep = (pos[cols_arr] > 0) & (pos[cols_arr] < y_true.shape[0])
+        n_eval = int(keep.sum())
+        if n_eval == 0:
+            out[taxon] = {"macro_auc": None, "n_eval_classes": 0}
+            continue
+        kept = cols_arr[keep]
+        try:
+            auc = float(roc_auc_score(y_true[:, kept], probs[:, kept], average="macro"))
+        except ValueError:
+            auc = float("nan")
+        out[taxon] = {"macro_auc": _r4(auc), "n_eval_classes": n_eval}
+    return out
 
 
 def per_class_auc_from_logits(y_true: np.ndarray, logits: np.ndarray, labels: Sequence[str]) -> pd.DataFrame:
@@ -363,10 +413,11 @@ def per_class_auc_from_logits(y_true: np.ndarray, logits: np.ndarray, labels: Se
                 "n_pos": pos,
                 "n_neg": neg,
                 "evaluable": bool(evaluable),
-                "auc": auc,
+                "auc": _r4(auc),
             }
         )
-    return pd.DataFrame(rows).sort_values(["evaluable", "auc"], ascending=[False, True]).reset_index(drop=True)
+    return pd.DataFrame(rows).sort_values(["evaluable", "auc"], ascending=[False, True],
+                                          na_position="last").reset_index(drop=True)
 
 
 def parse_float_list(raw: str) -> List[float]:
@@ -511,17 +562,17 @@ def train_one_fold(
 
         history.append(
             {
-                "fold": float(fold_id),
-                "epoch": float(epoch),
-                "train_loss": train_loss,
-                "val_loss": val_loss,
-                "val_macro_auc": float(val_auc),
-                "n_eval_classes": float(n_eval),
+                "fold": int(fold_id),
+                "epoch": int(epoch),
+                "train_loss": _r4(train_loss),
+                "val_loss": _r4(val_loss),
+                "val_macro_auc": _r4(val_auc),
+                "n_eval_classes": int(n_eval),
             }
         )
         print(
-            f"Fold {fold_id:02d} epoch {epoch:02d} | train_loss={train_loss:.6f} | "
-            f"val_loss={val_loss:.6f} | val_macro_auc={val_auc:.6f} ({n_eval} classes)"
+            f"Fold {fold_id:02d} epoch {epoch:02d} | train_loss={train_loss:.4f} | "
+            f"val_loss={val_loss:.4f} | val_macro_auc={val_auc:.4f} ({n_eval} classes)"
         )
 
         auc_cmp = -np.inf if np.isnan(val_auc) else float(val_auc)
@@ -532,16 +583,16 @@ def train_one_fold(
             best_val_logits = val_logits_np
 
     best_metrics = {
-        "fold": float(fold_id),
-        "best_val_macro_auc": None if not np.isfinite(best_auc) else float(best_auc),
-        "best_val_loss": float(best_val_loss),
-        "n_eval_classes_best": float(macro_auc_from_logits(y_val, best_val_logits)[1]),
-        "n_train_rows": float(len(y_train)),
-        "n_val_rows": float(len(y_val)),
+        "fold": int(fold_id),
+        "best_val_macro_auc": _r4(None if not np.isfinite(best_auc) else best_auc),
+        "best_val_loss": _r4(best_val_loss),
+        "n_eval_classes_best": int(macro_auc_from_logits(y_val, best_val_logits)[1]),
+        "n_train_rows": int(len(y_train)),
+        "n_val_rows": int(len(y_val)),
         "loss_name": str(loss_name),
-        "focal_gamma": float(focal_gamma),
-        "sampler_power": float(sampler_power),
-        "pos_weight_cap": float(pos_weight_cap),
+        "focal_gamma": _r4(focal_gamma),
+        "sampler_power": _r4(sampler_power),
+        "pos_weight_cap": _r4(pos_weight_cap),
     }
     return best_metrics, best_state, history, best_val_logits
 
@@ -811,34 +862,49 @@ def main() -> None:
             raise RuntimeError(f"OOF coverage incomplete, missing {missing} rows.")
 
         oof_auc, oof_n_eval = macro_auc_from_logits(y, oof_logits)
+        oof_taxa = taxa_auc_from_logits(
+            y_true=y, logits=oof_logits, target_labels=target_labels,
+            taxonomy_df=taxonomy,
+        )
         per_class_oof = per_class_auc_from_logits(y_true=y, logits=oof_logits, labels=target_labels)
-        print(f"OOF macro AUC: {oof_auc:.6f} ({oof_n_eval} classes)")
+        print(f"OOF macro AUC: {oof_auc:.4f} ({oof_n_eval} classes)")
+        for taxon, m in sorted(oof_taxa.items()):
+            print(f"  {taxon:<10s} oof_auc={m['macro_auc']}  (n_eval={m['n_eval_classes']})")
 
         run_payload = {
             "config": cfg,
-            "oof_auc": float(oof_auc),
+            "oof_auc": _r4(oof_auc),
             "oof_n_eval": int(oof_n_eval),
+            "oof_taxa": oof_taxa,
             "fold_metrics": fold_metrics,
             "history": all_history,
             "fold_states": fold_states,
             "best_fold_state": best_fold_state,
             "per_class_oof": per_class_oof,
         }
-        sweep_rows.append(
-            {
-                "config_id": int(cfg_idx),
-                "loss": cfg["loss_name"],
-                "focal_gamma": float(cfg["focal_gamma"]),
-                "sampler_power": float(cfg["sampler_power"]),
-                "lr": float(cfg["lr"]),
-                "weight_decay": float(cfg["weight_decay"]),
-                "epochs": int(cfg["epochs"]),
-                "oof_macro_auc": float(oof_auc),
-                "oof_n_eval_classes": int(oof_n_eval),
-            }
-        )
+        # Sweep CSV row — `primary` mirrors the convention used by the SSM /
+        # focal trainer summaries so a single sort across all sweep CSVs works.
+        sweep_row = {
+            "config_id": int(cfg_idx),
+            "loss": cfg["loss_name"],
+            "focal_gamma": _r4(cfg["focal_gamma"]),
+            "sampler_power": _r4(cfg["sampler_power"]),
+            "lr": _r4(cfg["lr"]),
+            "weight_decay": _r4(cfg["weight_decay"]),
+            "epochs": int(cfg["epochs"]),
+            "primary": _r4(oof_auc),
+            "oof_macro_auc": _r4(oof_auc),
+            "oof_n_eval_classes": int(oof_n_eval),
+        }
+        for taxon, m in oof_taxa.items():
+            sweep_row[f"oof_auc_{taxon.lower()}"] = m["macro_auc"]
+            sweep_row[f"oof_n_eval_{taxon.lower()}"] = m["n_eval_classes"]
+        sweep_rows.append(sweep_row)
 
-        if best_run is None or float(oof_auc) > float(best_run["oof_auc"]):
+        # Best-run selection compares raw floats safely (None < anything via -inf)
+        best_score = float("-inf") if best_run is None else (best_run["oof_auc"] or float("-inf"))
+        cur_score = float(oof_auc) if np.isfinite(oof_auc) else float("-inf")
+        if best_run is None or cur_score > best_score:
             best_run = run_payload
 
     if best_run is None:
@@ -846,12 +912,14 @@ def main() -> None:
 
     if args.sweep_csv is not None:
         args.sweep_csv.parent.mkdir(parents=True, exist_ok=True)
-        pd.DataFrame(sweep_rows).sort_values("oof_macro_auc", ascending=False).to_csv(args.sweep_csv, index=False)
+        pd.DataFrame(sweep_rows).sort_values("primary", ascending=False,
+                                             na_position="last").to_csv(args.sweep_csv, index=False)
         print(f"Saved sweep CSV: {args.sweep_csv}")
 
     best_cfg = best_run["config"]
-    oof_auc = float(best_run["oof_auc"])
+    oof_auc = float(best_run["oof_auc"]) if best_run["oof_auc"] is not None else float("nan")
     oof_n_eval = int(best_run["oof_n_eval"])
+    oof_taxa = best_run["oof_taxa"]
     fold_metrics = best_run["fold_metrics"]
     all_history = best_run["history"]
     fold_states = best_run["fold_states"]
@@ -863,20 +931,23 @@ def main() -> None:
     print(
         f"loss={best_cfg['loss_name']} gamma={best_cfg['focal_gamma']} sampler={best_cfg['sampler_power']} "
         f"lr={best_cfg['lr']} wd={best_cfg['weight_decay']} epochs={best_cfg['epochs']} | "
-        f"OOF={oof_auc:.6f} ({oof_n_eval} classes)"
+        f"OOF={oof_auc:.4f} ({oof_n_eval} classes)"
     )
+    print("Per-taxon OOF:")
+    for taxon, m in sorted(oof_taxa.items()):
+        print(f"  {taxon:<10s} oof_auc={m['macro_auc']}  (n_eval={m['n_eval_classes']})")
     print("Worst OOF classes:")
     if len(evaluable_df) == 0:
         print("  none")
     else:
         for _, row in evaluable_df.nsmallest(8, "auc").iterrows():
-            print(f"  {row['label']}: auc={row['auc']:.6f} pos={int(row['n_pos'])} neg={int(row['n_neg'])}")
+            print(f"  {row['label']}: auc={row['auc']:.4f} pos={int(row['n_pos'])} neg={int(row['n_neg'])}")
     print("Best OOF classes:")
     if len(evaluable_df) == 0:
         print("  none")
     else:
         for _, row in evaluable_df.nlargest(8, "auc").iterrows():
-            print(f"  {row['label']}: auc={row['auc']:.6f} pos={int(row['n_pos'])} neg={int(row['n_neg'])}")
+            print(f"  {row['label']}: auc={row['auc']:.4f} pos={int(row['n_pos'])} neg={int(row['n_neg'])}")
 
     if args.per_class_oof_csv is not None:
         args.per_class_oof_csv.parent.mkdir(parents=True, exist_ok=True)
@@ -922,8 +993,10 @@ def main() -> None:
                 },
                 "fold_metrics": fold_metrics,
                 "oof": {
-                    "macro_auc": None if not np.isfinite(oof_auc) else float(oof_auc),
+                    "primary": _r4(None if not np.isfinite(oof_auc) else oof_auc),
+                    "macro_auc": _r4(None if not np.isfinite(oof_auc) else oof_auc),
                     "n_eval_classes": int(oof_n_eval),
+                    "by_taxon": oof_taxa,
                 },
                 "per_class_oof": per_class_oof.to_dict(orient="records"),
                 "history": all_history,
