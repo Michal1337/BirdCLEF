@@ -479,14 +479,23 @@ def run_full_evaluation(cfg: dict) -> Dict:
     n_splits_cfg = int(cfg.get("n_splits", 5))
     folds = load_folds(n_splits=n_splits_cfg)
     fold_of = dict(zip(folds["filename"], folds["fold"].astype(int)))
+    # row_fold = -1 means EITHER (a) file isn't in folds parquet (e.g.
+    # unlabeled), or (b) file is pinned (fold=-1 in parquet). In both cases
+    # the file is excluded from val. The train mask below `row_fold != f`
+    # naturally includes pinned files in every fold's train; unlabeled files
+    # are filtered out elsewhere by `cache.labeled_mask`.
     row_fold = cache_meta["filename"].map(fold_of).fillna(-1).astype(int).to_numpy()
-    n_splits = int(folds["fold"].max()) + 1 if len(folds) else n_splits_cfg
+    n_splits = int(folds.loc[folds["fold"] >= 0, "fold"].max()) + 1 if len(folds) else n_splits_cfg
 
     oof_final = np.zeros_like(cache_Y, dtype=np.float32)
     oof_fp = np.zeros_like(cache_Y, dtype=np.float32)
     per_fold = {}
     for f in range(n_splits):
-        tr = np.where((row_fold != f) & (row_fold >= 0))[0]
+        # Train: every row except this fold's val. Pinned (-1) and unlabeled
+        # (-1 from fillna) both pass `row_fold != f` for any f >= 0, so they
+        # land in train as intended. The labeled-mask filter upstream
+        # already removed truly unlabeled rows from cache_meta.
+        tr = np.where(row_fold != f)[0]
         va = np.where(row_fold == f)[0]
         if len(va) == 0:
             continue

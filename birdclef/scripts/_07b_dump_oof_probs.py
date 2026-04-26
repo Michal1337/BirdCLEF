@@ -94,13 +94,16 @@ def _dump_ssm(out_dir: Path, ssm_config_name: str, n_splits: int) -> tuple[np.nd
 
     folds_df = load_folds(n_splits=int(n_splits))
     fold_of = dict(zip(folds_df["filename"], folds_df["fold"].astype(int)))
+    # fold=-1 means PINNED → in every fold's train, never in val (matches the
+    # _07b_ convention that pinned/missing rows are not part of OOF eval).
     row_fold = cache_meta["filename"].map(fold_of).fillna(-1).astype(int).to_numpy()
 
     n_classes = cache_Y.shape[1]
     oof_final = np.zeros((len(cache_meta), n_classes), dtype=np.float32)
-    keep = row_fold >= 0
+    keep = row_fold >= 0  # only rows assigned to a real fold contribute to OOF probs
     for f in range(int(n_splits)):
-        tr = np.where((row_fold != f) & (row_fold >= 0))[0]
+        # Train includes pinned (-1) and other folds; val is exact-match only.
+        tr = np.where(row_fold != f)[0]
         va = np.where(row_fold == f)[0]
         if len(va) == 0:
             print(f"[ssm-oof]   fold {f}: empty val set, skipping")

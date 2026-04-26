@@ -127,6 +127,12 @@ def main():
     sc["fold"] = sc["filename"].astype(str).map(fold_of)
     sc = sc.dropna(subset=["fold"]).reset_index(drop=True)
     sc["fold"] = sc["fold"].astype(int)
+    # Drop pinned files (fold=-1) — they're always-train, never validated.
+    n_pinned_rows = int((sc["fold"] == -1).sum())
+    if n_pinned_rows:
+        n_pinned_files = sc.loc[sc["fold"] == -1, "filename"].nunique()
+        print(f"[oof-sed] excluding {n_pinned_rows} rows from {n_pinned_files} pinned (always-train) files")
+        sc = sc[sc["fold"] >= 0].reset_index(drop=True)
     if sc.empty:
         raise SystemExit("No labeled rows have fold assignment — split parquet missing or stale.")
 
