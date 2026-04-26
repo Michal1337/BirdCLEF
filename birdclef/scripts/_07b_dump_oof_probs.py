@@ -191,12 +191,14 @@ def _dump_sed(sed_paths: List[str], target_filenames: List[str],
 
 def main():
     ap = argparse.ArgumentParser()
-    sed_group = ap.add_mutually_exclusive_group(required=True)
-    sed_group.add_argument("--sed-onnx", nargs="+", default=None,
+    # SED is optional — without it we still emit the SSM probs (useful for the
+    # per-class audit / standalone SSM analysis). Provide --sed-onnx or
+    # --sed-folds-glob to also emit sed_probs.npz for the blend search.
+    ap.add_argument("--sed-onnx", nargs="+", default=None,
                     help="Local paths to SED ONNX files (one per fold). Order matters: "
                          "must align with fold index (fold0, fold1, ...) — paths are "
                          "auto-mapped via the `foldN` substring.")
-    sed_group.add_argument("--sed-folds-glob", default=None,
+    ap.add_argument("--sed-folds-glob", default=None,
                     help="Glob pattern, e.g. 'birdclef/models_ckpt/sed/sed_v2s/fold*/best.onnx'")
     ap.add_argument("--n-splits", type=int, default=5, choices=[5, 10],
                     help="Static fold parquet to use. Default 5.")
@@ -205,57 +207,67 @@ def main():
                          "Hyperparameters come from BASELINE in ssm_configs.py.")
     ap.add_argument("--out-dir",
                     default=str(OUTPUT_ROOT / "blend_search" / "oof"),
-                    help="Where to write ssm_probs.npz, sed_probs.npz, y_true.npy, meta.parquet")
+                    help="Where to write ssm_probs.npz [, sed_probs.npz], y_true.npy, meta.parquet")
     args = ap.parse_args()
 
+    sed_paths: List[str] = []
     if args.sed_onnx:
         sed_paths = list(args.sed_onnx)
-    else:
+    elif args.sed_folds_glob:
         sed_paths = sorted(_glob.glob(args.sed_folds_glob))
         if not sed_paths:
             raise SystemExit(f"--sed-folds-glob '{args.sed_folds_glob}' matched no files")
-    print(f"[dump] {len(sed_paths)} SED ONNX paths:")
-    for p in sed_paths:
-        print(f"  - {p}")
+    if sed_paths:
+        print(f"[dump] {len(sed_paths)} SED ONNX paths:")
+        for p in sed_paths:
+            print(f"  - {p}")
+    else:
+        print("[dump] No SED paths provided — SSM-only mode (sed_probs.npz will not be written).")
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # 1) SSM stitched OOF — emits canonical row order
     ssm_probs, meta_out, y_true = _dump_ssm(out_dir, args.ssm_config_name, args.n_splits)
-
-    # 2) SED stitched OOF — predict each row by the fold's checkpoint that
-    # didn't see it
-    folds_df = load_folds(n_splits=args.n_splits)
-    fold_of = dict(zip(folds_df["filename"].astype(str), folds_df["fold"].astype(int)))
-    file_order = meta_out.drop_duplicates("filename")["filename"].astype(str).tolist()
-    n_classes = ssm_probs.shape[1]
-    sed_probs = _dump_sed(sed_paths, file_order, fold_of, n_classes)
-
-    if sed_probs.shape != ssm_probs.shape:
-        raise SystemExit(
-            f"shape mismatch: ssm={ssm_probs.shape}  sed={sed_probs.shape}. "
-            "Verify all labeled files have a fold assignment and exist on disk."
-        )
-
     np.savez_compressed(out_dir / "ssm_probs.npz", probs=ssm_probs)
-    np.savez_compressed(out_dir / "sed_probs.npz", probs=sed_probs)
     np.save(out_dir / "y_true.npy", y_true)
     meta_out.to_parquet(out_dir / "meta.parquet", index=False)
 
+    sed_probs = None
+    if sed_paths:
+        # 2) SED stitched OOF — predict each row by the fold's checkpoint that
+        # didn't see it
+        folds_df = load_folds(n_splits=args.n_splits)
+        fold_of = dict(zip(folds_df["filename"].astype(str), folds_df["fold"].astype(int)))
+        file_order = meta_out.drop_duplicates("filename")["filename"].astype(str).tolist()
+        n_classes = ssm_probs.shape[1]
+        sed_probs = _dump_sed(sed_paths, file_order, fold_of, n_classes)
+        if sed_probs.shape != ssm_probs.shape:
+            raise SystemExit(
+                f"shape mismatch: ssm={ssm_probs.shape}  sed={sed_probs.shape}. "
+                "Verify all labeled files have a fold assignment and exist on disk."
+            )
+        np.savez_compressed(out_dir / "sed_probs.npz", probs=sed_probs)
+
     print()
-    print(f"[dump] wrote 4 files to {out_dir}")
+    print(f"[dump] wrote files to {out_dir}")
     print(f"[dump]   ssm_probs.npz  shape={ssm_probs.shape}  mean={ssm_probs.mean():.4f}")
-    print(f"[dump]   sed_probs.npz  shape={sed_probs.shape}  mean={sed_probs.mean():.4f}")
+    if sed_probs is not None:
+        print(f"[dump]   sed_probs.npz  shape={sed_probs.shape}  mean={sed_probs.mean():.4f}")
     print(f"[dump]   y_true.npy     shape={y_true.shape}  positives={int(y_true.sum())}")
-    print(f"[dump]   meta.parquet   rows={len(meta_out)}  files={len(file_order)}")
+    print(f"[dump]   meta.parquet   rows={len(meta_out)}  files={meta_out['filename'].nunique()}")
     print()
-    print("Next step — blend weight search:")
-    print(f"  python -m birdclef.scripts._08_ensemble \\")
-    print(f"      --members {out_dir / 'ssm_probs.npz'} {out_dir / 'sed_probs.npz'} \\")
-    print(f"      --y-true  {out_dir / 'y_true.npy'} \\")
-    print(f"      --meta    {out_dir / 'meta.parquet'} \\")
-    print(f"      --step 0.05")
+    if sed_probs is not None:
+        print("Next step — blend weight search:")
+        print(f"  python -m birdclef.scripts._08_ensemble \\")
+        print(f"      --members {out_dir / 'ssm_probs.npz'} {out_dir / 'sed_probs.npz'} \\")
+        print(f"      --y-true  {out_dir / 'y_true.npy'} \\")
+        print(f"      --meta    {out_dir / 'meta.parquet'} \\")
+        print(f"      --step 0.05")
+    else:
+        print("Next step — per-class audit:")
+        print(f"  python -m birdclef.scripts._08b_per_class_audit --top-k 30")
+        print(f"  (add --include-perch to compare against raw Perch baseline)")
 
 
 if __name__ == "__main__":
