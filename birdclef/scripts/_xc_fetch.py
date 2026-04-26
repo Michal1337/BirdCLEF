@@ -85,13 +85,25 @@ def _query_xc(scientific_name: str, page: int = 1, sleep: float = 1.0,
     v2 which historically required no auth. `quality=A,B` filters to
     highest-rated recordings (A=best..E=worst) — what most BirdCLEF top
     solutions use.
+
+    v3 ONLY accepts tag-based queries. We split the binomial into
+    `gen:` + `sp:` tags. Free-text queries return 400. v2 still accepts
+    quoted free text.
     """
-    q = f'"{scientific_name}" q:{quality}'
-    params = {"query": q, "page": page}
+    parts = str(scientific_name).split()
     if api_key:
-        params["key"] = api_key
+        # v3: tag syntax. genus + species; if there's only one token treat
+        # it as genus (rare: catches taxa named to genus only).
+        if len(parts) >= 2:
+            q = f'gen:"{parts[0]}" sp:"{parts[1]}" q:{quality}'
+        else:
+            q = f'gen:"{parts[0]}" q:{quality}'
+        params = {"query": q, "page": page, "key": api_key}
         url = API_V3
     else:
+        # v2: free-text
+        q = f'"{scientific_name}" q:{quality}'
+        params = {"query": q, "page": page}
         url = API_V2
     r = requests.get(url, params=params, timeout=30)
     if r.status_code == 401:
