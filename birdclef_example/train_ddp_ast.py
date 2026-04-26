@@ -307,9 +307,16 @@ def build_ast_experiment_configs() -> List[Dict[str, Any]]:
         "focal_weight": 0.3,
         "focal_gamma": 2.0,
         "sampling_power": 0.5,
+        # Two-phase fine-tune: classifier head trains alone for the first N
+        # epochs (backbone frozen → no risk of corrupting AudioSet weights
+        # with noisy classifier gradients), then everything is unfrozen for
+        # the remaining (epochs - frozen_warmup_epochs) epochs at the lower
+        # full-fine-tune LR. Standard transformer fine-tuning recipe.
+        "frozen_warmup_epochs": 2,
+        "frozen_warmup_lr":     1e-3,
         # AST is single-LR; we still emit `lr_head` and `lr_backbone` so the
         # build_optimizer wrapper from train_ddp_sota works unchanged. Set both
-        # to the same target LR.
+        # to the same target LR (used in the unfrozen phase).
     }
     out: List[Dict[str, Any]] = []
 
@@ -362,13 +369,55 @@ def _select_experiments(name_filter: Optional[str]) -> List[Dict[str, Any]]:
     return matches
 
 
-def _build_optimizer_ast(model: nn.Module, lr: float, weight_decay: float):
-    """Single-LR AdamW. AST doesn't have a meaningful "head vs backbone" split
-    after we replaced the classifier head — every parameter except the new
-    Linear is pretrained and benefits from the same LR for fine-tuning.
+def _split_ast_params(model: nn.Module) -> tuple[list, list]:
+    """Return (head_params, backbone_params) — works on both bare model and DDP.
+
+    Head = `classifier.*` (the freshly-initialized 234-class linear).
+    Backbone = everything else (pretrained AudioSet weights).
     """
-    return torch.optim.AdamW(model.parameters(), lr=float(lr),
-                             weight_decay=float(weight_decay), betas=(0.9, 0.999))
+    bare = model.module if isinstance(model, DDP) else model
+    head, backbone = [], []
+    for name, p in bare.named_parameters():
+        # bare is ASTSpectrogramClassifier; classifier lives at .model.classifier.*
+        if "classifier" in name:
+            head.append(p)
+        else:
+            backbone.append(p)
+    return head, backbone
+
+
+def _set_backbone_trainable(model: nn.Module, trainable: bool) -> None:
+    bare = model.module if isinstance(model, DDP) else model
+    for name, p in bare.named_parameters():
+        if "classifier" not in name:
+            p.requires_grad = bool(trainable)
+
+
+def _build_optimizer_ast(model: nn.Module, lr: float, weight_decay: float):
+    """Single-LR AdamW for the full-fine-tune phase.
+
+    AST doesn't have a meaningful "head vs backbone" LR split after the freeze
+    warmup is done — every parameter except the new Linear is pretrained and
+    benefits from the same low LR for end-to-end fine-tuning.
+    """
+    return torch.optim.AdamW(
+        [p for p in model.parameters() if p.requires_grad],
+        lr=float(lr), weight_decay=float(weight_decay), betas=(0.9, 0.999),
+    )
+
+
+def _build_optimizer_head_only(model: nn.Module, lr: float, weight_decay: float):
+    """AdamW on classifier params only — used for the frozen-backbone warmup.
+
+    During this phase the backbone has requires_grad=False and DOESN'T appear
+    in this optimizer's param list, so its weights stay byte-identical to
+    the pretrained AudioSet checkpoint.
+    """
+    head_params, _ = _split_ast_params(model)
+    return torch.optim.AdamW(
+        head_params, lr=float(lr), weight_decay=float(weight_decay),
+        betas=(0.9, 0.999),
+    )
 
 
 def _cosine_warmup_scheduler(optimizer, epochs: int, warmup_epochs: int,
@@ -465,16 +514,32 @@ def run_one_experiment(
         focal_gamma=float(experiment["focal_gamma"]),
         label_smoothing=float(experiment["label_smoothing"]),
     )
-    optimizer = _build_optimizer_ast(
-        model=model,
-        lr=float(experiment["lr_head"]),  # AST single-LR; lr_head == lr_backbone
-        weight_decay=float(experiment["weight_decay"]),
-    )
-    scheduler = _cosine_warmup_scheduler(
-        optimizer=optimizer, epochs=epochs,
-        warmup_epochs=int(experiment["warmup_epochs"]),
-        min_lr_ratio=float(experiment["min_lr_ratio"]),
-    )
+
+    # Phase 1: frozen-backbone warmup.
+    # Classifier head trains alone with a higher LR so it converges quickly
+    # before any gradient touches the AudioSet weights. Standard transformer
+    # fine-tuning recipe — without this, noisy gradients from the freshly-init
+    # classifier flow back into the backbone and degrade pretraining.
+    frozen_warmup_epochs = int(experiment.get("frozen_warmup_epochs", 0))
+    frozen_warmup_lr     = float(experiment.get("frozen_warmup_lr", 1e-3))
+    if frozen_warmup_epochs > 0:
+        _set_backbone_trainable(model, False)
+        optimizer = _build_optimizer_head_only(
+            model=model, lr=frozen_warmup_lr,
+            weight_decay=float(experiment["weight_decay"]),
+        )
+        _print_main(rank, f"[phase 1] backbone FROZEN — head-only training for "
+                          f"{frozen_warmup_epochs} epoch(s) at lr={frozen_warmup_lr:.0e}")
+    else:
+        _set_backbone_trainable(model, True)
+        optimizer = _build_optimizer_ast(
+            model=model,
+            lr=float(experiment["lr_head"]),
+            weight_decay=float(experiment["weight_decay"]),
+        )
+    # Phase-2 scheduler is built fresh after the unfreeze; for phase 1 we use
+    # a constant-LR no-op so the loop's `scheduler.step()` is harmless.
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0)
     amp_enabled = use_bf16 and device.type == "cuda"
 
     _print_main(rank, "")
@@ -493,6 +558,28 @@ def run_one_experiment(
     history: List[Dict[str, Any]] = []
 
     for epoch in range(1, epochs + 1):
+        # Phase transition: at the first epoch AFTER frozen_warmup_epochs, unfreeze
+        # the backbone and switch to the full-fine-tune optimizer + cosine schedule.
+        # The schedule's epoch-budget is the remaining (epochs - frozen_warmup_epochs)
+        # so the cosine still goes from peak LR → min_lr_ratio over the unfrozen run.
+        if frozen_warmup_epochs > 0 and epoch == frozen_warmup_epochs + 1:
+            _set_backbone_trainable(model, True)
+            optimizer = _build_optimizer_ast(
+                model=model,
+                lr=float(experiment["lr_head"]),
+                weight_decay=float(experiment["weight_decay"]),
+            )
+            scheduler = _cosine_warmup_scheduler(
+                optimizer=optimizer,
+                epochs=epochs - frozen_warmup_epochs,
+                warmup_epochs=int(experiment["warmup_epochs"]),
+                min_lr_ratio=float(experiment["min_lr_ratio"]),
+            )
+            n_unfrozen = sum(p.requires_grad for p in (model.module if isinstance(model, DDP) else model).parameters())
+            _print_main(rank, f"[phase 2] backbone UNFROZEN at epoch {epoch} — "
+                              f"full fine-tune for {epochs - frozen_warmup_epochs} epochs at "
+                              f"peak lr={experiment['lr_head']:.0e} ({n_unfrozen} trainable params)")
+
         avg_train_loss = train_one_epoch_ddp(
             model=model, train_loader=train_loader, criterion=criterion,
             optimizer=optimizer, device=device, amp_enabled=amp_enabled,
