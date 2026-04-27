@@ -1,3 +1,0 @@
-config_name,correction_weight,focal_gamma,lambda_prior,loss,mlp_pca_dim,name,proto_lr,proto_n_epochs,proto_patience,residual_lr,residual_n_epochs,residual_patience,smoothing,threshold_grid,use_boost
-baseline,0.0,2.0,0.0,focal_bce,128,baseline,0.0008,80,20,0.0008,40,12,gaussian,[0.5],True
-lb_093_port,0.3,2.5,0.4,bce_focal_mean,64,lb_093_port,0.001,40,8,0.001,30,8,adaptive,"[0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6, 0.65, 0.7]",False

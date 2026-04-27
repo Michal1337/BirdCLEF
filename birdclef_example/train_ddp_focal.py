@@ -558,7 +558,7 @@ def main() -> None:
                     help="Experiment name from build_experiment_configs(). "
                          "Substring match supported. Default: sweep all configs.")
     ap.add_argument("--epochs", type=int, default=15)
-    ap.add_argument("--batch-size", type=int, default=24)
+    ap.add_argument("--batch-size", type=int, default=64)
     ap.add_argument("--num-workers", type=int, default=4)
     ap.add_argument("--preload-workers", type=int, default=8)
     ap.add_argument("--preload-train-audio", action="store_true", default=False,
@@ -592,10 +592,10 @@ def main() -> None:
     repo_root = Path(__file__).resolve().parents[1]
     data_dir = repo_root / "data"
     output_dir = Path(args.out_dir) if args.out_dir else \
-        repo_root / "birdclef_example" / "outputs" / "focal"
+        repo_root / "birdclef_example" / "outputs" / "focal2"
 
-    train_csv_path = data_dir / "train.csv"
-    train_audio_dir = data_dir / "train_audio"
+    train_csv_path = Path("/mnt/evafs/groups/re-com/mgromadzki/data/train.csv")
+    train_audio_dir = Path("/mnt/evafs/groups/re-com/mgromadzki/data/train_audio")
     soundscape_labels_path = data_dir / "train_soundscapes_labels.csv"
     train_soundscape_dir = data_dir / "train_soundscapes"
     taxonomy_path = data_dir / "taxonomy.csv"
