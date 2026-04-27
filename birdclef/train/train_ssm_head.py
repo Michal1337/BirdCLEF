@@ -481,13 +481,23 @@ def _augment_cache_with_pseudo(
     pseudo_Y = ((probs >= float(pseudo_tau)) & (keep_mask > 0)).astype(np.uint8)
 
     labeled = cache.labeled_mask
-    unlabeled_idx = np.where(~labeled)[0]
-    # Skip unlabeled rows that have no positive class — they're pure negatives,
-    # add no signal beyond what labeled rows already provide.
-    has_pos = pseudo_Y[unlabeled_idx].sum(axis=1) > 0
-    keep_unlab = unlabeled_idx[has_pos]
-
     labeled_idx = np.where(labeled)[0]
+    unlabeled_idx = np.where(~labeled)[0]
+
+    # The SSM stack reshapes (rows, ...) → (n_files, N_WINDOWS=12, ...) for
+    # ProtoSSM. Pseudo augmentation must therefore preserve the 12-windows-
+    # per-file invariant: include ALL 12 windows of any file that has at
+    # least one high-confidence pseudo-positive in any window. Windows
+    # without keep_mask positives become Y=0 (treated as negative) — this
+    # introduces some teacher-miss false negatives but is acceptable noise
+    # vs. broken reshape.
+    rows_per_file = pseudo_Y[unlabeled_idx].sum(axis=1) > 0
+    unlab_meta = cache.meta.iloc[unlabeled_idx][["filename"]].reset_index(drop=True)
+    unlab_meta["_orig_idx"] = unlabeled_idx
+    unlab_meta["_has_pos"]  = rows_per_file
+    files_with_pos = set(unlab_meta.loc[unlab_meta["_has_pos"], "filename"].unique())
+    keep_unlab = unlab_meta[unlab_meta["filename"].isin(files_with_pos)]["_orig_idx"].to_numpy()
+
     aug_meta = pd.concat([
         cache.meta.iloc[labeled_idx].reset_index(drop=True),
         cache.meta.iloc[keep_unlab].reset_index(drop=True),
@@ -497,10 +507,15 @@ def _augment_cache_with_pseudo(
     aug_Y      = np.concatenate([cache.Y[labeled_idx],      pseudo_Y[keep_unlab]],     axis=0)
     aug_labeled_mask = np.ones(len(aug_meta), dtype=bool)
 
-    n_lab, n_pseudo = len(labeled_idx), len(keep_unlab)
-    n_pseudo_pos = int(aug_Y[n_lab:].sum())
-    print(f"[pseudo] augmenting cache: labeled={n_lab}  "
-          f"pseudo-rows-with-positives={n_pseudo}  "
+    n_lab = len(labeled_idx)
+    n_pseudo_files = len(files_with_pos)
+    n_pseudo_rows  = len(keep_unlab)
+    n_pseudo_pos   = int(aug_Y[n_lab:].sum())
+    # Sanity: rows must be a clean multiple of 12 for both labeled and pseudo.
+    assert n_lab % 12 == 0, f"labeled rows ({n_lab}) not divisible by 12"
+    assert n_pseudo_rows % 12 == 0, f"pseudo rows ({n_pseudo_rows}) not divisible by 12 — file grouping bug"
+    print(f"[pseudo] augmenting cache: labeled={n_lab} ({n_lab//12} files)  "
+          f"pseudo={n_pseudo_rows} ({n_pseudo_files} files)  "
           f"pseudo-positives={n_pseudo_pos}  "
           f"τ={pseudo_tau}  round={pseudo_round}")
     return PerchCache(meta=aug_meta, scores=aug_scores, emb=aug_emb,
