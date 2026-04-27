@@ -335,18 +335,35 @@ def _train_mlp_probes(
 
     n_epochs = 100
     patience = 15
+    # Mini-batch over the row axis. Each batch is a subset of (N_tr) rows
+    # processed across all C classes simultaneously (the C axis is the
+    # parallelism, not the batch axis). This gives ~n_tr/batch_size
+    # gradient steps per epoch — comparable to sklearn's default batching
+    # — instead of full-batch gradient descent which collapses to one step
+    # per epoch and converges much worse.
+    batch_size = 512
+    n_train = tr_i.shape[0]
+    n_batches = max(1, (n_train + batch_size - 1) // batch_size)
     best_val = float("inf"); best_state = None; wait = 0
     pbar = tqdm(range(n_epochs), desc=f"mlp_probes[{cfg.get('name','?')}]",
                 leave=False, dynamic_ncols=True)
     for ep in pbar:
         model.train()
-        logits = model(X_t[:, tr_i, :])                   # (C, N_tr)
-        targets = Y_t[:, tr_i]
-        # BCE with per-class pos_weight broadcast over the N_tr axis.
-        loss = F.binary_cross_entropy_with_logits(
-            logits, targets, pos_weight=pos_w.unsqueeze(-1), reduction="mean",
-        )
-        opt.zero_grad(); loss.backward(); opt.step()
+        epoch_losses = []
+        # Reshuffle row order each epoch.
+        perm_ep = torch.randperm(n_train, device=device)
+        for b_start in range(0, n_train, batch_size):
+            b_local = perm_ep[b_start : b_start + batch_size]
+            b_idx = tr_i[b_local]
+            logits = model(X_t[:, b_idx, :])              # (C, batch)
+            targets = Y_t[:, b_idx]
+            # BCE with per-class pos_weight broadcast over the batch axis.
+            loss = F.binary_cross_entropy_with_logits(
+                logits, targets, pos_weight=pos_w.unsqueeze(-1), reduction="mean",
+            )
+            opt.zero_grad(); loss.backward(); opt.step()
+            epoch_losses.append(float(loss.item()))
+        cur_train = float(np.mean(epoch_losses)) if epoch_losses else float("nan")
 
         model.eval()
         with torch.no_grad():
@@ -355,7 +372,6 @@ def _train_mlp_probes(
                 v_logits, Y_t[:, va_i], pos_weight=pos_w.unsqueeze(-1),
                 reduction="mean",
             ).item()
-        cur_train = float(loss.item())
         if v_loss < best_val:
             best_val = v_loss
             best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
@@ -364,7 +380,8 @@ def _train_mlp_probes(
             wait += 1
         pbar.set_postfix(train=f"{cur_train:.4f}", val=f"{v_loss:.4f}",
                          best=f"{best_val:.4f}", wait=wait,
-                         n_classes=len(active), refresh=False)
+                         n_cls=len(active), n_steps=n_batches,
+                         refresh=False)
         if wait >= patience:
             break
 
