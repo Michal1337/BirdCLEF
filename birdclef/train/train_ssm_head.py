@@ -18,6 +18,7 @@ import torch.nn.functional as F
 from sklearn.decomposition import PCA
 from sklearn.neural_network import MLPClassifier
 from sklearn.preprocessing import StandardScaler
+from tqdm.auto import tqdm
 
 from birdclef.config.paths import (
     N_WINDOWS,
@@ -136,7 +137,9 @@ def _train_proto_ssm(
     distill_w = float(cfg["proto_distill_weight"])
 
     best_loss, best_state, wait = float("inf"), None, 0
-    for ep in range(n_epochs):
+    pbar = tqdm(range(n_epochs), desc=f"proto_ssm[{cfg.get('name','?')}]",
+                leave=False, dynamic_ncols=True)
+    for ep in pbar:
         model.train()
         out = model(emb_t, sc_t, site_ids=site_t, hours=hour_t)
         loss = loss_fn(out, lab_t)
@@ -149,16 +152,21 @@ def _train_proto_ssm(
         if ep >= swa_start:
             swa.update_parameters(model)
             swa_sched.step()
+            phase = "swa"
         else:
             sched.step()
-        if loss.item() < best_loss:
-            best_loss = loss.item()
+            phase = "warm"
+        cur = float(loss.item())
+        if cur < best_loss:
+            best_loss = cur
             best_state = {k: v.clone() for k, v in model.state_dict().items()}
             wait = 0
         else:
             wait += 1
-            if wait >= int(cfg["proto_patience"]):
-                break
+        pbar.set_postfix(loss=f"{cur:.4f}", best=f"{best_loss:.4f}",
+                         wait=wait, phase=phase, refresh=False)
+        if wait >= int(cfg["proto_patience"]):
+            break
     if ep >= swa_start:
         torch.optim.swa_utils.update_bn(emb_t.unsqueeze(0), swa)
         model = swa
@@ -297,7 +305,9 @@ def _train_residual(
                                                 epochs=n_epochs, steps_per_epoch=1,
                                                 pct_start=0.1, anneal_strategy="cos")
     best_loss, best_state, wait = float("inf"), None, 0
-    for ep in range(n_epochs):
+    pbar = tqdm(range(n_epochs), desc=f"residual_ssm[{cfg.get('name','?')}]",
+                leave=False, dynamic_ncols=True)
+    for ep in pbar:
         model.train()
         corr = model(emb_t[tr_i], fp_t[tr_i], site_ids=site_t[tr_i], hours=hour_t[tr_i])
         loss = F.mse_loss(corr, res_t[tr_i])
@@ -309,14 +319,17 @@ def _train_residual(
             v_loss = F.mse_loss(model(emb_t[va_i], fp_t[va_i],
                                       site_ids=site_t[va_i], hours=hour_t[va_i]),
                                 res_t[va_i]).item()
+        cur_train = float(loss.item())
         if v_loss < best_loss:
             best_loss = v_loss
             best_state = {k: v.clone() for k, v in model.state_dict().items()}
             wait = 0
         else:
             wait += 1
-            if wait >= int(cfg["residual_patience"]):
-                break
+        pbar.set_postfix(train=f"{cur_train:.4f}", val=f"{v_loss:.4f}",
+                         best=f"{best_loss:.4f}", wait=wait, refresh=False)
+        if wait >= int(cfg["residual_patience"]):
+            break
     if best_state is not None:
         model.load_state_dict(best_state)
     model.eval()
@@ -589,7 +602,9 @@ def run_full_evaluation(cfg: dict) -> Dict:
     oof_final = np.zeros_like(cache_Y, dtype=np.float32)
     oof_fp = np.zeros_like(cache_Y, dtype=np.float32)
     per_fold = {}
-    for f in range(n_splits):
+    fold_pbar = tqdm(range(n_splits), desc=f"folds[{cfg.get('name','?')}]",
+                     dynamic_ncols=True)
+    for f in fold_pbar:
         # Train: every row except this fold's val. Pinned (-1) and unlabeled
         # (-1 from fillna) both pass `row_fold != f` for any f >= 0, so they
         # land in train as intended. The labeled-mask filter upstream
@@ -598,6 +613,7 @@ def run_full_evaluation(cfg: dict) -> Dict:
         va = np.where(row_fold == f)[0]
         if len(va) == 0:
             continue
+        fold_pbar.set_postfix(fold=f, n_train=len(tr), n_val=len(va), refresh=False)
         seed_everything(base_seed + int(f) + 1)
         out = run_pipeline_for_split(cache_sub, tr, va, cfg, temperatures,
                                      lambda_prior_vec=lambda_prior_vec)
