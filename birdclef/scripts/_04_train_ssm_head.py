@@ -25,9 +25,19 @@ def main():
     )
     ap.add_argument("--config-overrides", type=str, default="{}",
                     help='JSON dict of baseline overrides to apply.')
+    ap.add_argument("--pseudo-round", type=int, default=None,
+                    help="Augment training with pseudo-labeled unlabeled rows from "
+                         "cache/pseudo/round{N}/ (built via `_05_pseudo_label`). "
+                         "Default: None (labeled-only training, behavior unchanged).")
+    ap.add_argument("--pseudo-tau", type=float, default=0.5,
+                    help="Threshold on pseudo-probs to convert to hard pseudo-positives. "
+                         "Only used when --pseudo-round is set. Default 0.5.")
     args = ap.parse_args()
     over = json.loads(args.config_overrides or "{}")
     cfg = {**BASELINE, "name": args.sweep_name, "n_splits": int(args.n_splits), **over}
+    if args.pseudo_round is not None:
+        cfg["pseudo_round"] = int(args.pseudo_round)
+        cfg["pseudo_tau"] = float(args.pseudo_tau)
     run_sweep(
         name=args.sweep_name,
         configs=[cfg],

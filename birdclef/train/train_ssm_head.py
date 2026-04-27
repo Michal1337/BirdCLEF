@@ -444,13 +444,97 @@ def run_pipeline_for_split(
     }
 
 
+def _augment_cache_with_pseudo(
+    cache: PerchCache, pseudo_round: int, pseudo_tau: float = 0.5,
+) -> PerchCache:
+    """Concat pseudo-labeled unlabeled rows onto the labeled training pool.
+
+    Pseudo-labels come from `cache/pseudo/round{N}/`:
+      - `probs.npz['final']`     : (10658, C) float32 — teacher's final-stage probs
+      - `probs.npz['keep_mask']` : (10658, C) uint8   — confidence-filter pass
+      - `meta.parquet`           : row alignment to the Perch cache
+
+    A row is included as a training augmentation if it is currently unlabeled
+    AND has at least one class with `keep_mask=1` AND `prob >= pseudo_tau`.
+    Y for that row = (probs >= pseudo_tau) & keep_mask  → hard pseudo-positives.
+
+    Pseudo rows are concatenated AFTER the labeled rows; they have no fold
+    assignment, so the row_fold logic in `run_full_evaluation` puts them in
+    every fold's train via the `.fillna(-1)` → `row_fold != f` path.
+    """
+    from birdclef.config.paths import PSEUDO_DIR
+    rd = PSEUDO_DIR / f"round{int(pseudo_round)}"
+    if not rd.exists():
+        raise SystemExit(f"pseudo round dir missing: {rd}. "
+                         "Build via `python -m birdclef.scripts._05_pseudo_label --round N`.")
+    arr = np.load(rd / "probs.npz")
+    probs = arr["final"].astype(np.float32)        # (N, C)
+    keep_mask = arr["keep_mask"].astype(np.uint8)   # (N, C)
+    pmeta = pd.read_parquet(rd / "meta.parquet")    # row_id, filename, window, is_labeled
+    if len(pmeta) != len(cache.meta):
+        raise SystemExit(
+            f"pseudo meta rows ({len(pmeta)}) != Perch cache rows ({len(cache.meta)}). "
+            "Stale cache or stale pseudo-round; rebuild one.")
+
+    # Hard pseudo-Y: positive only where teacher is confident (keep_mask=1)
+    # AND the prob clears the threshold. Other positions stay 0 (negative).
+    pseudo_Y = ((probs >= float(pseudo_tau)) & (keep_mask > 0)).astype(np.uint8)
+
+    labeled = cache.labeled_mask
+    unlabeled_idx = np.where(~labeled)[0]
+    # Skip unlabeled rows that have no positive class — they're pure negatives,
+    # add no signal beyond what labeled rows already provide.
+    has_pos = pseudo_Y[unlabeled_idx].sum(axis=1) > 0
+    keep_unlab = unlabeled_idx[has_pos]
+
+    labeled_idx = np.where(labeled)[0]
+    aug_meta = pd.concat([
+        cache.meta.iloc[labeled_idx].reset_index(drop=True),
+        cache.meta.iloc[keep_unlab].reset_index(drop=True),
+    ], ignore_index=True)
+    aug_scores = np.concatenate([cache.scores[labeled_idx], cache.scores[keep_unlab]], axis=0)
+    aug_emb    = np.concatenate([cache.emb[labeled_idx],    cache.emb[keep_unlab]],    axis=0)
+    aug_Y      = np.concatenate([cache.Y[labeled_idx],      pseudo_Y[keep_unlab]],     axis=0)
+    aug_labeled_mask = np.ones(len(aug_meta), dtype=bool)
+
+    n_lab, n_pseudo = len(labeled_idx), len(keep_unlab)
+    n_pseudo_pos = int(aug_Y[n_lab:].sum())
+    print(f"[pseudo] augmenting cache: labeled={n_lab}  "
+          f"pseudo-rows-with-positives={n_pseudo}  "
+          f"pseudo-positives={n_pseudo_pos}  "
+          f"τ={pseudo_tau}  round={pseudo_round}")
+    return PerchCache(meta=aug_meta, scores=aug_scores, emb=aug_emb,
+                      Y=aug_Y, labeled_mask=aug_labeled_mask)
+
+
 def run_full_evaluation(cfg: dict) -> Dict:
-    """Runs fold-safe stitched OOF for one config. Returns sweep-runner result."""
+    """Runs fold-safe stitched OOF for one config. Returns sweep-runner result.
+
+    Optional `cfg["pseudo_round"]` (int) augments the training pool with
+    pseudo-labeled unlabeled soundscape rows from `cache/pseudo/round{N}/`.
+    Pseudo rows are training-only; the OOF eval still measures on real
+    labeled-fold val (no pseudo-label leakage into the metric).
+    `cfg["pseudo_tau"]` (float, default 0.5) thresholds the pseudo-probs.
+    """
     base_seed = int(cfg.get("seed", 42))
     seed_everything(base_seed)
     cache = load_perch_cache()
-    # Limit to labeled rows
-    labeled_idx = np.where(cache.labeled_mask)[0]
+
+    # Optional: extend the training pool with pseudo-labeled unlabeled rows.
+    # cfg["pseudo_round"] = None (default) → behavior unchanged.
+    if cfg.get("pseudo_round") is not None:
+        cache = _augment_cache_with_pseudo(
+            cache,
+            pseudo_round=int(cfg["pseudo_round"]),
+            pseudo_tau=float(cfg.get("pseudo_tau", 0.5)),
+        )
+        # After augmentation, all rows are training-eligible (real label OR
+        # pseudo). The val measurement still respects fold membership: only
+        # rows whose FILENAME is in the folds parquet (i.e. labeled files)
+        # ever land in val. Pseudo rows have no fold → fold=-1 → train-only.
+        labeled_idx = np.arange(len(cache.meta))
+    else:
+        labeled_idx = np.where(cache.labeled_mask)[0]
     cache_meta = cache.meta.iloc[labeled_idx].reset_index(drop=True)
     cache_scores = cache.scores[labeled_idx]
     cache_emb = cache.emb[labeled_idx]
