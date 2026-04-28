@@ -15,5 +15,4 @@ __pycache__
 *.data
 *.pt
 local_test/
-splits/
 birdclef/cache/

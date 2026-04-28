@@ -72,14 +72,23 @@ SOUNDSCAPE_INDEX = SOUNDSCAPE_CACHE_DIR / "soundscapes_index.parquet"
 
 PSEUDO_DIR = CACHE_ROOT / "pseudo"
 
-def folds_path(n_splits: int) -> Path:
-    """Path to the static StratifiedKFold parquet for `n_splits` folds.
+FOLD_KINDS = ("strat", "site", "sitedate")
+
+
+def folds_path(n_splits: int, kind: str = "strat") -> Path:
+    """Path to a static fold parquet for `n_splits` folds of the given kind.
 
     Materialized by `python -m birdclef.scripts._02_build_splits`.
-    Both 5-fold and 10-fold variants live alongside each other; downstream
-    scripts pick via `--n-splits`.
+
+    kind:
+        "strat"    — single-label modal StratifiedKFold on filename (default).
+        "site"     — GroupKFold on site only. Uneven fold sizes (S22 dominates).
+        "sitedate" — GroupKFold on (site, date). Site-aware but balanced.
     """
-    return SPLIT_ROOT / f"folds_{int(n_splits)}_strat.parquet"
+    kind = str(kind).lower()
+    if kind not in FOLD_KINDS:
+        raise ValueError(f"unknown fold kind {kind!r}; expected one of {FOLD_KINDS}")
+    return SPLIT_ROOT / f"folds_{int(n_splits)}_{kind}.parquet"
 
 SUBMIT_DIR = OUTPUT_ROOT / "submit"
 

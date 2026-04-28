@@ -49,7 +49,8 @@ from birdclef.config.paths import (
 from birdclef.data.splits import load_folds
 
 
-def _dump_ssm(out_dir: Path, ssm_config_name: str, n_splits: int) -> tuple[np.ndarray, pd.DataFrame, np.ndarray]:
+def _dump_ssm(out_dir: Path, ssm_config_name: str, n_splits: int,
+              fold_kind: str = "strat") -> tuple[np.ndarray, pd.DataFrame, np.ndarray]:
     """Stitched OOF over all labeled rows: train per fold on n-1 folds, predict on held-out fold.
 
     Returns (probs[N, C], meta[N rows], y_true[N, C]) where N = total labeled
@@ -70,9 +71,11 @@ def _dump_ssm(out_dir: Path, ssm_config_name: str, n_splits: int) -> tuple[np.nd
     cfg["name"] = ssm_config_name
     cfg["seed"] = int(cfg.get("seed", 42))
     cfg["n_splits"] = int(n_splits)
+    cfg["fold_kind"] = str(fold_kind)
     seed_everything(cfg["seed"])
 
-    print(f"[ssm-oof] loading Perch cache; cleaned config '{cfg['name']}', n_splits={n_splits}")
+    print(f"[ssm-oof] loading Perch cache; cleaned config '{cfg['name']}', "
+          f"n_splits={n_splits}, fold_kind={fold_kind}")
     cache = load_perch_cache()
     labeled_idx = np.where(cache.labeled_mask)[0]
     cache_meta = cache.meta.iloc[labeled_idx].reset_index(drop=True)
@@ -92,7 +95,7 @@ def _dump_ssm(out_dir: Path, ssm_config_name: str, n_splits: int) -> tuple[np.nd
         lambda_texture=float(cfg.get("lambda_prior_texture", cfg["lambda_prior"])),
     )
 
-    folds_df = load_folds(n_splits=int(n_splits))
+    folds_df = load_folds(n_splits=int(n_splits), kind=fold_kind)
     fold_of = dict(zip(folds_df["filename"], folds_df["fold"].astype(int)))
     # fold=-1 means PINNED → in every fold's train, never in val (matches the
     # _07b_ convention that pinned/missing rows are not part of OOF eval).
@@ -205,6 +208,11 @@ def main():
                     help="Glob pattern, e.g. 'birdclef/models_ckpt/sed/sed_v2s/fold*/best.onnx'")
     ap.add_argument("--n-splits", type=int, default=5, choices=[5, 10],
                     help="Static fold parquet to use. Default 5.")
+    from birdclef.config.paths import FOLD_KINDS
+    ap.add_argument("--fold-kind", default="strat", choices=list(FOLD_KINDS),
+                    help="CV grouping. strat=filename stratified (default). "
+                         "site=GroupKFold on site (strict, unbalanced). "
+                         "sitedate=GroupKFold on (site, date) (balanced site-aware).")
     ap.add_argument("--ssm-config-name", default="oof_dump",
                     help="Name stamped on the SSM run (for log filenames). "
                          "Hyperparameters come from BASELINE in ssm_configs.py.")
@@ -231,7 +239,9 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # 1) SSM stitched OOF — emits canonical row order
-    ssm_probs, meta_out, y_true = _dump_ssm(out_dir, args.ssm_config_name, args.n_splits)
+    ssm_probs, meta_out, y_true = _dump_ssm(
+        out_dir, args.ssm_config_name, args.n_splits, fold_kind=args.fold_kind,
+    )
     np.savez_compressed(out_dir / "ssm_probs.npz", probs=ssm_probs)
     np.save(out_dir / "y_true.npy", y_true)
     meta_out.to_parquet(out_dir / "meta.parquet", index=False)
@@ -240,7 +250,7 @@ def main():
     if sed_paths:
         # 2) SED stitched OOF — predict each row by the fold's checkpoint that
         # didn't see it
-        folds_df = load_folds(n_splits=args.n_splits)
+        folds_df = load_folds(n_splits=args.n_splits, kind=args.fold_kind)
         fold_of = dict(zip(folds_df["filename"].astype(str), folds_df["fold"].astype(int)))
         file_order = meta_out.drop_duplicates("filename")["filename"].astype(str).tolist()
         n_classes = ssm_probs.shape[1]

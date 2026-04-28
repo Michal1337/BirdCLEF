@@ -736,9 +736,13 @@ def run_full_evaluation(cfg: dict) -> Dict:
     support = cache_Y.sum(axis=0)
     rare_idx, freq_idx = split_rare_frequent(support)
 
-    # OOF by file-level StratifiedKFold (n_splits configurable per cfg)
+    # OOF by file-level KFold (n_splits + kind configurable per cfg).
+    # kind="strat"    : single-label modal StratifiedKFold on filename (default)
+    # kind="site"     : GroupKFold on site (strict but unbalanced)
+    # kind="sitedate" : GroupKFold on (site, date) (balanced site-aware)
     n_splits_cfg = int(cfg.get("n_splits", 5))
-    folds = load_folds(n_splits=n_splits_cfg)
+    fold_kind_cfg = str(cfg.get("fold_kind", "strat"))
+    folds = load_folds(n_splits=n_splits_cfg, kind=fold_kind_cfg)
     fold_of = dict(zip(folds["filename"], folds["fold"].astype(int)))
     # row_fold = -1 means EITHER (a) file isn't in folds parquet (e.g.
     # unlabeled), or (b) file is pinned (fold=-1 in parquet). In both cases

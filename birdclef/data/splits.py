@@ -45,9 +45,9 @@ from typing import List
 
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import GroupKFold, StratifiedKFold
 
-from birdclef.config.paths import SPLIT_ROOT, folds_path
+from birdclef.config.paths import FOLD_KINDS, SPLIT_ROOT, folds_path
 from birdclef.data.soundscapes import label_to_idx, load_soundscape_meta
 
 
@@ -61,8 +61,8 @@ def _labeled_file_frame() -> pd.DataFrame:
 
     Returns columns: filename, primary_label (modal species across the 12
     windows of that file), label_set (full union of labels — kept for the
-    diagnostic summary).  Files with empty label_lists across all windows
-    are dropped — they can't contribute to evaluation either.
+    diagnostic summary), site, date.  Files with empty label_lists across
+    all windows are dropped — they can't contribute to evaluation either.
     """
     sc = load_soundscape_meta()
     sc = sc[sc["fully_labeled"]].copy()
@@ -78,10 +78,14 @@ def _labeled_file_frame() -> pd.DataFrame:
         if not all_labels:
             continue
         modal = Counter(all_labels).most_common(1)[0][0]
+        # site/date are constant within a filename — pick the first row's value.
+        first = group.iloc[0]
         rows.append({
             "filename": fname,
             "primary_label": modal,
             "label_set": tuple(sorted(set(all_labels))),
+            "site": str(first.get("site", "unknown")),
+            "date": str(first.get("date", "00000000")),
         })
     files = pd.DataFrame(rows).sort_values("filename").reset_index(drop=True)
     if files.empty:
@@ -146,36 +150,87 @@ def build_folds(n_splits: int, seed: int = 42) -> pd.DataFrame:
     return files[["filename", "primary_label", "fold"]].reset_index(drop=True)
 
 
-def build_and_persist_folds(n_splits: int, seed: int = 42) -> pd.DataFrame:
-    """Build a fold assignment and persist it to `folds_path(n_splits)`."""
+def build_grouped_folds(n_splits: int, kind: str) -> pd.DataFrame:
+    """GroupKFold by site or by (site, date).
+
+    kind="site": groups = file's site. With ~8 sites in BirdCLEF26, fold sizes
+        are highly uneven (S22 alone is ~66% of files). The S22 fold trains on
+        ~20 files only — accept the noise as the price of strict site-out CV.
+    kind="sitedate": groups = (site, date) tuple. ~48 groups for the labeled
+        pool → balanced ~12 files/fold, but S22's individual days can land in
+        train AND val (different days) so mic/ambience are still leaking.
+        Practical compromise when pure site-level produces unstable folds.
+    """
+    if kind not in ("site", "sitedate"):
+        raise ValueError(f"build_grouped_folds: kind must be site|sitedate, got {kind!r}")
+    files = _labeled_file_frame()
+    if len(files) < n_splits:
+        raise RuntimeError(
+            f"Only {len(files)} labeled files; cannot make {n_splits} folds."
+        )
+    if kind == "site":
+        groups = files["site"].astype(str).to_numpy()
+    else:
+        groups = (files["site"].astype(str) + "_" + files["date"].astype(str)).to_numpy()
+    n_unique_groups = int(pd.Series(groups).nunique())
+    if n_unique_groups < n_splits:
+        raise RuntimeError(
+            f"GroupKFold(kind={kind}, n_splits={n_splits}) requires "
+            f">= {n_splits} unique groups, found {n_unique_groups}."
+        )
+    gkf = GroupKFold(n_splits=int(n_splits))
+    fold_of = np.full(len(files), -1, dtype=np.int8)
+    for fold, (_tr, va) in enumerate(gkf.split(np.zeros(len(files)), groups=groups)):
+        fold_of[va] = fold
+    if (fold_of < 0).any():
+        raise RuntimeError("Some files were not assigned to any fold (bug).")
+    files = files.assign(fold=fold_of)
+    return files[["filename", "primary_label", "site", "date", "fold"]].reset_index(drop=True)
+
+
+def build_folds_kind(n_splits: int, kind: str = "strat", seed: int = 42) -> pd.DataFrame:
+    """Build folds of the requested kind. Dispatches to the right builder."""
+    if kind == "strat":
+        return build_folds(n_splits=int(n_splits), seed=int(seed))
+    return build_grouped_folds(n_splits=int(n_splits), kind=kind)
+
+
+def build_and_persist_folds(n_splits: int, seed: int = 42, kind: str = "strat") -> pd.DataFrame:
+    """Build a fold assignment and persist it to `folds_path(n_splits, kind)`."""
     SPLIT_ROOT.mkdir(parents=True, exist_ok=True)
-    folds = build_folds(n_splits=n_splits, seed=seed)
-    out_path = folds_path(n_splits)
+    folds = build_folds_kind(n_splits=n_splits, kind=kind, seed=seed)
+    out_path = folds_path(n_splits, kind=kind)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     folds.to_parquet(out_path, index=False)
     return folds
 
 
-def build_and_persist_all(seeds: int = 42, n_splits_list=DEFAULT_N_SPLITS) -> dict:
-    """Build all default fold counts (5 and 10). Returns {n_splits: DataFrame}."""
-    out = {}
-    for n in n_splits_list:
-        out[int(n)] = build_and_persist_folds(n_splits=int(n), seed=seeds)
+def build_and_persist_all(seeds: int = 42, n_splits_list=DEFAULT_N_SPLITS,
+                          kinds: tuple = ("strat",)) -> dict:
+    """Build fold parquets for every (n_splits, kind) pair. Returns nested dict."""
+    out: dict = {}
+    for kind in kinds:
+        out[kind] = {}
+        for n in n_splits_list:
+            out[kind][int(n)] = build_and_persist_folds(
+                n_splits=int(n), seed=seeds, kind=kind,
+            )
     return out
 
 
-def load_folds(n_splits: int = 5) -> pd.DataFrame:
-    """Read the persisted fold assignment for `n_splits` folds.
+def load_folds(n_splits: int = 5, kind: str = "strat") -> pd.DataFrame:
+    """Read the persisted fold assignment for `n_splits` folds of `kind`.
 
-    Returns DataFrame with columns (filename, primary_label, fold).
-    Raises FileNotFoundError if the parquet hasn't been built — run
-    `python -m birdclef.scripts._02_build_splits` first.
+    Returns DataFrame with columns (filename, primary_label, fold), plus
+    (site, date) when the parquet was built with a grouped kind. Raises
+    FileNotFoundError if the parquet hasn't been built — run
+    `python -m birdclef.scripts._02_build_splits --kind <kind>` first.
     """
-    p = folds_path(n_splits)
+    p = folds_path(n_splits, kind=kind)
     if not Path(p).exists():
         raise FileNotFoundError(
             f"Fold parquet missing: {p}. Run "
-            "`python -m birdclef.scripts._02_build_splits` to build it."
+            f"`python -m birdclef.scripts._02_build_splits --kind {kind}` to build it."
         )
     return pd.read_parquet(p)
 
