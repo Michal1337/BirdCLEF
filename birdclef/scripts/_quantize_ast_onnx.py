@@ -43,27 +43,56 @@ def main() -> None:
 
     try:
         from onnxruntime.quantization import quantize_dynamic, QuantType
+        from onnxruntime.quantization.shape_inference import quant_pre_process
     except ImportError as e:
         raise SystemExit(
             "onnxruntime.quantization not installed. `pip install onnxruntime`"
         ) from e
 
     args.out_onnx.parent.mkdir(parents=True, exist_ok=True)
-    print(f"[quant] dynamic quantization: {args.in_onnx} → {args.out_onnx}")
+
+    # Step 1: pre-process. The exported ONNX from torch.onnx.export often
+    # has stale or incomplete shape annotations on tensors whose shape was
+    # introduced by reshape/squeeze ops (e.g. the freshly-init 234-class
+    # classifier head). The quantizer's shape inference fails on those
+    # mismatches with a confusing "(768) vs (234)" error. quant_pre_process
+    # runs symbolic shape inference + constant folding + small graph
+    # optimizations to clean it up before quantization.
+    preprocessed = args.out_onnx.with_suffix(".preprocessed.onnx")
+    print(f"[quant] step 1: quant_pre_process → {preprocessed}")
+    quant_pre_process(
+        input_model=str(args.in_onnx),
+        output_model_path=str(preprocessed),
+        skip_optimization=False,
+        skip_onnx_shape=False,
+        skip_symbolic_shape=False,
+        auto_merge=True,
+    )
+
+    # Step 2: dynamic quantize from the cleaned model.
+    print(f"[quant] step 2: dynamic quantization → {args.out_onnx}")
     print(f"[quant]   weight_type=QInt8 (activations stay FP32)")
     quantize_dynamic(
-        model_input=str(args.in_onnx),
+        model_input=str(preprocessed),
         model_output=str(args.out_onnx),
         weight_type=QuantType.QInt8,
-        # `per_channel=True` for slightly better accuracy on the large
-        # FFN/attention matmuls. Default False keeps it simple but per-
-        # channel typically loses no measurable AUC and is similar speed.
+        # per_channel=True for slightly better accuracy on the large
+        # FFN/attention matmuls.
         per_channel=True,
-        # Reduce_range for x86 compatibility (avoids overflow on legacy CPUs).
-        # On modern CPUs (AVX-512 VNNI) you can set False for slightly more
-        # accuracy headroom, but Kaggle CPUs are typically AVX2 only.
+        # reduce_range=True for x86 compatibility (no overflow on AVX2-only
+        # CPUs). On AVX-512-VNNI you can set False for slightly more
+        # accuracy headroom; Kaggle CPUs are typically AVX2 only.
         reduce_range=True,
     )
+
+    # Clean up the preprocessed intermediate (it can be ~330 MB).
+    try:
+        preprocessed.unlink()
+        for p in preprocessed.parent.glob(preprocessed.stem + ".data"):
+            # large external-data file from shape-inference may be there too
+            p.unlink()
+    except Exception:
+        pass
     in_mb = args.in_onnx.stat().st_size / 1024**2
     out_mb = args.out_onnx.stat().st_size / 1024**2
     print(f"[quant] sizes: fp32 {in_mb:.1f} MB → int8 {out_mb:.1f} MB  "
