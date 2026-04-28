@@ -124,6 +124,11 @@ def _dump_ssm(out_dir: Path, ssm_config_name: str, n_splits: int,
     y_true = cache_Y[keep].astype(np.uint8)
     keep_cols = [c for c in ["row_id", "filename", "site", "hour_utc"] if c in keep_meta.columns]
     meta_out = keep_meta[keep_cols].copy()
+    # Stamp the per-row fold index + the kind that produced it so downstream
+    # consumers (e.g. _09_blend_search) can compute mean-of-folds metrics
+    # without re-loading the fold parquet.
+    meta_out["fold"] = row_fold[keep].astype(np.int8)
+    meta_out["fold_kind"] = str(fold_kind)
     return probs, meta_out, y_true
 
 

@@ -1,9 +1,17 @@
 """Per-taxon convex-combination search over multiple blend members.
 
 Given N ≥ 2 row-aligned probability arrays (one per blend member) and the
-ground-truth label matrix, finds the per-taxon weights that maximize macro
-AUC. Outputs a JSON of weights you can paste into the LB notebook (replacing
-the hand-picked _TAXON_WEIGHTS dict in the per-taxon blend cell).
+ground-truth label matrix, finds the per-taxon weights that maximize the
+chosen AUC metric. Outputs a JSON of weights you can paste into the LB
+notebook (replacing the hand-picked _TAXON_WEIGHTS dict).
+
+Metric (--metric):
+    mean_of_folds (default, requires meta.parquet with a `fold` column) —
+        average of per-fold macro AUCs. LB-correlated; mirrors how a deployed
+        model fits its calibration once on all data. Use --folds to drop
+        problem folds (e.g. site-CV fold 0 trains on too little data).
+    stitched — single macro AUC over all rows concatenated. Biased by
+        inter-fold calibration drift; legacy default.
 
 Search space: for each taxon, sweep weight combinations on a coarse grid
 (default step=0.1) over the simplex (weights sum to 1). For 2 members it's a
@@ -11,22 +19,27 @@ Search space: for each taxon, sweep weight combinations on a coarse grid
 Coarse step is intentional — finer grids overfit val with so few rows.
 
 Inputs (default Locations match _07b_dump_oof_probs + _08c_dump_ast_val):
-    outputs/blend_search/oof/ssm_probs.npz  → SSM 5-fold OOF predictions
+    outputs/blend_search/oof/ssm_probs.npz  → SSM stitched OOF predictions
     outputs/blend_search/oof/ast_probs.npz  → AST val predictions
     outputs/blend_search/oof/y_true.npy     → ground truth (uint8)
-    outputs/blend_search/oof/meta.parquet   → row metadata (for taxon lookup)
+    outputs/blend_search/oof/meta.parquet   → row metadata; needs `fold` +
+                                              `fold_kind` columns for
+                                              mean-of-folds metric
 
 Run:
-    # build inputs first
-    python -m birdclef.scripts._07b_dump_oof_probs --n-splits 5
-    python -m birdclef.scripts._08c_dump_ast_val \\
-        --ast-ckpt birdclef_example/outputs/ast/ast_lr3e-05_e15/best_model.pt
+    # rebuild OOF inputs with fold info under the desired CV scheme
+    python -m birdclef.scripts._07b_dump_oof_probs --n-splits 5 --fold-kind strat
 
-    # search
+    # mean-of-folds search across all folds
     python -m birdclef.scripts._09_blend_search \\
         --members ssm:outputs/blend_search/oof/ssm_probs.npz \\
                   ast:outputs/blend_search/oof/ast_probs.npz \\
-        --step 0.1
+        --step 0.2
+
+    # restrict to specific folds (e.g. drop site-CV fold 0 = all-S22)
+    python -m birdclef.scripts._09_blend_search \\
+        --members ssm:... ast:... \\
+        --folds 1 2 3 4
 """
 from __future__ import annotations
 
@@ -64,6 +77,36 @@ def _macro_auc(Y: np.ndarray, P: np.ndarray, class_idx: np.ndarray) -> Tuple[flo
         return float("nan"), int(keep.sum())
 
 
+def _mean_of_folds_auc(
+    Y: np.ndarray, P: np.ndarray, class_idx: np.ndarray, fold_of_row: np.ndarray,
+) -> Tuple[float, int]:
+    """Mean of per-fold macro AUCs (within `class_idx` columns).
+
+    For each fold f, computes macro AUC over rows where `fold_of_row == f`,
+    averaging only over classes with at least one positive in that fold's
+    val rows. Returns (mean over folds where AUC is finite, n_folds_used).
+
+    This is the LB-correlated metric: each fold scores its own self-consistent
+    predictions, mirroring how a deployed model fits its calibration once on
+    all data. Stitched-OOF (concat all folds → one global AUC) mixes score
+    distributions across differently-trained fold models and is misleading.
+    """
+    folds = np.unique(fold_of_row[fold_of_row >= 0])
+    if len(folds) == 0:
+        return float("nan"), 0
+    per_fold = []
+    for f in folds:
+        rows = np.where(fold_of_row == f)[0]
+        if len(rows) == 0:
+            continue
+        auc_f, _ = _macro_auc(Y[rows], P[rows], class_idx)
+        if np.isfinite(auc_f):
+            per_fold.append(auc_f)
+    if not per_fold:
+        return float("nan"), 0
+    return float(np.mean(per_fold)), len(per_fold)
+
+
 def _simplex_grid(n_members: int, step: float) -> List[Tuple[float, ...]]:
     """All weight tuples on the n-simplex with `step` granularity."""
     n_steps = int(round(1.0 / step))
@@ -97,6 +140,18 @@ def main() -> None:
                     help="Grid step on the simplex. Default 0.1 = coarse "
                          "(11 points per axis for 2 members). Lower = finer "
                          "search but higher overfit-to-val risk on few rows.")
+    ap.add_argument("--metric", default="mean_of_folds",
+                    choices=["mean_of_folds", "stitched"],
+                    help="Optimization target. mean_of_folds = average of "
+                         "per-fold macro AUCs (LB-correlated; default when "
+                         "meta has a 'fold' column). stitched = single macro "
+                         "AUC over all rows concatenated (legacy; biased by "
+                         "inter-fold calibration drift).")
+    ap.add_argument("--folds", nargs="+", type=int, default=None,
+                    help="Restrict mean-of-folds to a subset of fold ids "
+                         "(e.g. --folds 1 2 3 4 to drop fold 0). Default: "
+                         "all folds present in meta. Ignored if --metric "
+                         "stitched.")
     ap.add_argument("--out-json", type=Path,
                     default=Path("outputs/blend/blend_weights.json"),
                     help="Output: per-taxon weights JSON.")
@@ -131,6 +186,41 @@ def main() -> None:
             raise SystemExit(f"shape mismatch: {n}={P.shape} vs y_true={Y.shape}")
         print(f"[blend]   {n:>6s}  shape={P.shape}  mean={P.mean():.4f}")
 
+    # Resolve the AUC metric. mean_of_folds requires a `fold` column in meta.
+    metric = args.metric
+    fold_of_row: np.ndarray | None = None
+    if metric == "mean_of_folds":
+        if "fold" not in meta.columns:
+            print(f"[blend] WARN: meta has no 'fold' column — falling back "
+                  f"to stitched. Re-dump OOF probs with the updated "
+                  f"_07b_dump_oof_probs to get fold-aware ranking.")
+            metric = "stitched"
+        else:
+            fold_of_row = meta["fold"].astype(int).to_numpy()
+            available = sorted(int(f) for f in np.unique(fold_of_row) if f >= 0)
+            if args.folds is not None:
+                requested = set(int(f) for f in args.folds)
+                missing = requested - set(available)
+                if missing:
+                    raise SystemExit(
+                        f"--folds requested {sorted(missing)} but meta only has {available}"
+                    )
+                # Mask non-selected rows by setting their fold to -1, which the
+                # mean-of-folds helper already filters out.
+                mask = np.isin(fold_of_row, sorted(requested))
+                fold_of_row = np.where(mask, fold_of_row, -1).astype(np.int8)
+                print(f"[blend] mean-of-folds restricted to folds {sorted(requested)} "
+                      f"(of available {available}, "
+                      f"{int(mask.sum())}/{len(mask)} rows)")
+            else:
+                print(f"[blend] mean-of-folds over folds {available} "
+                      f"(fold_kind={meta.get('fold_kind', pd.Series(['?'])).iloc[0]})")
+
+    def _score(Yp: np.ndarray, Pp: np.ndarray, class_idx: np.ndarray) -> Tuple[float, int]:
+        if metric == "mean_of_folds" and fold_of_row is not None:
+            return _mean_of_folds_auc(Yp, Pp, class_idx, fold_of_row)
+        return _macro_auc(Yp, Pp, class_idx)
+
     # Build per-taxon class-index lists from taxonomy.
     labels = primary_labels()
     tax = load_taxonomy()
@@ -159,7 +249,7 @@ def main() -> None:
         # single-member baselines
         single = []
         for P in P_list:
-            auc, n_eval = _macro_auc(Y, P, idx)
+            auc, n_eval = _score(Y, P, idx)
             single.append(auc)
         if not all(np.isfinite(s) for s in single):
             # If any member has no positives in this taxon, skip the search
@@ -171,7 +261,7 @@ def main() -> None:
             best_w = grid[0]
             for w in grid:
                 blended = sum(wi * Pi for wi, Pi in zip(w, P_list))
-                auc, _ = _macro_auc(Y, blended, idx)
+                auc, _ = _score(Y, blended, idx)
                 if not np.isfinite(auc):
                     continue
                 if auc > best_score:
@@ -194,8 +284,8 @@ def main() -> None:
     # Overall (all val-seen classes) for sanity.
     all_seen = np.where(Y.sum(axis=0) > 0)[0]
     print()
-    print("=== Overall (all val-seen classes) ===")
-    overall_singles = [_macro_auc(Y, P, all_seen)[0] for P in P_list]
+    print(f"=== Overall (all val-seen classes, metric={metric}) ===")
+    overall_singles = [_score(Y, P, all_seen)[0] for P in P_list]
     for n, s in zip(member_names, overall_singles):
         print(f"  {n:>6s} alone: {s:.4f}")
     # Overall best with the per-taxon weight assignment we just chose
@@ -204,14 +294,14 @@ def main() -> None:
         w = tuple(results[taxon]["best_weights"][n] for n in member_names)
         b = sum(wi * Pi for wi, Pi in zip(w, P_list))
         blended_per_taxon[:, cols] = b[:, cols]
-    per_taxon_overall = _macro_auc(Y, blended_per_taxon, all_seen)[0]
+    per_taxon_overall = _score(Y, blended_per_taxon, all_seen)[0]
     print(f"  per-taxon blend: {per_taxon_overall:.4f}")
     # Also a single-α baseline for comparison
     if len(members) == 2:
         best_global_alpha, best_global_auc = 0.5, -np.inf
         for alpha in np.arange(0.0, 1.0 + args.step, args.step):
             b = alpha * P_list[0] + (1 - alpha) * P_list[1]
-            a, _ = _macro_auc(Y, b, all_seen)
+            a, _ = _score(Y, b, all_seen)
             if a > best_global_auc:
                 best_global_auc, best_global_alpha = a, float(alpha)
         print(f"  best global α (single weight): "
@@ -232,6 +322,11 @@ def main() -> None:
         "n_grid_points": len(grid),
         "n_rows": int(n_rows),
         "n_classes": int(n_cls),
+        "metric": metric,
+        "fold_kind": (str(meta["fold_kind"].iloc[0])
+                      if "fold_kind" in meta.columns else None),
+        "folds_used": (sorted(set(int(f) for f in fold_of_row if f >= 0))
+                       if fold_of_row is not None else None),
     }
 
     args.out_json.parent.mkdir(parents=True, exist_ok=True)
