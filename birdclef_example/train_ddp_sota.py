@@ -226,16 +226,37 @@ class BCEFocalComboLoss(nn.Module):
         self.focal_gamma = float(focal_gamma)
         self.label_smoothing = float(label_smoothing)
 
-    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        logits: torch.Tensor,
+        targets: torch.Tensor,
+        loss_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """BCE+focal combo with optional per-(row, class) loss mask.
+
+        loss_mask: same shape as `targets` (B, n_classes), values {0., 1.}.
+        Cells with mask=0 contribute zero gradient. Used by pseudo-label
+        training so the student isn't trained on positions where the
+        teacher was uncertain. When mask is None, behaves identically to
+        the unmasked path (no perf/numerical change for non-pseudo runs).
+        """
         if self.label_smoothing > 0:
             targets = targets * (1.0 - self.label_smoothing) + (1.0 - targets) * self.label_smoothing
 
         bce_elem = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
-        bce = bce_elem.mean()
-
         probs = torch.sigmoid(logits)
         pt = targets * probs + (1.0 - targets) * (1.0 - probs)
-        focal = ((1.0 - pt).pow(self.focal_gamma) * bce_elem).mean()
+        focal_elem = (1.0 - pt).pow(self.focal_gamma) * bce_elem
+
+        if loss_mask is None:
+            bce = bce_elem.mean()
+            focal = focal_elem.mean()
+        else:
+            # Sum over masked cells, divide by their count. clamp(min=1)
+            # avoids div-by-zero on (extremely unlikely) all-zero masks.
+            denom = loss_mask.sum().clamp(min=1.0)
+            bce = (bce_elem * loss_mask).sum() / denom
+            focal = (focal_elem * loss_mask).sum() / denom
 
         return self.bce_weight * bce + self.focal_weight * focal
 
@@ -338,15 +359,27 @@ def apply_mixup(
     targets: torch.Tensor,
     alpha: float,
     probability: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    loss_mask: torch.Tensor | None = None,
+):
+    """Mixup augmentation. Returns (inputs, targets) by default, or
+    (inputs, targets, loss_mask) when a mask is provided. The mask is
+    combined with elementwise OR (`max`): a position contributes to the
+    loss if EITHER mixed sample had it kept. That preserves the "do not
+    train on uncertain teacher cells" guarantee for the dominant sample.
+    """
     if alpha <= 0.0 or probability <= 0.0 or inputs.size(0) < 2:
-        return inputs, targets
+        return (inputs, targets) if loss_mask is None else (inputs, targets, loss_mask)
     if torch.rand(1, device=inputs.device).item() > probability:
-        return inputs, targets
+        return (inputs, targets) if loss_mask is None else (inputs, targets, loss_mask)
 
     lam = torch.distributions.Beta(alpha, alpha).sample((1,)).to(inputs.device).item()
     idx = torch.randperm(inputs.size(0), device=inputs.device)
-    return lam * inputs + (1 - lam) * inputs[idx], lam * targets + (1 - lam) * targets[idx]
+    mixed_inputs = lam * inputs + (1 - lam) * inputs[idx]
+    mixed_targets = lam * targets + (1 - lam) * targets[idx]
+    if loss_mask is None:
+        return mixed_inputs, mixed_targets
+    mixed_mask = torch.maximum(loss_mask, loss_mask[idx])
+    return mixed_inputs, mixed_targets, mixed_mask
 
 
 def build_optimizer(
@@ -425,15 +458,32 @@ def train_one_epoch_ddp(
     running_loss = 0.0
     batch_count = 0
     progress = tqdm(train_loader, desc=epoch_label, leave=False, disable=not _is_main_process(rank))
-    for batch_idx, (inputs, targets) in enumerate(progress, start=1):
+    for batch_idx, batch in enumerate(progress, start=1):
+        # Dataset returns 2-tuple (legacy / no pseudo-labels) or 3-tuple
+        # (pseudo-label mode). Both paths are supported here so the same
+        # train_one_epoch_ddp covers both AST/CNN trainer modes.
+        if len(batch) == 3:
+            inputs, targets, loss_mask = batch
+            loss_mask = loss_mask.to(device, non_blocking=True)
+        else:
+            inputs, targets = batch
+            loss_mask = None
         inputs = inputs.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
-        inputs, targets = apply_mixup(inputs, targets, mixup_alpha, mixup_probability)
+        if loss_mask is None:
+            inputs, targets = apply_mixup(inputs, targets, mixup_alpha, mixup_probability)
+        else:
+            inputs, targets, loss_mask = apply_mixup(
+                inputs, targets, mixup_alpha, mixup_probability, loss_mask=loss_mask,
+            )
 
         optimizer.zero_grad(set_to_none=True)
         with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=amp_enabled):
             logits = model(inputs)
-            loss = criterion(logits, targets)
+            if loss_mask is None:
+                loss = criterion(logits, targets)
+            else:
+                loss = criterion(logits, targets, loss_mask=loss_mask)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip_norm)
         optimizer.step()

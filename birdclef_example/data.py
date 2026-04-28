@@ -1,10 +1,12 @@
 import ast
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import json
 import re
 from pathlib import Path
 from typing import Iterator, List, Optional, Tuple, Dict
 
+import numpy as np
 import pandas as pd
 import soundfile as sf
 import torch
@@ -15,6 +17,10 @@ from tqdm import tqdm
 from torch import Tensor, nn
 from torch.nn import functional as F
 from torch.utils.data import Dataset
+
+
+N_WINDOWS_PER_FILE = 12       # 12 × 5 s = 60 s soundscape file
+WINDOW_SECONDS = 5
 
 
 PRIMARY_LABEL_SPLIT_RE = re.compile(r"[;,\s]+")
@@ -166,6 +172,83 @@ def prepare_train_audio_metadata(metadata: pd.DataFrame, audio_dir: Path) -> pd.
     return prepared
 
 
+def _format_seconds(s: int) -> str:
+    """Seconds-int → "0:00:SS" / "0:00:00"-style time string the dataset slices on."""
+    return f"0:{(s // 60):02d}:{(s % 60):02d}"
+
+
+def load_pseudo_round(pseudo_dir: Path, rnd: int) -> Tuple[np.ndarray, np.ndarray, pd.DataFrame, dict]:
+    """Read birdclef/cache/pseudo/round{N}/.
+
+    Returns (probs[N_rows, n_classes] float32,
+             keep_mask[N_rows, n_classes] uint8,
+             meta DataFrame with columns row_id/filename/window/(is_labeled),
+             info dict from info.json — empty dict if missing).
+    """
+    rdir = Path(pseudo_dir) / f"round{int(rnd)}"
+    meta_path = rdir / "meta.parquet"
+    probs_path = rdir / "probs.npz"
+    if not meta_path.exists() or not probs_path.exists():
+        raise FileNotFoundError(
+            f"Pseudo round {rnd} not found under {rdir}. "
+            "Run `python -m birdclef.scripts._05_pseudo_label --round N` first."
+        )
+    meta = pd.read_parquet(meta_path)
+    arrs = np.load(probs_path)
+    # _05_pseudo_label writes either {'probs', 'keep_mask'} (SED teacher) or
+    # {'final', 'first_pass', 'keep_mask'} (SSM teacher). Prefer 'final'/'probs'.
+    if "final" in arrs.files:
+        probs = arrs["final"].astype(np.float32)
+    elif "probs" in arrs.files:
+        probs = arrs["probs"].astype(np.float32)
+    else:
+        raise ValueError(f"{probs_path}: no 'probs' or 'final' array found")
+    keep = arrs["keep_mask"].astype(np.uint8) if "keep_mask" in arrs.files else np.ones_like(probs, dtype=np.uint8)
+    info_path = rdir / "info.json"
+    info: dict = {}
+    if info_path.exists():
+        try:
+            info = json.loads(info_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            pass
+    return probs, keep, meta, info
+
+
+def prepare_pseudo_soundscape_metadata(
+    pseudo_meta: pd.DataFrame,
+    keep_mask: np.ndarray,
+    soundscape_dir: Path,
+    require_kept_positive: bool = True,
+) -> pd.DataFrame:
+    """Build BirdCLEFDataset-compatible rows for every (file, window) in the
+    pseudo cache, with `pseudo_row` indexing into the (probs, keep_mask) arrays.
+
+    require_kept_positive: drop rows whose keep_mask is entirely zero — those
+    contribute no gradient and just bloat the loader.
+    """
+    if "filename" not in pseudo_meta.columns or "window" not in pseudo_meta.columns:
+        raise ValueError(
+            "pseudo meta must have columns 'filename' and 'window'. "
+            f"Found: {list(pseudo_meta.columns)}"
+        )
+    df = pseudo_meta.copy().reset_index(drop=True)
+    df["pseudo_row"] = df.index.astype(np.int64)
+    if require_kept_positive:
+        any_kept = keep_mask.any(axis=1)
+        df = df[any_kept[df["pseudo_row"].to_numpy()]].reset_index(drop=True)
+
+    df["filename"] = df["filename"].astype(str)
+    df["window"] = df["window"].astype(int).clip(0, N_WINDOWS_PER_FILE - 1)
+    df["start"] = df["window"].map(lambda w: _format_seconds(int(w) * WINDOW_SECONDS))
+    df["end"] = df["window"].map(lambda w: _format_seconds(int(w + 1) * WINDOW_SECONDS))
+    df["audio_filepath"] = df["filename"].map(lambda name: str(soundscape_dir / name))
+    df["primary_label"] = ""           # ignored — target comes from pseudo_row
+    df["secondary_labels"] = "[]"
+    df["source"] = "pseudo_soundscape"
+    return df[["filename", "start", "end", "audio_filepath", "primary_label",
+               "secondary_labels", "source", "pseudo_row"]]
+
+
 def prepare_soundscape_metadata(metadata: pd.DataFrame, soundscape_dir: Path) -> pd.DataFrame:
     required_cols = {"filename", "start", "end", "primary_label"}
     missing = required_cols.difference(metadata.columns)
@@ -199,7 +282,21 @@ class BirdCLEFDataset(Dataset):
         preload_audio: bool = True,
         max_cached_files: int = 100,
         preload_workers: int = 1,
+        pseudo_probs: Optional["np.ndarray"] = None,
+        pseudo_keep: Optional["np.ndarray"] = None,
     ):
+        """
+        pseudo_probs: optional (N, n_classes) float32 — soft pseudo-targets
+            from `_05_pseudo_label`. Rows whose `metadata['source'] ==
+            'pseudo_soundscape'` look up their target via `metadata['pseudo_row']`.
+        pseudo_keep: optional (N, n_classes) uint8 — per-cell loss mask for the
+            pseudo rows. Cells with keep=0 contribute zero gradient.
+
+        When BOTH pseudo arrays are provided, `__getitem__` returns a 3-tuple
+        `(waveform, target, loss_mask)`. Otherwise it returns the legacy 2-tuple
+        `(waveform, target)` so existing trainers / val loaders keep working
+        unchanged.
+        """
         self.metadata = metadata.reset_index(drop=True)
         self.label_map = label_map
         self.sample_rate = sample_rate
@@ -210,17 +307,62 @@ class BirdCLEFDataset(Dataset):
         self.preload_workers = max(1, preload_workers)
         self._audio_cache: OrderedDict[Path, Tensor] = OrderedDict()
 
+        # Pseudo plumbing. Both arrays must be set together — any None disables
+        # the pseudo path and reverts to legacy 2-tuple output.
+        self._pseudo_probs = pseudo_probs
+        self._pseudo_keep = pseudo_keep
+        self._pseudo_active = (pseudo_probs is not None) and (pseudo_keep is not None)
+        if self._pseudo_active:
+            if pseudo_probs.shape != pseudo_keep.shape:
+                raise ValueError(
+                    f"pseudo_probs {pseudo_probs.shape} and pseudo_keep "
+                    f"{pseudo_keep.shape} must have matching shape."
+                )
+            if "source" not in self.metadata.columns:
+                raise ValueError(
+                    "metadata needs a 'source' column to identify pseudo rows "
+                    "(values like 'pseudo_soundscape', 'train_audio', "
+                    "'train_soundscapes')."
+                )
+            if (
+                "pseudo_row" not in self.metadata.columns
+                and (self.metadata["source"] == "pseudo_soundscape").any()
+            ):
+                raise ValueError(
+                    "metadata has 'pseudo_soundscape' rows but no 'pseudo_row' "
+                    "column to index them — build with "
+                    "`prepare_pseudo_soundscape_metadata`."
+                )
+            self._n_classes_pseudo = int(pseudo_probs.shape[1])
+            if self._n_classes_pseudo != len(label_map):
+                raise ValueError(
+                    f"pseudo array width {self._n_classes_pseudo} mismatches "
+                    f"label_map ({len(label_map)})."
+                )
+
         if self.preload_audio:
             self._preload_all_audio()
 
     def __len__(self) -> int:
         return len(self.metadata)
 
-    def __getitem__(self, idx: int) -> Tuple[Tensor, Tensor]:
+    def __getitem__(self, idx: int):
         row = self.metadata.iloc[idx]
         waveform = self._load_waveform(row)
-        target = self._encode_target(row)
-        return waveform, target
+        if not self._pseudo_active:
+            target = self._encode_target(row)
+            return waveform, target
+
+        # Pseudo path: 3-tuple with per-cell loss mask.
+        source = str(row.get("source", ""))
+        if source == "pseudo_soundscape":
+            pr = int(row["pseudo_row"])
+            target = torch.from_numpy(self._pseudo_probs[pr].astype("float32"))
+            mask = torch.from_numpy(self._pseudo_keep[pr].astype("float32"))
+        else:
+            target = self._encode_target(row)
+            mask = torch.ones_like(target)
+        return waveform, target, mask
 
     def _preload_all_audio(self) -> None:
         unique_paths = [

@@ -71,9 +71,11 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from birdclef_example.data import (
+from birdclef_example.data import (  # noqa: E402
     BirdCLEFDataset,
     build_label_map,
+    load_pseudo_round,
+    prepare_pseudo_soundscape_metadata,
     prepare_soundscape_metadata,
     prepare_train_audio_metadata,
 )
@@ -701,6 +703,11 @@ def main() -> None:
                     help="Override output dir. Default: birdclef_example/outputs/ast")
     ap.add_argument("--include-xc", action="store_true",
                     help="Also load Xeno-Canto recordings (data/train_audio_xc.csv).")
+    ap.add_argument("--pseudo-round", type=int, default=None,
+                    help="Train with pseudo-labels from "
+                         "birdclef/cache/pseudo/round{N}/. The pseudo-soundscape "
+                         "rows are appended to the focal-recording train pool "
+                         "and the BCE loss is gated by the kept-cell mask.")
     args = ap.parse_args()
 
     distributed, world_size, rank, local_rank = _get_distributed_context()
@@ -749,6 +756,42 @@ def main() -> None:
     train_meta = train_meta[train_meta["audio_filepath"].apply(lambda p: Path(p).exists())]
     train_meta = train_meta.reset_index(drop=True)
 
+    # Pseudo-label augmentation (optional). Loads the round artefacts from
+    # birdclef/cache/pseudo/round{N}/ and appends pseudo-soundscape rows to
+    # the focal training pool. Pseudo arrays are passed to BirdCLEFDataset so
+    # __getitem__ returns the soft target + per-cell loss mask for those rows.
+    pseudo_probs = None
+    pseudo_keep = None
+    if args.pseudo_round is not None:
+        pseudo_dir = repo_root / "birdclef" / "cache" / "pseudo"
+        if not pseudo_dir.exists():
+            raise FileNotFoundError(
+                f"--pseudo-round set but {pseudo_dir} missing. "
+                "Run `python -m birdclef.scripts._05_pseudo_label --round N` first."
+            )
+        pseudo_probs, pseudo_keep, pseudo_meta_df, pseudo_info = load_pseudo_round(
+            pseudo_dir, int(args.pseudo_round),
+        )
+        pseudo_train_meta = prepare_pseudo_soundscape_metadata(
+            pseudo_meta_df, pseudo_keep, train_soundscape_dir,
+            require_kept_positive=True,
+        )
+        # Filter out files that don't exist on disk (defensive — pseudo cache
+        # may reference files removed since the cache was built).
+        existing = pseudo_train_meta["audio_filepath"].apply(lambda p: Path(p).exists())
+        pseudo_train_meta = pseudo_train_meta[existing].reset_index(drop=True)
+        # Stamp pseudo_row=-1 on the focal rows so the column exists for the
+        # whole frame; BirdCLEFDataset only consults it for source==pseudo_soundscape.
+        if "pseudo_row" not in train_meta.columns:
+            train_meta["pseudo_row"] = -1
+        train_meta = pd.concat(
+            [train_meta, pseudo_train_meta], ignore_index=True
+        ).reset_index(drop=True)
+        _print_main(rank, f"[setup] pseudo round {args.pseudo_round}: "
+                          f"+{len(pseudo_train_meta)} soundscape rows  "
+                          f"(teacher={pseudo_info.get('teacher_name', pseudo_info.get('teacher', '?'))}, "
+                          f"keep_fraction={pseudo_info.get('keep_fraction', '?')})")
+
     soundscape_df = pd.read_csv(soundscape_labels_path)
     val_meta = prepare_soundscape_metadata(soundscape_df, train_soundscape_dir)
     label_map = build_label_map(train_meta, taxonomy_path)
@@ -781,6 +824,8 @@ def main() -> None:
         duration=float(base_model_config["duration"]),
         training=True, preload_audio=bool(args.preload_train_audio),
         preload_workers=int(args.preload_workers),
+        pseudo_probs=pseudo_probs,
+        pseudo_keep=pseudo_keep,
     )
     val_dataset = None
     if _is_main_process(rank):
