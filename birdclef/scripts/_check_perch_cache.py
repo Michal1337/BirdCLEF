@@ -178,22 +178,36 @@ def main() -> None:
             "Either re-build the cache or point --sample-sub at the matching version."
         )
 
-    # Align Y_full to cache row order
-    if not set(meta["row_id"]).issubset(full_rows["row_id"]):
-        missing = set(meta["row_id"]) - set(full_rows["row_id"])
-        raise SystemExit(
-            f"{len(missing)} cache row_ids have no fully-labeled match. "
-            "Cache references partially-labeled files? Sample row_id missing: "
-            f"{sorted(missing)[:3]}"
-        )
-    # Build cache_row_idx → full_rows_idx, then index Y_full by it.
+    # The cache typically covers ALL soundscapes (labeled + unlabeled, ~10k
+    # files × 12 windows = ~125k rows). Only ~59 files are fully-labeled.
+    # Filter cache rows down to the fully-labeled subset before computing
+    # honest OOF — unlabeled rows have no GT and would only add noise.
     full_idx_by_row = dict(zip(full_rows["row_id"].astype(str), full_rows.index.tolist()))
-    cache_to_full = np.array([full_idx_by_row[str(r)] for r in meta["row_id"]], dtype=np.int64)
+    cache_row_ids = meta["row_id"].astype(str).to_numpy()
+    in_full = np.array([rid in full_idx_by_row for rid in cache_row_ids])
+    n_total = len(cache_row_ids)
+    n_kept = int(in_full.sum())
+    n_dropped = n_total - n_kept
+    print(f"[check] cache rows = {n_total}; fully-labeled rows kept = {n_kept}  "
+          f"(dropped {n_dropped} unlabeled-soundscape rows)")
+    if n_kept == 0:
+        raise SystemExit(
+            "No cache rows match the fully-labeled pool. Either the cache is "
+            "from a totally different sample_sub, or row_id formatting drifted."
+        )
+    if n_kept != len(full_rows):
+        # Some labeled files aren't represented in the cache — flag but don't fail.
+        print(f"[check] WARN: {len(full_rows) - n_kept} fully-labeled rows "
+              f"have no cache entry; AUC will skip those rows.")
+    sc_tr = sc_tr[in_full]
+    meta = meta.loc[in_full].reset_index(drop=True)
+    cache_to_full = np.array(
+        [full_idx_by_row[rid] for rid in meta["row_id"].astype(str)],
+        dtype=np.int64,
+    )
     Y_aligned = Y_full[cache_to_full]
     n_seen = int((Y_aligned.sum(axis=0) > 0).sum())
-
-    print(f"[check] cache rows = {len(meta)}; full-labeled rows = {len(full_rows)}")
-    print(f"[check] active classes in cache (≥1 positive) = {n_seen}/{n_classes}")
+    print(f"[check] active classes in evaluation subset (≥1 positive) = {n_seen}/{n_classes}")
     print()
 
     with warnings.catch_warnings():
