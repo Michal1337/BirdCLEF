@@ -44,9 +44,10 @@ def main() -> None:
     try:
         from onnxruntime.quantization import quantize_dynamic, QuantType
         from onnxruntime.quantization.shape_inference import quant_pre_process
+        import onnx
     except ImportError as e:
         raise SystemExit(
-            "onnxruntime.quantization not installed. `pip install onnxruntime`"
+            f"missing dep ({e.name}). `pip install onnxruntime onnx`"
         ) from e
 
     args.out_onnx.parent.mkdir(parents=True, exist_ok=True)
@@ -82,11 +83,33 @@ def main() -> None:
         import shutil
         shutil.copy(args.in_onnx, preprocessed)
 
-    # Step 2: dynamic quantize from the cleaned model.
-    print(f"[quant] step 2: dynamic quantization → {args.out_onnx}")
+    # Step 2: strip stale value_info before quantize_dynamic.
+    #
+    # quant_pre_process injects value_info entries for every initializer
+    # (~750 on the AST graph). At least one of those carries a stale shape
+    # that conflicts with what onnx.shape_inference computes, and
+    # quantize_dynamic's internal `save_and_reload_model_with_shape_infer`
+    # call then crashes with `Inferred shape and existing shape differ in
+    # dimension 0: (768) vs (234)` — the (234) is the freshly-init head's
+    # n_classes, the (768) is AST's hidden size.
+    #
+    # Clearing value_info forces shape inference to recompute from scratch
+    # without any conflicting hints. The fresh inference succeeds and the
+    # quantizer is happy.
+    stripped = args.out_onnx.with_suffix(".stripped.onnx")
+    print(f"[quant] step 2: strip stale value_info → {stripped}")
+    m = onnx.load(str(preprocessed), load_external_data=False)
+    n_before = len(m.graph.value_info)
+    del m.graph.value_info[:]
+    m_inf = onnx.shape_inference.infer_shapes(m, check_type=False, strict_mode=True, data_prop=True)
+    print(f"[quant]   value_info: {n_before} → {len(m_inf.graph.value_info)} (recomputed fresh)")
+    onnx.save(m_inf, str(stripped))
+
+    # Step 3: dynamic quantize from the cleaned model.
+    print(f"[quant] step 3: dynamic quantization → {args.out_onnx}")
     print(f"[quant]   weight_type=QInt8 (activations stay FP32)")
     quantize_dynamic(
-        model_input=str(preprocessed),
+        model_input=str(stripped),
         model_output=str(args.out_onnx),
         weight_type=QuantType.QInt8,
         # per_channel=True for slightly better accuracy on the large
@@ -98,16 +121,25 @@ def main() -> None:
         reduce_range=True,
     )
 
-    # Clean up the preprocessed intermediate (it can be ~330 MB).
-    try:
-        preprocessed.unlink()
-        for p in preprocessed.parent.glob(preprocessed.stem + ".data"):
-            # large external-data file from shape-inference may be there too
-            p.unlink()
-    except Exception:
-        pass
-    in_mb = args.in_onnx.stat().st_size / 1024**2
-    out_mb = args.out_onnx.stat().st_size / 1024**2
+    # Clean up the intermediate files (each ~330 MB).
+    for tmp in (preprocessed, stripped):
+        try:
+            tmp.unlink()
+            for p in tmp.parent.glob(tmp.stem + ".data"):
+                p.unlink()
+        except Exception:
+            pass
+    # Size accounting: torch.onnx.export with external_data leaves weights
+    # in a sidecar `model.onnx.data` file, so the bare .onnx is tiny. Sum
+    # the sidecar to report a fair before/after.
+    def _onnx_total_size(p: Path) -> float:
+        sz = p.stat().st_size
+        for sib in p.parent.iterdir():
+            if sib.name.startswith(p.stem + ".") and sib.suffix == ".data":
+                sz += sib.stat().st_size
+        return sz / 1024**2
+    in_mb = _onnx_total_size(args.in_onnx)
+    out_mb = _onnx_total_size(args.out_onnx)
     print(f"[quant] sizes: fp32 {in_mb:.1f} MB → int8 {out_mb:.1f} MB  "
           f"({(1 - out_mb/in_mb)*100:.0f}% smaller)")
 
