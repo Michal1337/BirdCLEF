@@ -18,13 +18,17 @@ Search space: for each taxon, sweep weight combinations on a coarse grid
 1-D sweep; for 3 members a 2-D triangle; for N members a Dirichlet grid.
 Coarse step is intentional — finer grids overfit val with so few rows.
 
-Inputs (default Locations match _07b_dump_oof_probs + _08c_dump_ast_val):
-    outputs/blend_search/oof/ssm_probs.npz  → SSM stitched OOF predictions
-    outputs/blend_search/oof/ast_probs.npz  → AST val predictions
-    outputs/blend_search/oof/y_true.npy     → ground truth (uint8)
-    outputs/blend_search/oof/meta.parquet   → row metadata; needs `fold` +
-                                              `fold_kind` columns for
-                                              mean-of-folds metric
+Inputs (per-CV directories — pass via --oof-dir or override individually):
+    outputs/blend_search/oof_<kind>/ssm_probs.npz  → SSM stitched OOF probs
+    outputs/blend_search/oof_<kind>/y_true.npy     → ground truth (uint8)
+    outputs/blend_search/oof_<kind>/meta.parquet   → row metadata; needs
+                                                     `fold` + `fold_kind`
+                                                     columns for mean_of_folds
+    outputs/blend_search/oof_<kind>/ast_probs.npz  → AST probs (row-aligned)
+
+Where `<kind>` is one of strat, site, sitedate. Default --oof-dir is
+oof_strat (best LB-correlated for this competition); pass --oof-dir
+.../oof_sitedate to compare under a stricter scheme without re-dumping.
 
 Run:
     # rebuild OOF inputs with fold info under the desired CV scheme
@@ -132,10 +136,17 @@ def main() -> None:
     ap.add_argument("--members", nargs="+", required=True,
                     help="member specs as name:path.npz (e.g. ssm:outputs/.../ssm_probs.npz "
                          "ast:outputs/.../ast_probs.npz). Each .npz must have 'probs' key.")
-    ap.add_argument("--y-true", type=Path,
-                    default=OUTPUT_ROOT / "blend_search" / "oof" / "y_true.npy")
-    ap.add_argument("--meta", type=Path,
-                    default=OUTPUT_ROOT / "blend_search" / "oof" / "meta.parquet")
+    ap.add_argument("--oof-dir", type=Path, default=None,
+                    help="Convenience: directory containing y_true.npy + "
+                         "meta.parquet (e.g. .../oof_strat). Used as the "
+                         "default for --y-true / --meta if not given. "
+                         "Defaults to .../blend_search/oof_strat/.")
+    ap.add_argument("--y-true", type=Path, default=None,
+                    help="Override path to y_true.npy. Default: "
+                         "<oof-dir>/y_true.npy")
+    ap.add_argument("--meta", type=Path, default=None,
+                    help="Override path to meta.parquet. Default: "
+                         "<oof-dir>/meta.parquet")
     ap.add_argument("--step", type=float, default=0.1,
                     help="Grid step on the simplex. Default 0.1 = coarse "
                          "(11 points per axis for 2 members). Lower = finer "
@@ -157,6 +168,15 @@ def main() -> None:
                     help="Output: per-taxon weights JSON.")
     args = ap.parse_args()
 
+    # Resolve OOF artifact paths. --oof-dir is the convenience knob; explicit
+    # --y-true / --meta override it. Default base dir is oof_strat (the kind
+    # that empirically tracks LB best).
+    oof_dir = args.oof_dir or (OUTPUT_ROOT / "blend_search" / "oof_strat")
+    if args.y_true is None:
+        args.y_true = oof_dir / "y_true.npy"
+    if args.meta is None:
+        args.meta = oof_dir / "meta.parquet"
+
     members = [_parse_member_arg(m) for m in args.members]
     if len(members) < 2:
         raise SystemExit("Need ≥2 members for a blend search")
@@ -165,7 +185,9 @@ def main() -> None:
             raise SystemExit(f"Missing prob file for member {name!r}: {path}")
     if not args.y_true.exists() or not args.meta.exists():
         raise SystemExit(
-            f"Missing y_true or meta. Run _07b_dump_oof_probs first.\n"
+            f"Missing y_true or meta in {oof_dir}. Run "
+            f"`_07b_dump_oof_probs --fold-kind <kind>` first to populate "
+            f"`birdclef/outputs/blend_search/oof_<kind>/`.\n"
             f"  y_true: {args.y_true}\n  meta:   {args.meta}"
         )
 

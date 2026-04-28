@@ -1,19 +1,31 @@
-"""Dump stitched-OOF probability arrays for blend-weight search via _08_ensemble.py.
+"""Dump stitched-OOF probability arrays for blend-weight search via _09_blend_search.
 
 Two members are emitted, both aligned row-for-row to the labeled soundscape
 rows in the Perch cache (all 59 fully-labeled files × 12 windows = 708 rows):
 
     {out_dir}/ssm_probs.npz   {"probs": (N, C) float32}
-    {out_dir}/sed_probs.npz   {"probs": (N, C) float32}
+    {out_dir}/sed_probs.npz   {"probs": (N, C) float32}    (optional)
     {out_dir}/y_true.npy      (N, C) uint8
-    {out_dir}/meta.parquet    columns: row_id, filename, site, hour_utc
+    {out_dir}/meta.parquet    cols: row_id, filename, site, hour_utc, fold,
+                                    fold_kind
 
-Then the existing _08_ensemble.py search runs:
+Default `out_dir` is `birdclef/outputs/blend_search/oof_<fold-kind>/`, so
+you can re-run with different `--fold-kind` values without clobbering prior
+dumps. Pass `--out-dir` to override.
 
-    python -m birdclef.scripts._08_ensemble \
-        --members .../ssm_probs.npz .../sed_probs.npz \
-        --y-true  .../y_true.npy \
-        --meta    .../meta.parquet --step 0.05
+Row order is sorted by (filename, end_sec) and is independent of fold-kind,
+so AST/CNN prob dumps produced against any one of the per-kind dirs stay
+row-aligned to the others — copy a single ast_probs.npz between dirs if you
+want to compare blend search across CV schemes without re-running AST
+inference.
+
+Run examples:
+
+    # filename-stratified (LB-correlated default)
+    python -m birdclef.scripts._07b_dump_oof_probs --fold-kind strat
+
+    # site-aware (stricter; sitedate balances better than pure site)
+    python -m birdclef.scripts._07b_dump_oof_probs --fold-kind sitedate
 
 How the OOF members are computed:
 - SSM: for each fold i, train the SSM pipeline on n-1 folds and predict on
@@ -21,10 +33,8 @@ How the OOF members are computed:
 - SED: load each fold's `best.pt` ONNX, predict on that fold's val files,
   concatenate. Each row predicted by the model that didn't see that file.
 
-Both members produce honest stitched-OOF predictions for every labeled row.
-The blend search then picks weights that maximize macro AUC on those 708
-rows. With 3.5x more samples than the old V-anchor dump, the weight estimate
-is much less noisy.
+The blend search then picks weights that maximize either stitched macro AUC
+or mean-of-folds macro AUC (the LB-correlated default) over those 708 rows.
 """
 from __future__ import annotations
 
@@ -221,10 +231,15 @@ def main():
     ap.add_argument("--ssm-config-name", default="oof_dump",
                     help="Name stamped on the SSM run (for log filenames). "
                          "Hyperparameters come from BASELINE in ssm_configs.py.")
-    ap.add_argument("--out-dir",
-                    default=str(OUTPUT_ROOT / "blend_search" / "oof"),
-                    help="Where to write ssm_probs.npz [, sed_probs.npz], y_true.npy, meta.parquet")
+    ap.add_argument("--out-dir", default=None,
+                    help="Where to write ssm_probs.npz [, sed_probs.npz], "
+                         "y_true.npy, meta.parquet. Default: "
+                         "birdclef/outputs/blend_search/oof_<fold-kind>/ "
+                         "(auto-suffixed by --fold-kind so different CV "
+                         "schemes don't clobber each other).")
     args = ap.parse_args()
+    if args.out_dir is None:
+        args.out_dir = str(OUTPUT_ROOT / "blend_search" / f"oof_{args.fold_kind}")
 
     sed_paths: List[str] = []
     if args.sed_onnx:
