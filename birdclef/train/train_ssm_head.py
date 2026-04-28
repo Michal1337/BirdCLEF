@@ -60,13 +60,34 @@ class PerchCache:
     labeled_mask: np.ndarray # (N,) bool
 
 
-def load_perch_cache() -> PerchCache:
+def load_perch_cache(apply_proxy: bool = True) -> PerchCache:
+    """Load the Perch cache from disk.
+
+    apply_proxy: if True (default) and the cache contains a `scores_proxy`
+        array, add it onto `scores_full_raw` so the resulting `cache.scores`
+        has the genus-max fill applied at unmapped Aves/Amphibia/Insecta
+        positions — this matches the legacy behaviour the SSM stack relies
+        on for ~+0.01 OOF macro-AUC. Set False when an experiment wants the
+        pure direct-mapped Perch logits (e.g., to ablate the proxy or
+        baseline raw Perch).
+
+    Older cache npz files that lack `scores_proxy` are still supported —
+    `apply_proxy=True` is silently a no-op (the proxy was already baked into
+    `scores_full_raw` when the old cache was built). For the same reason,
+    `apply_proxy=False` does NOT un-bake the proxy on old caches; rebuild
+    via `build_perch_cache.py` to get an honest pure-direct artifact.
+    """
+    from birdclef.models.perch import apply_proxy_to_scores
+
     meta = pd.read_parquet(PERCH_META)
     arr = np.load(PERCH_NPZ)
     scores = arr["scores_full_raw"].astype(np.float32)
     emb = arr["emb_full"].astype(np.float32)
     Y = np.load(PERCH_LABELS)
     labeled = meta["is_labeled"].astype(bool).to_numpy()
+    if apply_proxy and "scores_proxy" in arr.files:
+        scores_proxy = arr["scores_proxy"].astype(np.float32)
+        scores = apply_proxy_to_scores(scores, scores_proxy)
     return PerchCache(meta=meta, scores=scores, emb=emb, Y=Y, labeled_mask=labeled)
 
 
@@ -695,7 +716,10 @@ def run_full_evaluation(cfg: dict) -> Dict:
     """
     base_seed = int(cfg.get("seed", 42))
     seed_everything(base_seed)
-    cache = load_perch_cache()
+    # cfg["use_perch_proxy"] = True (default) preserves legacy SSM behaviour;
+    # set False to ablate the genus-proxy fill and run on pure direct-mapped
+    # Perch logits (the same numbers a public-notebook 0.729 baseline uses).
+    cache = load_perch_cache(apply_proxy=bool(cfg.get("use_perch_proxy", True)))
 
     # Optional: extend the training pool with pseudo-labeled unlabeled rows.
     # cfg["pseudo_round"] = None (default) → behavior unchanged.

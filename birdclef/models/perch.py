@@ -125,7 +125,19 @@ def run_perch(
 ):
     """Run Perch ONNX over a list of 60 s OGG paths.
 
-    Returns (meta_df, scores[N*12, C], embs[N*12, 1536]).
+    Returns (meta_df, scores[N*12, C], embs[N*12, 1536], scores_proxy[N*12, C]).
+
+    Score arrays are disjoint by construction — `scores` holds only direct
+    sci_name → Perch logit values (zeros at unmapped positions), and
+    `scores_proxy` holds only the genus-max fill at the proxy positions
+    (zeros everywhere else). To get the legacy "proxy-baked-in" tensor
+    consumers used to consume from `cache.scores`, simply add them:
+
+        full = scores + scores_proxy
+
+    Keeping them separate lets each experiment decide whether to use the
+    proxy without rerunning Perch, and keeps the on-disk cache honest about
+    what's a direct measurement vs a derived genus aggregate.
     """
     from birdclef.data.soundscapes import parse_fname
 
@@ -137,7 +149,7 @@ def run_perch(
         mapping = build_label_mapping()
     mapped_pos = mapping["mapped_pos"]
     mapped_bc = mapping["mapped_bc"]
-    proxy_map = mapping["proxy_map"]
+    proxy_map = mapping.get("proxy_map", {})
 
     input_name = session.get_inputs()[0].name
     out_map = {o.name: i for i, o in enumerate(session.get_outputs())}
@@ -150,7 +162,12 @@ def run_perch(
     dates = np.empty(n_rows, dtype=object)
     hours = np.zeros(n_rows, dtype=np.int16)
     scores = np.zeros((n_rows, n_classes), dtype=np.float32)
+    scores_proxy = np.zeros((n_rows, n_classes), dtype=np.float32)
     embs = np.zeros((n_rows, 1536), dtype=np.float32)
+    # Pre-flatten the proxy_map into parallel arrays so we can apply it with
+    # one max() per Perch batch, no Python loop in the hot path.
+    proxy_target_pos = np.array(sorted(proxy_map.keys()), dtype=np.int32) if proxy_map else np.empty(0, dtype=np.int32)
+    proxy_bc_arrs = [np.asarray(proxy_map[int(p)], dtype=np.int32) for p in proxy_target_pos]
 
     wr = 0
     it = range(0, len(paths), batch_files)
@@ -185,9 +202,11 @@ def run_perch(
             emb = outs[out_map["embedding"]].astype(np.float32)
             scores[br:wr, mapped_pos] = logits[:, mapped_bc]
             embs[br:wr] = emb
-            for pos_idx, bc_idxs in proxy_map.items():
-                bc_arr = np.asarray(bc_idxs, dtype=np.int32)
-                scores[br:wr, pos_idx] = logits[:, bc_arr].max(axis=1)
+            # Genus-proxy fill: store separately, NOT merged into `scores`.
+            # Computed inline because we need access to the full Perch logit
+            # tensor `logits`, which is discarded after this loop.
+            for tgt_pos, bc_arr in zip(proxy_target_pos, proxy_bc_arrs):
+                scores_proxy[br:wr, int(tgt_pos)] = logits[:, bc_arr].max(axis=1)
     meta_df = pd.DataFrame(
         {
             "row_id": row_ids,
@@ -197,4 +216,24 @@ def run_perch(
             "hour_utc": hours,
         }
     )
-    return meta_df, scores, embs
+    return meta_df, scores, embs, scores_proxy
+
+
+def apply_proxy_to_scores(scores: np.ndarray, scores_proxy: np.ndarray) -> np.ndarray:
+    """Add the genus-proxy fill into a direct-mapped scores tensor.
+
+    scores         (N, C) float32 — direct sci_name → Perch logits, unmapped at 0
+    scores_proxy   (N, C) float32 — genus-max fill at proxy target columns,
+                                    zeros everywhere else (disjoint from
+                                    direct-mapped positions by construction)
+
+    Returns a NEW array (does not mutate input). Use this in any experiment
+    that wants the legacy "proxy-baked-in" semantics — historically the
+    SSM stack relied on this for ~92 unmapped Aves/Amphibia/Insecta classes
+    and it lifted OOF macro-AUC by ~0.01.
+    """
+    if scores.shape != scores_proxy.shape:
+        raise ValueError(
+            f"shape mismatch: scores {scores.shape} vs scores_proxy {scores_proxy.shape}"
+        )
+    return scores + scores_proxy
