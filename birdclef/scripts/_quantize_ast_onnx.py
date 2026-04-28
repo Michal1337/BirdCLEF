@@ -54,20 +54,33 @@ def main() -> None:
     # Step 1: pre-process. The exported ONNX from torch.onnx.export often
     # has stale or incomplete shape annotations on tensors whose shape was
     # introduced by reshape/squeeze ops (e.g. the freshly-init 234-class
-    # classifier head). The quantizer's shape inference fails on those
-    # mismatches with a confusing "(768) vs (234)" error. quant_pre_process
-    # runs symbolic shape inference + constant folding + small graph
-    # optimizations to clean it up before quantization.
+    # classifier head). quant_pre_process runs constant folding + light
+    # graph optimizations + ONNX's regular shape inference to clean it up.
+    #
+    # We skip ONNX Runtime's *symbolic* shape inference because it fails
+    # on HuggingFace transformer exports — its Concat/Reshape inference
+    # is strict about merging int dims that the export doesn't always
+    # agree on (raises an AssertionError on `_merge_symbols`). The
+    # regular onnx.shape_inference is enough for the quantizer's needs.
     preprocessed = args.out_onnx.with_suffix(".preprocessed.onnx")
     print(f"[quant] step 1: quant_pre_process → {preprocessed}")
-    quant_pre_process(
-        input_model=str(args.in_onnx),
-        output_model_path=str(preprocessed),
-        skip_optimization=False,
-        skip_onnx_shape=False,
-        skip_symbolic_shape=False,
-        auto_merge=True,
-    )
+    try:
+        quant_pre_process(
+            input_model=str(args.in_onnx),
+            output_model_path=str(preprocessed),
+            skip_optimization=False,
+            skip_onnx_shape=False,
+            skip_symbolic_shape=True,    # known-bad on HF transformer exports
+            auto_merge=True,
+        )
+    except Exception as e:
+        # Last-resort fallback: no preprocessing. Quantizer's shape inference
+        # may still fail, but worth trying — sometimes onnx_shape alone
+        # is enough.
+        print(f"[quant] WARN: quant_pre_process failed ({e}). "
+              f"Falling back to in-place input ONNX (no preprocessing).")
+        import shutil
+        shutil.copy(args.in_onnx, preprocessed)
 
     # Step 2: dynamic quantize from the cleaned model.
     print(f"[quant] step 2: dynamic quantization → {args.out_onnx}")
