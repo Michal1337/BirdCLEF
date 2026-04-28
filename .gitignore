@@ -16,3 +16,4 @@ __pycache__
 *.pt
 local_test/
 birdclef/cache/
+.claude
