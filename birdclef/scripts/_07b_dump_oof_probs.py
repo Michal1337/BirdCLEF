@@ -87,13 +87,29 @@ def _dump_ssm(out_dir: Path, ssm_config_name: str, n_splits: int,
     print(f"[ssm-oof] loading Perch cache; cleaned config '{cfg['name']}', "
           f"n_splits={n_splits}, fold_kind={fold_kind}")
     cache = load_perch_cache()
+    # Match the LB-notebook / sweep-runner pattern: explicit proxy merge
+    # right after the load, before any downstream consumer touches scores.
+    # Default on; flip to False in cfg to dump pure direct-mapped OOF.
+    if bool(cfg.get("use_perch_proxy", True)):
+        from birdclef.models.perch import apply_proxy_to_scores
+        cache.scores = apply_proxy_to_scores(cache.scores, cache.scores_proxy)
     labeled_idx = np.where(cache.labeled_mask)[0]
     cache_meta = cache.meta.iloc[labeled_idx].reset_index(drop=True)
     cache_scores = cache.scores[labeled_idx]
     cache_emb = cache.emb[labeled_idx]
     cache_Y = cache.Y[labeled_idx]
-    cache_sub = PerchCache(meta=cache_meta, scores=cache_scores, emb=cache_emb,
-                           Y=cache_Y, labeled_mask=np.ones(len(cache_meta), dtype=bool))
+    # Subset cache: proxy is already merged into cache_scores upstream (or
+    # was never wanted), so the subset's `scores_proxy` is all-zero — any
+    # downstream code that touches `cache_sub.scores_proxy` will see "no
+    # extra fill to apply" and won't re-add the proxy.
+    cache_sub = PerchCache(
+        meta=cache_meta,
+        scores=cache_scores,
+        scores_proxy=np.zeros_like(cache_scores),
+        emb=cache_emb,
+        Y=cache_Y,
+        labeled_mask=np.ones(len(cache_meta), dtype=bool),
+    )
 
     tax = load_taxonomy()
     class_map = tax.set_index("primary_label")["class_name"].to_dict()

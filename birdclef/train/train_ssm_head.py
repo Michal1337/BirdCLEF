@@ -53,42 +53,51 @@ def sigmoid_np(x: np.ndarray) -> np.ndarray:
 
 @dataclass
 class PerchCache:
-    meta: pd.DataFrame       # one row per 5 s window
-    scores: np.ndarray       # (N, C) Perch logits mapped to BirdCLEF classes
-    emb: np.ndarray          # (N, 1536) embeddings
-    Y: np.ndarray            # (N, C) uint8, zeros for unlabeled rows
-    labeled_mask: np.ndarray # (N,) bool
+    meta: pd.DataFrame             # one row per 5 s window
+    scores: np.ndarray             # (N, C) raw direct-mapped Perch logits;
+                                   # zero at unmapped positions
+    scores_proxy: np.ndarray       # (N, C) genus-max fill at proxy target
+                                   # columns; zero everywhere else.
+                                   # All-zero on legacy caches that pre-baked
+                                   # the proxy into `scores`.
+    emb: np.ndarray                # (N, 1536) embeddings
+    Y: np.ndarray                  # (N, C) uint8, zeros for unlabeled rows
+    labeled_mask: np.ndarray       # (N,) bool
 
 
-def load_perch_cache(apply_proxy: bool = True) -> PerchCache:
-    """Load the Perch cache from disk.
+def load_perch_cache() -> PerchCache:
+    """Load the Perch cache from disk. No score merging happens here.
 
-    apply_proxy: if True (default) and the cache contains a `scores_proxy`
-        array, add it onto `scores_full_raw` so the resulting `cache.scores`
-        has the genus-max fill applied at unmapped Aves/Amphibia/Insecta
-        positions — this matches the legacy behaviour the SSM stack relies
-        on for ~+0.01 OOF macro-AUC. Set False when an experiment wants the
-        pure direct-mapped Perch logits (e.g., to ablate the proxy or
-        baseline raw Perch).
+    Returns both arrays separately:
+      cache.scores         — direct-mapped Perch logits only.
+      cache.scores_proxy   — genus-max proxy fill (zeros if the cache
+                             pre-dates the new format, since legacy caches
+                             baked the proxy into `scores`).
 
-    Older cache npz files that lack `scores_proxy` are still supported —
-    `apply_proxy=True` is silently a no-op (the proxy was already baked into
-    `scores_full_raw` when the old cache was built). For the same reason,
-    `apply_proxy=False` does NOT un-bake the proxy on old caches; rebuild
-    via `build_perch_cache.py` to get an honest pure-direct artifact.
+    Each downstream experiment is responsible for deciding whether to apply
+    the proxy. The canonical merge is `apply_proxy_to_scores(scores,
+    scores_proxy)` — i.e. element-wise sum, since the two arrays are
+    disjoint by construction. The LB notebook (cell 6) and the SSM sweep
+    runner do this merge themselves at their own load-equivalent stage.
+
+    Legacy caches without `scores_proxy` get an all-zero placeholder so
+    consumers can still call `apply_proxy_to_scores` unconditionally and
+    get the same tensor they used to get.
     """
-    from birdclef.models.perch import apply_proxy_to_scores
-
     meta = pd.read_parquet(PERCH_META)
     arr = np.load(PERCH_NPZ)
     scores = arr["scores_full_raw"].astype(np.float32)
     emb = arr["emb_full"].astype(np.float32)
     Y = np.load(PERCH_LABELS)
     labeled = meta["is_labeled"].astype(bool).to_numpy()
-    if apply_proxy and "scores_proxy" in arr.files:
+    if "scores_proxy" in arr.files:
         scores_proxy = arr["scores_proxy"].astype(np.float32)
-        scores = apply_proxy_to_scores(scores, scores_proxy)
-    return PerchCache(meta=meta, scores=scores, emb=emb, Y=Y, labeled_mask=labeled)
+    else:
+        scores_proxy = np.zeros_like(scores)
+    return PerchCache(
+        meta=meta, scores=scores, scores_proxy=scores_proxy,
+        emb=emb, Y=Y, labeled_mask=labeled,
+    )
 
 
 def _site2i(meta: pd.DataFrame, cap: int) -> dict:
@@ -701,8 +710,18 @@ def _augment_cache_with_pseudo(
           f"pseudo={n_pseudo_rows} ({n_pseudo_files} files)  "
           f"pseudo-positives={n_pseudo_pos}  "
           f"τ={pseudo_tau}  round={pseudo_round}")
-    return PerchCache(meta=aug_meta, scores=aug_scores, emb=aug_emb,
-                      Y=aug_Y, labeled_mask=aug_labeled_mask)
+    # The augmented cache's scores already include whatever proxy decision
+    # the caller made upstream (proxy merged at load stage, or pure direct).
+    # Pass an all-zero scores_proxy to satisfy the dataclass invariant — no
+    # further merge is needed downstream.
+    return PerchCache(
+        meta=aug_meta,
+        scores=aug_scores,
+        scores_proxy=np.zeros_like(aug_scores),
+        emb=aug_emb,
+        Y=aug_Y,
+        labeled_mask=aug_labeled_mask,
+    )
 
 
 def run_full_evaluation(cfg: dict) -> Dict:
@@ -716,10 +735,16 @@ def run_full_evaluation(cfg: dict) -> Dict:
     """
     base_seed = int(cfg.get("seed", 42))
     seed_everything(base_seed)
-    # cfg["use_perch_proxy"] = True (default) preserves legacy SSM behaviour;
-    # set False to ablate the genus-proxy fill and run on pure direct-mapped
-    # Perch logits (the same numbers a public-notebook 0.729 baseline uses).
-    cache = load_perch_cache(apply_proxy=bool(cfg.get("use_perch_proxy", True)))
+    cache = load_perch_cache()
+    # Apply the genus-proxy fill at the same stage the LB notebook does
+    # (cell 6 / 8 in cand.ipynb / LB_0931_seed.ipynb — right after reading
+    # the cache off disk and before any downstream consumer touches the
+    # scores). cfg["use_perch_proxy"] = True is the default so legacy SSM
+    # behaviour is preserved; set False to ablate and baseline on pure
+    # direct-mapped Perch logits (the public-notebook 0.729 number).
+    if bool(cfg.get("use_perch_proxy", True)):
+        from birdclef.models.perch import apply_proxy_to_scores
+        cache.scores = apply_proxy_to_scores(cache.scores, cache.scores_proxy)
 
     # Optional: extend the training pool with pseudo-labeled unlabeled rows.
     # cfg["pseudo_round"] = None (default) → behavior unchanged.
@@ -740,8 +765,17 @@ def run_full_evaluation(cfg: dict) -> Dict:
     cache_scores = cache.scores[labeled_idx]
     cache_emb = cache.emb[labeled_idx]
     cache_Y = cache.Y[labeled_idx]
-    cache_sub = PerchCache(meta=cache_meta, scores=cache_scores, emb=cache_emb,
-                           Y=cache_Y, labeled_mask=np.ones(len(cache_meta), dtype=bool))
+    # `cache_scores` already reflects the proxy decision (merged or not) made
+    # at the load stage above. Subset's `scores_proxy` is zero so no
+    # downstream code re-applies it.
+    cache_sub = PerchCache(
+        meta=cache_meta,
+        scores=cache_scores,
+        scores_proxy=np.zeros_like(cache_scores),
+        emb=cache_emb,
+        Y=cache_Y,
+        labeled_mask=np.ones(len(cache_meta), dtype=bool),
+    )
 
     # Temperature vector
     from birdclef.data.soundscapes import load_taxonomy

@@ -194,6 +194,12 @@ def pseudo_label_with_ssm_pipeline(
 
     print(f"[pseudo:ssm] loading Perch cache...")
     cache = load_perch_cache()
+    # Apply genus-proxy fill at the load stage (matches LB notebook + SSM
+    # sweep). Defaults on, set teacher_cfg["use_perch_proxy"] = False to
+    # ablate.
+    if bool(teacher_cfg.get("use_perch_proxy", True)):
+        from birdclef.models.perch import apply_proxy_to_scores
+        cache.scores = apply_proxy_to_scores(cache.scores, cache.scores_proxy)
     n_rows, n_classes = cache.scores.shape
 
     is_labeled = cache.labeled_mask
