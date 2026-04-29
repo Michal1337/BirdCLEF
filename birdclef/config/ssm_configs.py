@@ -118,3 +118,14 @@ SWEEP_BEST_SSM = [
     _make(name="proto_long_prior_strong",
           proto_n_epochs=80, proto_patience=20, lambda_prior=0.60),
 ]
+
+
+# Noise-floor sweep — runs the BASELINE under multiple seeds so the std of
+# mean-of-folds AUCs across seeds is the per-config measurement noise (σ).
+# That σ is the threshold below which any "best vs baseline" gap in the
+# regular SWEEP_BEST_SSM is statistical noise, not real hyperparameter
+# signal. Run this BEFORE committing compute to a multi-seed full sweep.
+NOISE_FLOOR_SEEDS = (42, 7, 13, 21, 99)
+SWEEP_NOISE_FLOOR = [
+    _make(name=f"baseline_s{s}", seed=int(s)) for s in NOISE_FLOOR_SEEDS
+]
