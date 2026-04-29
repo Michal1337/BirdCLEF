@@ -219,12 +219,20 @@ def prepare_pseudo_soundscape_metadata(
     keep_mask: np.ndarray,
     soundscape_dir: Path,
     require_kept_positive: bool = True,
+    exclude_filenames: Optional[set[str]] = None,
 ) -> pd.DataFrame:
     """Build BirdCLEFDataset-compatible rows for every (file, window) in the
     pseudo cache, with `pseudo_row` indexing into the (probs, keep_mask) arrays.
 
     require_kept_positive: drop rows whose keep_mask is entirely zero — those
     contribute no gradient and just bloat the loader.
+
+    exclude_filenames: drop pseudo rows whose filename is in this set. CRITICAL
+    when the val pool overlaps with the pseudo cache — pass the set of
+    val-pool filenames to prevent training on val audio (the teacher
+    over-fits its own training rows; using those as pseudo-targets and
+    evaluating on the same audio is a leak that inflates val AUC by
+    +0.10-0.15).
     """
     if "filename" not in pseudo_meta.columns or "window" not in pseudo_meta.columns:
         raise ValueError(
@@ -238,6 +246,14 @@ def prepare_pseudo_soundscape_metadata(
         df = df[any_kept[df["pseudo_row"].to_numpy()]].reset_index(drop=True)
 
     df["filename"] = df["filename"].astype(str)
+    if exclude_filenames:
+        before = len(df)
+        df = df[~df["filename"].isin(set(exclude_filenames))].reset_index(drop=True)
+        # Caller log: how many rows we cut. The kept count should equal
+        # (eligible_files - val_files) × N_WINDOWS_PER_FILE before any
+        # require_kept_positive filtering trims further.
+        print(f"[pseudo] excluded {before - len(df)} pseudo rows whose "
+              f"filename was in val pool (leak prevention)")
     df["window"] = df["window"].astype(int).clip(0, N_WINDOWS_PER_FILE - 1)
     df["start"] = df["window"].map(lambda w: _format_seconds(int(w) * WINDOW_SECONDS))
     df["end"] = df["window"].map(lambda w: _format_seconds(int(w + 1) * WINDOW_SECONDS))

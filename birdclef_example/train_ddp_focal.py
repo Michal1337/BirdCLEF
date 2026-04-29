@@ -661,9 +661,19 @@ def main() -> None:
         pseudo_probs, pseudo_keep, pseudo_meta_df, pseudo_info = load_pseudo_round(
             pseudo_dir, int(args.pseudo_round),
         )
+        # Read the val pool filenames first so we can exclude them from the
+        # pseudo train pool. Without this, pseudo rows for the labeled
+        # soundscapes leak into training and inflate val AUC by +0.10-0.15
+        # (teacher over-fits labeled rows; student mimics → val ≈ teacher
+        # train-fit, not honest generalization).
+        _val_soundscape_df = pd.read_csv(soundscape_labels_path)
+        _val_pool_filenames = set(
+            _val_soundscape_df["filename"].astype(str).unique().tolist()
+        )
         pseudo_train_meta = prepare_pseudo_soundscape_metadata(
             pseudo_meta_df, pseudo_keep, train_soundscape_dir,
             require_kept_positive=True,
+            exclude_filenames=_val_pool_filenames,
         )
         existing = pseudo_train_meta["audio_filepath"].apply(lambda p: Path(p).exists())
         pseudo_train_meta = pseudo_train_meta[existing].reset_index(drop=True)
