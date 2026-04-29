@@ -841,7 +841,7 @@ def main() -> None:
         dist.barrier()
 
     all_summaries: List[Dict[str, Any]] = []
-    for experiment in selected_exps[7:]:
+    for experiment in selected_exps:
         try:
             summary = run_one_experiment(
                 experiment=experiment,
