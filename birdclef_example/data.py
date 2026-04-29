@@ -21,6 +21,36 @@ from torch.utils.data import Dataset
 
 N_WINDOWS_PER_FILE = 12       # 12 × 5 s = 60 s soundscape file
 WINDOW_SECONDS = 5
+SOUNDSCAPE_SOURCES = {"pseudo_soundscape", "train_soundscapes"}
+
+
+def _try_load_soundscape_memmap():
+    """Best-effort load of birdclef/cache/soundscapes/soundscapes_f16_32k.npy.
+
+    Returns (memmap[n_files, FILE_SAMPLES], filename → row_idx dict, sr) or
+    (None, {}, 0) if the cache isn't built. Lets BirdCLEFDataset short-circuit
+    soundscape OGG decodes — a 100x speedup over per-call sf.read at random
+    access patterns when ~10k soundscapes are mixed into the train pool.
+    """
+    try:
+        from birdclef.config.paths import (
+            FILE_SAMPLES, SOUNDSCAPE_NPY, SOUNDSCAPE_INDEX, SR,
+        )
+    except Exception:
+        return None, {}, 0
+    if not SOUNDSCAPE_NPY.exists() or not SOUNDSCAPE_INDEX.exists():
+        return None, {}, 0
+    try:
+        store = np.load(SOUNDSCAPE_NPY, mmap_mode="r")
+        idx = pd.read_parquet(SOUNDSCAPE_INDEX)
+        if "ok" in idx.columns:
+            idx = idx[idx["ok"] == 1]
+        row_by_file = dict(
+            zip(idx["filename"].astype(str), idx["row_idx"].astype(int))
+        )
+        return store, row_by_file, int(SR)
+    except Exception:
+        return None, {}, 0
 
 
 PRIMARY_LABEL_SPLIT_RE = re.compile(r"[;,\s]+")
@@ -323,6 +353,20 @@ class BirdCLEFDataset(Dataset):
         self.preload_workers = max(1, preload_workers)
         self._audio_cache: OrderedDict[Path, Tensor] = OrderedDict()
 
+        # Fast path for soundscape rows (pseudo or labeled): an mmap'd
+        # float16 32 kHz array of every decoded soundscape. Avoids the
+        # OGG-decode-per-getitem cost that murders throughput when ~10k
+        # pseudo soundscapes are mixed into the train pool. Built by
+        # `python -m birdclef.cache.build_soundscape_cache`. If the cache
+        # isn't present, _sc_store stays None and we fall back to OGG decode.
+        self._sc_store, self._sc_row_by_file, self._sc_store_sr = _try_load_soundscape_memmap()
+        if self._sc_store is not None:
+            n_sc_in_meta = int(self.metadata["source"].isin(SOUNDSCAPE_SOURCES).sum()) \
+                if "source" in self.metadata.columns else 0
+            print(f"[BirdCLEFDataset] soundscape memmap fast path active "
+                  f"({len(self._sc_row_by_file)} files indexed; "
+                  f"{n_sc_in_meta} soundscape rows in this dataset's metadata)")
+
         # Pseudo plumbing. Both arrays must be set together — any None disables
         # the pseudo path and reverts to legacy 2-tuple output.
         self._pseudo_probs = pseudo_probs
@@ -403,6 +447,48 @@ class BirdCLEFDataset(Dataset):
                 self._audio_cache[filepath] = future.result()
 
     def _load_waveform(self, row: pd.Series) -> Tensor:
+        # Fast path for soundscape rows when the memmap cache is loaded.
+        # Bypasses OGG decode entirely — slices a (1, win_samples) view from
+        # the (n_files, FILE_SAMPLES) float16 mmap. Each soundscape sample
+        # becomes O(1) memcpy instead of an O(60s) sf.read + decode.
+        if (
+            self._sc_store is not None
+            and "source" in row.index
+            and str(row["source"]) in SOUNDSCAPE_SOURCES
+            and self.sample_rate == self._sc_store_sr
+        ):
+            filename = str(row["filename"])
+            sc_row = self._sc_row_by_file.get(filename)
+            if sc_row is not None:
+                start_time = row.get("start")
+                end_time = row.get("end")
+                if isinstance(start_time, str) and isinstance(end_time, str):
+                    s_off = int(_time_to_seconds(start_time) * self._sc_store_sr)
+                    e_off = int(_time_to_seconds(end_time)   * self._sc_store_sr)
+                else:
+                    # No explicit window range — fall back to a uniform random
+                    # 5s window inside the 60s file. Matches the OGG path's
+                    # `_sample_fixed_length_chunk` semantics.
+                    max_start = max(1, self._sc_store.shape[1] - self.segment_samples)
+                    s_off = int(torch.randint(0, max_start + 1, (1,)).item()
+                                if self.training else max_start // 2)
+                    e_off = s_off + self.segment_samples
+                # Clamp to memmap bounds + pad/truncate to segment_samples.
+                s_off = max(0, min(s_off, self._sc_store.shape[1]))
+                e_off = max(s_off + 1, min(e_off, self._sc_store.shape[1]))
+                slc = np.asarray(
+                    self._sc_store[sc_row, s_off:e_off], dtype=np.float32,
+                )
+                wave = torch.from_numpy(slc).unsqueeze(0)   # (1, T)
+                length = wave.size(1)
+                if length < self.segment_samples:
+                    wave = F.pad(wave, (0, self.segment_samples - length))
+                elif length > self.segment_samples:
+                    wave = wave[:, : self.segment_samples]
+                return wave.contiguous()
+
+        # Slow path: OGG decode + LRU cache. Used for focal recordings and
+        # any soundscape file the memmap doesn't index.
         filepath = Path(str(row["audio_filepath"]))
         if not filepath.exists():
             raise FileNotFoundError(f"Missing audio file {filepath}")
