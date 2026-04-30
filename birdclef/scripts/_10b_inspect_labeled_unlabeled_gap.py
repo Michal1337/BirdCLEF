@@ -3,7 +3,8 @@
 Three checks, each ~10s:
   1. Per-site composition: how labeled is each site?
   2. XGBoost feature importance: how concentrated is the discrimination?
-  3. Within-site adversarial AUC: site fingerprint vs deeper distributional gap.
+  3. Within-site adversarial AUC + accuracy: site fingerprint vs deeper
+     distributional gap.
 
 Usage:
     PYTHONIOENCODING=utf-8 python -m birdclef.scripts._10b_inspect_labeled_unlabeled_gap
@@ -103,9 +104,9 @@ def main() -> None:
     else:
         print("  → discrimination is broadly distributed. Deep distributional gap.")
 
-    # ── 3. Within-site adversarial AUC ─────────────────────────────
+    # ── 3. Within-site adversarial AUC + accuracy (S22 only) ───────
     print()
-    print("=== 3. Within-site adversarial AUC (S22 only) ===")
+    print("=== 3. Within-site adversarial AUC + accuracy (S22 only) ===")
     if "site" not in meta.columns:
         print("[inspect] no 'site' column; skipping.")
         return
@@ -119,38 +120,47 @@ def main() -> None:
     if n_s22_lab < 50 or n_s22_unlab < 50:
         print("  insufficient S22 unlabeled rows for adversarial val "
               "(need ≥50 of each). Skipping.")
+        return
+
+    Xs = emb[s22_mask]
+    ys = is_labeled[s22_mask].astype(np.int64) ^ 1   # 0=labeled, 1=unlabeled
+    skf = StratifiedKFold(5, shuffle=True, random_state=42)
+    aucs = []
+    accs = []
+    for tr, va in skf.split(Xs, ys):
+        cf = xgb.XGBClassifier(
+            n_estimators=300, max_depth=4, learning_rate=0.06,
+            subsample=0.8, colsample_bytree=0.7,
+            tree_method="hist", random_state=42, eval_metric="auc",
+        )
+        cf.fit(Xs[tr], ys[tr], verbose=False)
+        p = cf.predict_proba(Xs[va])[:, 1]
+        y_pred = (p >= 0.5).astype(np.int64)
+        aucs.append(roc_auc_score(ys[va], p))
+        accs.append(float((y_pred == ys[va]).mean()))
+    within_auc = float(np.mean(aucs))
+    within_acc = float(np.mean(accs))
+    print(f"  within-S22 adversarial AUC: {within_auc:.4f} ± {np.std(aucs):.4f}")
+    print(f"  within-S22 adversarial ACC: {within_acc:.4f} ± {np.std(accs):.4f}  "
+          f"(chance = 0.5; majority-class baseline = "
+          f"{max((ys==0).mean(), (ys==1).mean()):.4f})")
+    print()
+    if within_auc < 0.65:
+        print("  → within-site adv-AUC is LOW. The 0.99 cross-pool gap is mostly")
+        print("    SITE FINGERPRINT, not deep distributional difference. Once you")
+        print("    control for site, labeled and unlabeled audio look very similar.")
+        print("    Implication: site×date CV is fine; pseudo training is hurt by site")
+        print("    bias rather than fundamental domain mismatch.")
+    elif within_auc < 0.85:
+        print("  → moderate within-site gap. Both site fingerprint AND deeper")
+        print("    differences contribute. Filtering pseudo by labeled-likeness might")
+        print("    help by selecting unlabeled rows from sites/conditions similar to")
+        print("    labeled.")
     else:
-        Xs = emb[s22_mask]
-        ys = is_labeled[s22_mask].astype(np.int64) ^ 1   # 0=labeled, 1=unlabeled
-        skf = StratifiedKFold(5, shuffle=True, random_state=42)
-        aucs = []
-        for tr, va in skf.split(Xs, ys):
-            cf = xgb.XGBClassifier(
-                n_estimators=300, max_depth=4, learning_rate=0.06,
-                subsample=0.8, colsample_bytree=0.7,
-                tree_method="hist", random_state=42, eval_metric="auc",
-            )
-            cf.fit(Xs[tr], ys[tr], verbose=False)
-            aucs.append(roc_auc_score(ys[va], cf.predict_proba(Xs[va])[:, 1]))
-        within_auc = float(np.mean(aucs))
-        print(f"  within-S22 adversarial AUC: {within_auc:.4f} ± {np.std(aucs):.4f}")
-        print()
-        if within_auc < 0.65:
-            print("  → within-site adv-AUC is LOW. The 0.99 cross-pool gap is mostly")
-            print("    SITE FINGERPRINT, not deep distributional difference. Once you")
-            print("    control for site, labeled and unlabeled audio look very similar.")
-            print("    Implication: site×date CV is fine; pseudo training is hurt by site")
-            print("    bias rather than fundamental domain mismatch.")
-        elif within_auc < 0.85:
-            print("  → moderate within-site gap. Both site fingerprint AND deeper")
-            print("    differences contribute. Filtering pseudo by labeled-likeness might")
-            print("    help by selecting unlabeled rows from sites/conditions similar to")
-            print("    labeled.")
-        else:
-            print("  → within-site gap is also high. Even within S22, labeled and unlabeled")
-            print("    are distinct — likely a TIME or RECORDING-EQUIPMENT difference.")
-            print("    The labeled subset may be from a specific recording session that")
-            print("    differs from the rest of S22's data.")
+        print("  → within-site gap is also high. Even within S22, labeled and unlabeled")
+        print("    are distinct — likely a TIME or RECORDING-EQUIPMENT difference.")
+        print("    The labeled subset may be from a specific recording session that")
+        print("    differs from the rest of S22's data.")
 
 
 if __name__ == "__main__":
