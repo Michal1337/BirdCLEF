@@ -138,25 +138,66 @@ def main() -> None:
         print("[adv-int]   Possible reasons: temporal drift (labeling done in batches),")
         print("[adv-int]   or systematic per-site labeling. Worth inspecting.")
 
-    # ── Train final classifier on ALL data; score every cache row ───
+    # ── Use OOF (held-out) scores from CV as the canonical filter ───
+    #
+    # Why OOF rather than "train on all data, score everything":
+    # every unlabeled row was in the training set as class 1 in the all-data
+    # path, so the classifier would have memorized it and assigned it a
+    # biased-down score. The OOF scores from the 5-fold CV above are clean
+    # — each row is scored by a fold's classifier that DIDN'T see that row
+    # in train, so the score reflects true generalization, not memorization.
+    #
+    # Note `oof_scores` was indexed only over `keep_idx` (the labeled +
+    # subsampled-or-full unlabeled pool). For rows outside that pool (only
+    # possible if --balanced is set), we fall back to the all-data classifier
+    # output. Without --balanced, every cache row is in keep_idx and we have
+    # honest OOF scores everywhere.
     print()
-    print("[adv-int] training final classifier on all data + scoring every cache row...")
-    clf_full = xgb.XGBClassifier(**xgb_params)
-    clf_full.fit(X, y, verbose=False)
-    all_scores = clf_full.predict_proba(emb)[:, 1]   # P(unlabeled) for every cache row
+    print("[adv-int] composing canonical scores: OOF where available, all-data "
+          "fallback elsewhere")
 
-    # Score quantiles
-    q = np.percentile(all_scores[is_labeled], [10, 50, 90])
-    print(f"[adv-int] labeled rows: P(unlabeled) percentiles 10%={q[0]:.3f} "
-          f"50%={q[1]:.3f} 90%={q[2]:.3f}")
-    q = np.percentile(all_scores[~is_labeled], [10, 50, 90])
-    print(f"[adv-int] unlabeled rows: P(unlabeled) percentiles 10%={q[0]:.3f} "
-          f"50%={q[1]:.3f} 90%={q[2]:.3f}")
+    # Build per-row score over the FULL cache (n_rows = len(emb)).
+    full_scores = np.zeros(len(emb), dtype=np.float32)
+    full_scores[keep_idx] = oof_scores
 
-    # Reverse the score so "labeled-likeness" = P(labeled) = 1 - P(unlabeled).
-    # That's the more useful signal for filtering pseudo: keep rows that look
-    # most like the labeled val pool.
-    labeled_likeness = (1.0 - all_scores).astype(np.float32)
+    # If --balanced subsampled the unlabeled, the un-sampled unlabeled rows
+    # got no OOF score. Fill them via an all-data classifier (still trained
+    # on the same balanced subset, which keeps the comparison apples-to-apples).
+    missing = np.ones(len(emb), dtype=bool)
+    missing[keep_idx] = False
+    n_missing = int(missing.sum())
+    if n_missing > 0:
+        print(f"[adv-int]   {n_missing:,} rows outside CV pool (--balanced enabled);"
+              f" filling via all-data classifier")
+        clf_full = xgb.XGBClassifier(**xgb_params)
+        clf_full.fit(X, y, verbose=False)
+        full_scores[missing] = clf_full.predict_proba(emb[missing])[:, 1]
+
+    # Print quantiles to sanity-check (these are P(unlabeled), labeled rows
+    # should score low, unlabeled should score high)
+    q = np.percentile(full_scores[is_labeled], [10, 50, 90])
+    print(f"[adv-int] labeled rows OOF P(unlabeled) percentiles "
+          f"10%={q[0]:.3f}  50%={q[1]:.3f}  90%={q[2]:.3f}")
+    q = np.percentile(full_scores[~is_labeled], [10, 50, 90])
+    print(f"[adv-int] unlabeled rows OOF P(unlabeled) percentiles "
+          f"10%={q[0]:.3f}  50%={q[1]:.3f}  90%={q[2]:.3f}")
+
+    # Inversion: labeled_likeness = 1 - P(unlabeled). Higher = more labeled-like.
+    labeled_likeness = (1.0 - full_scores).astype(np.float32)
+
+    # Sanity: how spread out are unlabeled scores under OOF? With memorization
+    # bias removed, the top end of the unlabeled distribution should reach up
+    # to meaningful values (e.g., > 0.1) instead of being clipped near 0.
+    unl_scores = labeled_likeness[~is_labeled]
+    pcs = np.percentile(unl_scores, [50, 75, 90, 95, 99, 99.5, 99.9])
+    print(f"[adv-int] unlabeled rows labeled-likeness percentiles:")
+    print(f"[adv-int]   50%={pcs[0]:.4f}  75%={pcs[1]:.4f}  90%={pcs[2]:.4f}  "
+          f"95%={pcs[3]:.4f}  99%={pcs[4]:.4f}  99.5%={pcs[5]:.4f}  "
+          f"99.9%={pcs[6]:.4f}")
+    for thr in (0.1, 0.2, 0.3, 0.5, 0.7):
+        n = int((unl_scores >= thr).sum())
+        print(f"[adv-int]   unlabeled with labeled_likeness ≥ {thr}: {n:,} "
+              f"({n/len(unl_scores)*100:.2f}%)")
 
     args.out_npz.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
@@ -167,11 +208,12 @@ def main() -> None:
         adv_auc_mean=np.float32(auc_mean),
         adv_auc_std=np.float32(auc_std),
         balanced=np.uint8(int(args.balanced)),
+        oof_scoring=np.uint8(1),    # marker: this npz uses honest OOF scores
     )
     print()
-    print(f"[adv-int] wrote per-row labeled-likeness scores to {args.out_npz}")
+    print(f"[adv-int] wrote OOF-based labeled-likeness scores to {args.out_npz}")
     print(f"[adv-int]   shape={labeled_likeness.shape}  "
-          f"(use as a soft filter for round-2 pseudo)")
+          f"(no train-set memorization bias)")
 
 
 if __name__ == "__main__":
