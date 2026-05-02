@@ -166,6 +166,83 @@ def _np_dtype_from_ort(type_str: str):
     return np.float32
 
 
+# Tucker-bundle mel parameters — must match `_03c_eval_sed_kaggle_onnx.py`.
+_TUCKER_N_MELS = 256
+_TUCKER_N_FFT = 2048
+_TUCKER_HOP = 512
+_TUCKER_FMIN = 20
+_TUCKER_FMAX = 16000
+_TUCKER_TOP_DB = 80
+_TUCKER_SMOOTH_SIGMA = 0.65
+
+
+def _audio_to_mel_tucker(chunks: np.ndarray) -> np.ndarray:
+    """(N_WINDOWS, WINDOW_SAMPLES) → (N_WINDOWS, 1, n_mels, n_frames) for Tucker bundle."""
+    import librosa
+    from birdclef.config.paths import SR
+    mels = []
+    for x in chunks:
+        s = librosa.feature.melspectrogram(
+            y=x, sr=SR, n_fft=_TUCKER_N_FFT, hop_length=_TUCKER_HOP,
+            n_mels=_TUCKER_N_MELS, fmin=_TUCKER_FMIN, fmax=_TUCKER_FMAX, power=2.0,
+        )
+        s = librosa.power_to_db(s, top_db=_TUCKER_TOP_DB)
+        s = (s - s.mean()) / (s.std() + 1e-6)
+        mels.append(s)
+    return np.stack(mels)[:, None].astype(np.float32)
+
+
+def _sigmoid_np(x: np.ndarray) -> np.ndarray:
+    return 1.0 / (1.0 + np.exp(-np.clip(x.astype(np.float32), -50, 50)))
+
+
+def _predict_one_session(sess, wins: np.ndarray) -> np.ndarray:
+    """Run one ONNX session on the 12 windows of a single 60s file. Auto-detects
+    whether the model is waveform-input clip-only (our SED export) or mel-input
+    dual-head (Tucker's bundle), and applies the matching aggregation.
+
+    Returns (N_WINDOWS, n_classes) probabilities.
+    """
+    inp = sess.get_inputs()[0]
+    inp_name = inp.name
+    inp_rank = len(inp.shape)
+    inp_dtype = _np_dtype_from_ort(inp.type)
+
+    # Waveform input (rank 2): our SEDExportWrapper-style ONNX. Single output
+    # = clip logits.
+    if inp_rank == 2:
+        x = wins if wins.dtype == inp_dtype else wins.astype(inp_dtype)
+        logits = sess.run(None, {inp_name: x})[0]
+        return _sigmoid_np(logits)
+
+    # Mel input (rank 4: B, 1, n_mels, n_frames): Tucker-style bundle.
+    # Compute mel, then aggregate dual heads if present.
+    if inp_rank == 4:
+        mel = _audio_to_mel_tucker(wins)
+        if mel.dtype != inp_dtype:
+            mel = mel.astype(inp_dtype)
+        outs = sess.run(None, {inp_name: mel})
+        if len(outs) >= 2:
+            # Dual-head: 0.5*sigmoid(clip) + 0.5*sigmoid(frame.max)
+            clip_logits = outs[0]
+            fw_max = outs[1].max(axis=1)
+            p = 0.5 * _sigmoid_np(clip_logits) + 0.5 * _sigmoid_np(fw_max)
+        else:
+            # Mel input but only clip head — sigmoid the single output
+            p = _sigmoid_np(outs[0])
+        # Light Gaussian smoothing across the 12 windows (Tucker recipe)
+        from scipy.ndimage import gaussian_filter1d
+        if p.shape[0] > 1:
+            p = gaussian_filter1d(p, sigma=_TUCKER_SMOOTH_SIGMA, axis=0,
+                                  mode="nearest").astype(np.float32)
+        return p.astype(np.float32)
+
+    raise SystemExit(
+        f"Unsupported ONNX input rank {inp_rank} (shape={inp.shape}); "
+        "expected rank 2 (waveform) or rank 4 (mel spectrogram)."
+    )
+
+
 def _dump_sed(sed_paths: List[str], target_filenames: List[str],
               row_fold_per_file: dict, n_classes: int) -> np.ndarray:
     """Per-file: predict with the ONNX session whose fold did NOT include this file.
@@ -175,6 +252,9 @@ def _dump_sed(sed_paths: List[str], target_filenames: List[str],
     with that fold's checkpoint gives the honest OOF prediction.
 
     `sed_paths` is sorted by fold (path naming `fold0/`, `fold1/`, ...).
+
+    Auto-detects ONNX input signature: waveform-rank-2 (our trained SED export)
+    vs mel-rank-4 + dual-head outputs (Tucker's bundle).
     """
     import onnxruntime as ort
     import re
@@ -191,11 +271,11 @@ def _dump_sed(sed_paths: List[str], target_filenames: List[str],
         sess = ort.InferenceSession(str(p), sess_options=sess_opts,
                                     providers=["CPUExecutionProvider"])
         sess_by_fold[fold_idx] = sess
-        print(f"[sed-oof]   loaded fold {fold_idx} ONNX from {p}")
-
-    # Per-session input name + dtype
-    name_by_fold = {f: s.get_inputs()[0].name for f, s in sess_by_fold.items()}
-    dtype_by_fold = {f: _np_dtype_from_ort(s.get_inputs()[0].type) for f, s in sess_by_fold.items()}
+        # Print I/O signature so the operator can confirm the model kind
+        inp_shape = sess.get_inputs()[0].shape
+        out_count = len(sess.get_outputs())
+        print(f"[sed-oof]   loaded fold {fold_idx}: input={inp_shape}  "
+              f"outputs={out_count}  ({p})")
 
     rows = []
     for fname in tqdm(target_filenames, desc="SED stitched OOF"):
@@ -209,8 +289,6 @@ def _dump_sed(sed_paths: List[str], target_filenames: List[str],
                 f"Available folds: {sorted(sess_by_fold)}."
             )
         sess = sess_by_fold[fold]
-        inp = name_by_fold[fold]
-        dt = dtype_by_fold[fold]
         y, _ = sf.read(str(path), dtype="float32", always_2d=False)
         if y.ndim == 2:
             y = y.mean(axis=1)
@@ -219,9 +297,7 @@ def _dump_sed(sed_paths: List[str], target_filenames: List[str],
         else:
             y = y[:FILE_SAMPLES]
         wins = y.reshape(N_WINDOWS, WINDOW_SAMPLES).astype(np.float32)
-        x = wins if wins.dtype == dt else wins.astype(dt)
-        logits = sess.run(None, {inp: x})[0]
-        probs = 1.0 / (1.0 + np.exp(-np.clip(logits.astype(np.float32), -30, 30)))
+        probs = _predict_one_session(sess, wins)
         rows.append(probs)
     return np.concatenate(rows, axis=0).astype(np.float32)
 
