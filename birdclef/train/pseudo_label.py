@@ -90,15 +90,18 @@ def _apply_confidence_filter(
 
 @torch.no_grad()
 def _predict_sed_on_file(model, wav_60s: np.ndarray, device) -> np.ndarray:
-    """Returns 12xC probabilities for a 60s waveform."""
+    """Returns 12xC probabilities for a 60s waveform via dual-head SED
+    aggregation: 0.5*sigmoid(clip) + 0.5*sigmoid(frame.max).
+    """
+    from birdclef.models.sed import dual_head_predict
     if wav_60s.shape[0] < FILE_SAMPLES:
         wav_60s = np.pad(wav_60s, (0, FILE_SAMPLES - wav_60s.shape[0]))
     else:
         wav_60s = wav_60s[:FILE_SAMPLES]
     wins = wav_60s.reshape(N_WINDOWS, WINDOW_SAMPLES)
     x = torch.from_numpy(wins.astype(np.float32)).to(device)
-    logits = model(x)
-    return torch.sigmoid(logits).cpu().numpy()
+    out = model(x)
+    return dual_head_predict(out).cpu().numpy()
 
 
 def pseudo_label_with_sed(

@@ -157,8 +157,9 @@ def _eval_on_soundscape_files(
             y = y.mean(axis=1)
         wins = _windowize(y)
         x = torch.from_numpy(wins).to(device)
-        logits = model(x)
-        probs = torch.sigmoid(logits).cpu().numpy()
+        from birdclef.models.sed import dual_head_predict
+        out = model(x)
+        probs = dual_head_predict(out).cpu().numpy()
         sub = rows[rows["filename"] == fn].sort_values("end_sec")
         if len(sub) < N_WINDOWS:
             continue
@@ -370,8 +371,10 @@ def train_one_fold(cfg: dict, fold: int | None, dry_run_steps: int = 0) -> dict:
                 dtype=amp_dtype,
                 enabled=bool(cfg["amp"]) and torch.cuda.is_available(),
             ):
-                logits = model(wav.squeeze(1))
-                loss = loss_fn(logits, y, loss_mask=loss_mask)
+                out = model(wav.squeeze(1))
+                from birdclef.models.sed import dual_head_loss
+                loss = dual_head_loss(out, y, loss_fn, loss_mask=loss_mask,
+                                      frame_weight=float(cfg.get("frame_weight", 0.5)))
             if use_grad_scaler:
                 scaler.scale(loss).backward()
                 scaler.unscale_(opt)

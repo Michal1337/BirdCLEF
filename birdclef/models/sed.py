@@ -1,8 +1,16 @@
-"""SED model: timm backbone + attention-pool head + spectrogram frontend.
+"""SED model: timm backbone + dual-head (clip + framewise) + spectrogram frontend.
 
-Produces per-clip multilabel logits for 5 s windows (one prediction per clip).
-For 60 s soundscape inference, caller chops waveform into 12 windows and runs
-in batches of 12.
+Architecture matches the public 5-fold distilled SED bundle
+(`models/sed_kaggle/sed_fold{0..4}.onnx`, Tucker Arrants):
+  - 1-channel mel spectrogram (default 256 mels, hop 512)
+  - timm backbone (default `tf_efficientnet_b0.ns_jft_in1k`)
+  - clip head: AttentionPool over time → Linear(C, n_classes)
+  - framewise head: Linear(C, n_classes) applied per time step
+  - inference aggregation: 0.5·sigmoid(clip) + 0.5·sigmoid(frame.max)
+
+The framewise output catches brief calls (a single chirp inside a 5 s window);
+the clip output handles sustained vocalizations. Combining them at the
+sigmoid-mean is the standard SED inference recipe (PANNs / Choi 2018).
 
 Two front-end implementations:
   - MelFrontend:  torchaudio.transforms.MelSpectrogram. Used at train time.
@@ -21,13 +29,16 @@ import torch.nn.functional as F
 
 @dataclass
 class SEDConfig:
-    backbone: str = "tf_efficientnetv2_s.in21k_ft_in1k"
+    # Defaults mirror the Tucker Arrants distilled-SED bundle
+    # (`models/sed_kaggle/`) so a from-scratch SED here is a structural
+    # match for the Kaggle teacher we're trying to replace.
+    backbone: str = "tf_efficientnet_b0.ns_jft_in1k"
     n_classes: int = 234
     dropout: float = 0.30
     sample_rate: int = 32000
-    n_mels: int = 128
+    n_mels: int = 256
     n_fft: int = 2048
-    hop_length: int = 320
+    hop_length: int = 512
     f_min: int = 20
     f_max: int = 16000
     freq_mask_param: int = 24
@@ -98,26 +109,79 @@ class SED(nn.Module):
         )
         feat_dim = int(self.backbone.num_features)
         self.pool = AttentionPool(feat_dim, dropout=cfg.dropout)
+        # Clip-level head: pooled features → per-class logits.
         self.head = nn.Sequential(
             nn.LayerNorm(feat_dim),
             nn.Dropout(cfg.dropout),
             nn.Linear(feat_dim, cfg.n_classes),
         )
+        # Framewise head: per-time-step logits, shares the backbone with the
+        # clip head. Final inference combines both via dual_head_predict().
+        self.framewise_head = nn.Sequential(
+            nn.LayerNorm(feat_dim),
+            nn.Dropout(cfg.dropout),
+            nn.Linear(feat_dim, cfg.n_classes),
+        )
 
-    def forward(self, waveform: torch.Tensor) -> torch.Tensor:
+    def forward(self, waveform: torch.Tensor) -> dict:
+        """Returns {'clip_logits': (B, n_classes),
+                    'framewise_logits': (B, T, n_classes)}.
+
+        T is the number of time steps after the backbone (depends on mel
+        config and backbone stride). Clip logits come from attention-pooled
+        features; framewise logits are produced per time step from the same
+        feature sequence.
+        """
         x = self.frontend(waveform)
         if self.training:
             x = self.spec_aug(x)
         feats = self.backbone(x)
         if feats.ndim == 4:
             # [B, C, H, W] -> treat W as time steps
-            feats = feats.mean(dim=2).transpose(1, 2)  # [B, W, C]
+            feats = feats.mean(dim=2).transpose(1, 2)  # [B, T, C]
         elif feats.ndim > 2:
             feats = feats.flatten(1).unsqueeze(1)
         else:
             feats = feats.unsqueeze(1)
-        pooled = self.pool(feats)
-        return self.head(pooled)
+        framewise_logits = self.framewise_head(feats)        # [B, T, n_classes]
+        pooled = self.pool(feats)                            # [B, C]
+        clip_logits = self.head(pooled)                      # [B, n_classes]
+        return {"clip_logits": clip_logits, "framewise_logits": framewise_logits}
+
+
+def dual_head_predict(out: dict) -> torch.Tensor:
+    """Standard SED inference aggregation:
+        0.5 * sigmoid(clip_logits) + 0.5 * sigmoid(frame.max(time))
+
+    Matches Tucker's distilled-SED bundle and cell 26 of LB_0942_seed.ipynb.
+    Returns (B, n_classes) probabilities in [0, 1].
+    """
+    clip = torch.sigmoid(out["clip_logits"])
+    fw_max = torch.sigmoid(out["framewise_logits"].max(dim=1).values)
+    return 0.5 * clip + 0.5 * fw_max
+
+
+def dual_head_loss(
+    out: dict,
+    y: torch.Tensor,
+    loss_fn,
+    loss_mask: torch.Tensor | None = None,
+    frame_weight: float = 0.5,
+) -> torch.Tensor:
+    """Combine clip-level and frame-max BCE losses.
+
+    The frame head is supervised via max-pool over time so its targets are the
+    same clip-level multilabel `y` — soundscape labels are clip-level only.
+    """
+    clip_logits = out["clip_logits"]
+    fw_max_logits = out["framewise_logits"].max(dim=1).values
+    if loss_mask is not None:
+        loss_clip = loss_fn(clip_logits, y, loss_mask=loss_mask)
+        loss_frame = loss_fn(fw_max_logits, y, loss_mask=loss_mask)
+    else:
+        loss_clip = loss_fn(clip_logits, y)
+        loss_frame = loss_fn(fw_max_logits, y)
+    return (1.0 - float(frame_weight)) * loss_clip + float(frame_weight) * loss_frame
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -201,9 +265,14 @@ class ConvMelSpectrogram(nn.Module):
 class SEDExportWrapper(nn.Module):
     """Drop-in replacement for SED at ONNX export time.
 
-    Same forward signature (waveform → logits), same trained weights, but
-    swaps the torchaudio mel front-end for the ONNX-safe `ConvMelSpectrogram`.
-    Skips SpecAugment (eval-mode only).
+    Same forward shape ((clip_logits, framewise_logits) tuple to mirror
+    Tucker's bundle), same trained weights, but swaps the torchaudio mel
+    front-end for the ONNX-safe `ConvMelSpectrogram`. Skips SpecAugment
+    (eval-mode only).
+
+    Forward returns a 2-tuple instead of a dict because torch.onnx.export
+    serializes tuples directly to named outputs (`clip_logits`,
+    `framewise_logits`); dicts require an extra wrapper.
     """
 
     def __init__(self, sed: SED):
@@ -216,8 +285,9 @@ class SEDExportWrapper(nn.Module):
         self.backbone = sed.backbone
         self.pool = sed.pool
         self.head = sed.head
+        self.framewise_head = sed.framewise_head
 
-    def forward(self, waveform: torch.Tensor) -> torch.Tensor:
+    def forward(self, waveform: torch.Tensor):
         if waveform.ndim == 3:
             waveform = waveform.squeeze(1)
         log_mel = self.mel(waveform)                              # (B, n_mels, frames)
@@ -243,5 +313,7 @@ class SEDExportWrapper(nn.Module):
             feats = feats.flatten(1).unsqueeze(1)
         else:
             feats = feats.unsqueeze(1)
+        framewise_logits = self.framewise_head(feats)
         pooled = self.pool(feats)
-        return self.head(pooled)
+        clip_logits = self.head(pooled)
+        return clip_logits, framewise_logits

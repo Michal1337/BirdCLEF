@@ -74,7 +74,10 @@ def _load_sed_from_ckpt(ckpt_path: Path, device: torch.device):
 
 @torch.no_grad()
 def _predict_file(model, fpath: Path, device: torch.device) -> np.ndarray:
-    """Return (N_WINDOWS, n_classes) sigmoid probabilities for one 60s OGG."""
+    """Return (N_WINDOWS, n_classes) probabilities for one 60s OGG via
+    dual-head aggregation: 0.5*sigmoid(clip) + 0.5*sigmoid(frame.max).
+    """
+    from birdclef.models.sed import dual_head_predict
     y, _ = sf.read(str(fpath), dtype="float32", always_2d=False)
     if y.ndim == 2:
         y = y.mean(axis=1)
@@ -83,8 +86,8 @@ def _predict_file(model, fpath: Path, device: torch.device) -> np.ndarray:
     else:
         y = y[:FILE_SAMPLES]
     wins = torch.from_numpy(y.reshape(N_WINDOWS, WINDOW_SAMPLES).astype(np.float32)).to(device)
-    logits = model(wins)
-    return torch.sigmoid(logits).cpu().numpy()
+    out = model(wins)
+    return dual_head_predict(out).cpu().numpy()
 
 
 def main():
