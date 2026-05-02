@@ -1,7 +1,12 @@
 """Sweep grids for the Perch+SSM head pipeline (train/train_ssm_head.py).
 
-BASELINE = LB_093.ipynb knobs (the 0.93 LB recipe). After the lb sweep
-confirmed LB_093 wins on stitched/mean OOF too, it became the new default.
+BASELINE = LB_0942_seed.ipynb knobs (the 0.942 LB recipe with SED blend).
+The SSM-only stack is identical to the prior LB_093 baseline except:
+  - `lambda_prior_texture` is dropped to 0.40 (no texture special-casing —
+    the public 0.942 notebook uses scalar lambda=0.4 for all taxa)
+  - `apply_thresholds=False` — `apply_per_class_thresholds` is computed but
+    NOT applied to the final probs. Required for downstream rank-blending
+    with SED, since binarization breaks rank correlation.
 
 Each config is merged with BASELINE. The hparams-diff CSV auto-drops fields
 that are constant across the sweep — so you only see the knobs that move.
@@ -16,7 +21,7 @@ BASELINE = dict(
     seed=42,
     ensemble_w=0.50,
     lambda_prior=0.40,
-    lambda_prior_texture=1.00,
+    lambda_prior_texture=0.40,
     correction_weight=0.30,
     loss="bce_focal_mean",
     focal_alpha=0.25,
@@ -35,6 +40,7 @@ BASELINE = dict(
     file_conf_power=0.40,
     rank_power=0.40,
     threshold_grid=(0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70),
+    apply_thresholds=False,
     proto_n_epochs=40,
     proto_lr=1e-3,
     proto_patience=8,

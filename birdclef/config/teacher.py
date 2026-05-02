@@ -68,20 +68,22 @@ TEACHER_V0_SEEDS = (42, 7, 13)
 TEACHER_V0_NAME = "ssm_pca128_ens3"
 
 
-# --- TEACHER_V1: LB_093 BASELINE -------------------------------------------
+# --- TEACHER_V1: LB_0942_seed BASELINE -------------------------------------
 # Pulled directly from `birdclef.config.ssm_configs.BASELINE`, which mirrors
-# the LB 0.93 notebook's deployed-pipeline knobs (texture-prior, lambda=0.4
-# birds + 1.0 frogs/insects, adaptive smoothing, boost off, threshold grid
-# 0.25–0.70, BASELINE proto/residual training schedules). This is what we
-# want as the round-0 pseudo-label teacher: the same recipe that scored
-# 0.93 LB, so its high-confidence predictions on unlabeled soundscapes are
-# the most trustworthy signal we have right now (no flat-head — that's a
-# separate experiment and currently HURTS LB by 0.01 — see LB_0931_seed
+# the LB_0942_seed notebook's deployed-pipeline knobs: scalar lambda=0.4
+# prior (no texture special-casing — frogs/insects use the same lambda as
+# birds), adaptive smoothing, boost off, threshold grid 0.25–0.70 (computed
+# but NOT applied — see `apply_thresholds=False`), BASELINE proto/residual
+# training schedules. This recipe scores LB 0.925 stand-alone and 0.942
+# when rank-blended 60/40 with a distilled SED. We use it as the pseudo-
+# label teacher because its high-confidence predictions on unlabeled
+# soundscapes are the most trustworthy signal we have (no flat-head —
+# separate experiment that currently HURTS LB by 0.01, see LB_0931_seed
 # A/B from 2026-04-27).
-from birdclef.config.ssm_configs import BASELINE as _LB093_BASELINE
+from birdclef.config.ssm_configs import BASELINE as _LB0942_BASELINE
 
-TEACHER_V1_LB093 = dict(_LB093_BASELINE)
-TEACHER_V1_LB093["name"] = "ssm_lb093_baseline"
+TEACHER_V1_LB093 = dict(_LB0942_BASELINE)
+TEACHER_V1_LB093["name"] = "ssm_lb0942_baseline"
 # Three seeds → averages out per-seed variance we measured on stitched-OOF AUC.
 TEACHER_V1_SEEDS = (42, 7, 13)
 TEACHER_V1_NAME = "ssm_lb093_ens3"

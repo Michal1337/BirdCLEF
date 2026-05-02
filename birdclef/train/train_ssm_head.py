@@ -628,7 +628,10 @@ def run_pipeline_for_split(
         n_windows=N_WINDOWS,
     )
     probs = _postproc(final_logits, temperatures, cfg)
-    final_probs = apply_per_class_thresholds(probs, thresholds)
+    if bool(cfg.get("apply_thresholds", True)):
+        final_probs = apply_per_class_thresholds(probs, thresholds)
+    else:
+        final_probs = probs
 
     return {
         "first_pass": sigmoid_np(first_pass_va).astype(np.float32),
