@@ -186,11 +186,19 @@ class SEDTrainDataset(Dataset):
         # train on the other n-1 folds.
         sc = load_soundscape_meta()
         sc = sc[sc["fully_labeled"]]
+        # Val-fold filenames must be excluded from BOTH the labeled GT pool
+        # AND the pseudo-only pool below — otherwise a val file would slip
+        # into training as a pseudo-only sample (teacher has seen it; its
+        # pseudo target effectively encodes the true labels) and inflate the
+        # fold-val AUC measurement.
+        val_filenames: set[str] = set()
         if fold is not None:
             folds_df = load_folds(n_splits=int(n_splits))
             fold_of = dict(zip(folds_df["filename"], folds_df["fold"].astype(int)))
             keep_filenames = {fn for fn, fld in fold_of.items() if fld != int(fold)}
             sc = sc[sc["filename"].isin(keep_filenames)]
+            val_filenames = {fn for fn, fld in fold_of.items() if fld == int(fold)}
+        self._val_filenames = val_filenames
         self._sc_df = sc
         labeled_sc_files = sc.drop_duplicates("filename")["filename"].astype(str).tolist()
 
@@ -210,11 +218,18 @@ class SEDTrainDataset(Dataset):
             self._pseudo_info = info
 
             # Soundscape pool grows to include every file covered by the
-            # pseudo-label cache. With V-anchor gone, every file in the
-            # pseudo cache that isn't in the labeled GT pool is eligible.
+            # pseudo-label cache. Every file in the pseudo cache that isn't
+            # in the labeled GT pool AND isn't in the held-out val fold is
+            # eligible. Val-fold exclusion matters because the teacher has
+            # likely seen those files (built on all labeled rows), so a
+            # pseudo-only sample of a val file would leak its true labels
+            # into training.
             eligible_files = sorted(file_to_start.keys())
             labeled_set = set(labeled_sc_files)
-            unlabeled_sc_files = [f for f in eligible_files if f not in labeled_set]
+            unlabeled_sc_files = [
+                f for f in eligible_files
+                if f not in labeled_set and f not in val_filenames
+            ]
 
         # Final soundscape file pool (labeled GT files + pseudo-only files)
         self._sc_labeled_files = labeled_sc_files

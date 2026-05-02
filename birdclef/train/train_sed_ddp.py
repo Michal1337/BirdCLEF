@@ -312,8 +312,26 @@ def train_one_fold(cfg: dict, fold: int | None, dry_run_steps: int = 0) -> dict:
 
     opt = torch.optim.AdamW(model.parameters(), lr=float(cfg["lr"]),
                             weight_decay=float(cfg["weight_decay"]))
-    total_steps = max(1, int(cfg["epochs"]) * max(1, len(loader)))
+    steps_per_epoch = max(1, len(loader))
+    total_steps = max(1, int(cfg["epochs"]) * steps_per_epoch)
     warmup_steps = int(total_steps * float(cfg["warmup_frac"]))
+    if _is_main(rank):
+        eff_batch = (
+            int(cfg["batch_size"]) * max(1, world_size)
+            * int(cfg.get("grad_accum", 1))
+        )
+        print(
+            f"[sed:{cfg['name']} f{fold}] schedule  "
+            f"epochs={int(cfg['epochs'])}  "
+            f"steps/epoch={steps_per_epoch}  "
+            f"total_steps={total_steps}  "
+            f"warmup_steps={warmup_steps}  "
+            f"({float(cfg['warmup_frac']) * 100:.1f}%)  "
+            f"eff_batch={eff_batch} "
+            f"(per_rank={int(cfg['batch_size'])} × ranks={max(1, world_size)} "
+            f"× grad_accum={int(cfg.get('grad_accum', 1))})  "
+            f"dataset_len={len(dataset)}"
+        )
     def lr_at(step: int) -> float:
         if step < warmup_steps:
             return step / max(1, warmup_steps)
