@@ -97,7 +97,21 @@ def _load_pseudo_round(rnd: int):
         )
     meta = pd.read_parquet(meta_path)
     arrs = np.load(probs_path)
-    probs = arrs["probs"].astype(np.float32)
+    # Schema varies by builder:
+    #   - SSM teacher / SSM+SED blend teacher (pseudo_label.py): saves
+    #     `final` (post-pipeline probs) + optional `first_pass`, `ssm_final`,
+    #     `sed_final`.
+    #   - SED-checkpoint teacher: saves a single `probs` key.
+    if "final" in arrs.files:
+        probs = arrs["final"].astype(np.float32)
+    elif "probs" in arrs.files:
+        probs = arrs["probs"].astype(np.float32)
+    else:
+        raise KeyError(
+            f"Pseudo round {rnd} npz at {probs_path} has neither 'final' nor "
+            f"'probs' arrays. Available keys: {arrs.files}. Rebuild via "
+            "scripts/_05_pseudo_label.py."
+        )
     keep = arrs["keep_mask"].astype(np.uint8) if "keep_mask" in arrs.files else np.ones_like(probs, dtype=np.uint8)
     # Rows come in blocks of N_WINDOWS per filename, ordered by appearance.
     file_start = (
