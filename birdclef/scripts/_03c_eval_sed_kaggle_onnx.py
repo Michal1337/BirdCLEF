@@ -140,10 +140,21 @@ def main() -> None:
                     help="Directory containing sed_fold{0..K-1}.onnx.")
     ap.add_argument("--n-splits", type=int, default=5, choices=[5, 10],
                     help="Static fold parquet to use for fold→files lookup.")
+    ap.add_argument("--shuffle-offset", type=int, default=0,
+                    help="Leak probe: rotate the fold→ONNX assignment by this "
+                         "offset. With K folds, our fold k uses sed_fold{(k+offset) %% K}. "
+                         "offset=0 (default) is the honest assignment. offset>0 "
+                         "guarantees no ONNX evaluates the val set its filename "
+                         "implies. If AUC stays high under offset>0, the per-fold "
+                         "assignment was meaningless and the model has seen our val "
+                         "files in training (full leak). If AUC drops big, the fold "
+                         "assignment was real and the original number is honest OOF.")
     ap.add_argument("--out-json", default=None,
-                    help="Override output JSON path (default: <onnx-dir>/stitched_oof_metrics.json)")
+                    help="Override output JSON path (default: <onnx-dir>/stitched_oof_metrics.json, "
+                         "or stitched_oof_metrics_shuffle{offset}.json when shuffling)")
     ap.add_argument("--out-npz", default=None,
-                    help="Override output NPZ path (default: <onnx-dir>/stitched_oof_probs.npz)")
+                    help="Override output NPZ path (default: <onnx-dir>/stitched_oof_probs.npz, "
+                         "or stitched_oof_probs_shuffle{offset}.npz when shuffling)")
     args = ap.parse_args()
 
     onnx_dir = Path(args.onnx_dir)
@@ -151,6 +162,16 @@ def main() -> None:
         raise SystemExit(f"No ONNX dir at {onnx_dir}")
     fold_paths = _resolve_fold_paths(onnx_dir)
     print(f"[oof-sed-onnx] onnx_dir={onnx_dir}  folds={sorted(fold_paths.keys())}")
+
+    K = len(fold_paths)
+    offset = int(args.shuffle_offset) % K
+    if offset != 0:
+        print(f"[oof-sed-onnx] LEAK PROBE: shuffle-offset={offset} (mod {K}) — "
+              f"each fold will be evaluated by a DIFFERENT ONNX")
+        for k in sorted(fold_paths.keys()):
+            mapped = (k + offset) % K
+            print(f"[oof-sed-onnx]   our fold {k}  →  {fold_paths[mapped].name}")
+    fold_to_onnx_idx = {k: (k + offset) % K for k in sorted(fold_paths.keys())}
 
     folds_df = load_folds(n_splits=args.n_splits)
     sc = load_soundscape_meta()
@@ -189,13 +210,18 @@ def main() -> None:
             print(f"[oof-sed-onnx] WARN: no ONNX for fold {fold}; "
                   f"those val rows will stay 0")
             continue
-        sess = _make_session(fold_paths[fold])
+        onnx_idx = fold_to_onnx_idx.get(int(fold), int(fold))
+        if onnx_idx not in fold_paths:
+            print(f"[oof-sed-onnx] WARN: shuffle mapped fold {fold} → ONNX idx "
+                  f"{onnx_idx} which doesn't exist; skipping")
+            continue
+        sess = _make_session(fold_paths[onnx_idx])
         n_folds_seen += 1
 
         sub = sc[sc["fold"] == fold]
         files = sub.drop_duplicates("filename")["filename"].astype(str).tolist()
         print(f"[oof-sed-onnx] fold {fold}: {len(files)} files, "
-              f"onnx={fold_paths[fold].name}")
+              f"onnx={fold_paths[onnx_idx].name}")
         fold_row_idxs: list[int] = []
         for fn in files:
             row_idx = sub.index[sub["filename"] == fn].to_numpy()
@@ -245,6 +271,10 @@ def main() -> None:
         "n_splits": int(args.n_splits),
         "onnx_dir": str(onnx_dir),
         "fold_files": {str(k): str(v.name) for k, v in sorted(fold_paths.items())},
+        "shuffle_offset": int(offset),
+        "fold_to_onnx_assignment": {
+            str(k): fold_paths[v].name for k, v in sorted(fold_to_onnx_idx.items())
+        },
         "mel_params": dict(
             n_mels=N_MELS_SED, n_fft=N_FFT_SED, hop=HOP_SED,
             fmin=FMIN_SED, fmax=FMAX_SED, top_db=TOP_DB_SED,
@@ -252,13 +282,20 @@ def main() -> None:
         ),
     }
 
-    out_json = Path(args.out_json) if args.out_json else (onnx_dir / "stitched_oof_metrics.json")
-    out_npz = Path(args.out_npz) if args.out_npz else (onnx_dir / "stitched_oof_probs.npz")
+    suffix = f"_shuffle{offset}" if offset != 0 else ""
+    out_json = Path(args.out_json) if args.out_json else (
+        onnx_dir / f"stitched_oof_metrics{suffix}.json"
+    )
+    out_npz = Path(args.out_npz) if args.out_npz else (
+        onnx_dir / f"stitched_oof_probs{suffix}.npz"
+    )
     out_json.parent.mkdir(parents=True, exist_ok=True)
     out_json.write_text(json.dumps(summary, indent=2, default=str), encoding="utf-8")
     np.savez_compressed(out_npz, probs=P, y_true=Y)
 
     print()
+    if offset != 0:
+        print(f"[oof-sed-onnx] *** LEAK PROBE shuffle-offset={offset} ***")
     print(f"[oof-sed-onnx] onnx_dir={onnx_dir}  n_splits={args.n_splits}  "
           f"folds_seen={n_folds_seen}")
     print(f"[oof-sed-onnx] primary (mean_oof_auc) = {mean_oof_auc:.4f}")
