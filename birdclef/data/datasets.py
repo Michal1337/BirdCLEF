@@ -17,6 +17,8 @@ InferenceDataset: streams 60 s soundscape OGGs from disk for final prediction.
 from __future__ import annotations
 
 import json
+import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -42,18 +44,39 @@ from birdclef.config.paths import (
 from birdclef.data.soundscapes import label_to_idx, load_soundscape_meta
 
 
+def _preload_into_ram() -> bool:
+    """If BIRDCLEF_PRELOAD_CACHE is truthy, the waveform + soundscape memmaps
+    are read fully into RAM at dataset construction time. Eliminates the
+    page-fault cost on every random window read — useful when you have
+    plenty of RAM (~50 GB total for both caches) and a slow filesystem.
+    """
+    return str(os.environ.get("BIRDCLEF_PRELOAD_CACHE", "")).lower() in {
+        "1", "true", "yes", "ram"
+    }
+
+
 def _load_soundscape_store():
     """Open the soundscape memmap (n_files, FILE_SAMPLES) f16 if present.
 
-    Returns (memmap, {filename: row_idx}) or (None, {}) when the cache hasn't
-    been built. The dataset falls back to on-the-fly OGG decode in that case.
+    Returns (memmap | ndarray, {filename: row_idx}) or (None, {}) when the
+    cache hasn't been built. The dataset falls back to on-the-fly OGG decode
+    in that case. With BIRDCLEF_PRELOAD_CACHE=1 the array is loaded fully
+    into RAM (~40 GB for the full soundscape pool).
     """
     if not SOUNDSCAPE_NPY.exists() or not SOUNDSCAPE_INDEX.exists():
         return None, {}
     try:
-        store = np.load(SOUNDSCAPE_NPY, mmap_mode="r")
+        if _preload_into_ram():
+            t0 = time.time()
+            store = np.load(SOUNDSCAPE_NPY)         # full read into RAM
+            print(f"[SEDTrainDataset] preloaded soundscape store into RAM: "
+                  f"shape={store.shape} dtype={store.dtype} "
+                  f"size={store.nbytes / 1024**3:.1f} GB "
+                  f"({time.time() - t0:.1f}s)")
+        else:
+            store = np.load(SOUNDSCAPE_NPY, mmap_mode="r")
     except Exception as exc:
-        print(f"[SEDTrainDataset] soundscape memmap load failed ({exc}); fallback to OGG decode")
+        print(f"[SEDTrainDataset] soundscape store load failed ({exc}); fallback to OGG decode")
         return None, {}
     idx = pd.read_parquet(SOUNDSCAPE_INDEX)
     if "ok" in idx.columns:
@@ -76,7 +99,15 @@ def _load_waveform_store() -> tuple[np.ndarray, pd.DataFrame]:
         raise FileNotFoundError(
             f"Waveform cache not found: run scripts/01_build_caches.py --stage waveform"
         )
-    store = np.load(WAVEFORM_NPY, mmap_mode="r")
+    if _preload_into_ram():
+        t0 = time.time()
+        store = np.load(WAVEFORM_NPY)              # full read into RAM
+        print(f"[SEDTrainDataset] preloaded waveform store into RAM: "
+              f"shape={store.shape} dtype={store.dtype} "
+              f"size={store.nbytes / 1024**3:.1f} GB "
+              f"({time.time() - t0:.1f}s)")
+    else:
+        store = np.load(WAVEFORM_NPY, mmap_mode="r")
     index = pd.read_parquet(WAVEFORM_INDEX)
     return store, index
 
