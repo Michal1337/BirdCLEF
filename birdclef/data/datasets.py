@@ -134,6 +134,7 @@ class SEDTrainDataset(Dataset):
         pseudo_round: Optional[int] = None,
         n_splits: int = 5,
         seed: int = 42,
+        use_train_audio: bool = True,
     ):
         from birdclef.data.splits import load_folds
         from birdclef.data.train_audio import build_train_audio_labels, load_train_audio_meta
@@ -141,22 +142,28 @@ class SEDTrainDataset(Dataset):
         self.win = window_seconds * SR
         self.sfrac = float(soundscape_fraction)
         self.fw_prob = float(first_window_prob)
-        self._store, self._idx = _load_waveform_store()
-
-        ta = load_train_audio_meta()
-        idx_by_file = dict(zip(self._idx["filename"].astype(str), self._idx.index))
-        Y_ta = build_train_audio_labels(ta)
+        # When False, skip loading train_audio entirely — every sample comes
+        # from the soundscape pool (labeled GT and/or pseudo). Useful for
+        # ablations that train SED only on soundscapes with proper fold
+        # holdout (no focal recordings, no domain bridging).
+        self._use_train_audio = bool(use_train_audio)
+        self._store, self._idx = (None, None)
         self._ta_rows: list[SEDTrainSample] = []
-        for i, row in ta.iterrows():
-            r = idx_by_file.get(str(row["filename"]))
-            if r is None:
-                continue
-            meta = self._idx.iloc[r]
-            self._ta_rows.append(SEDTrainSample(
-                source="train_audio", source_id=int(meta["clip_id"]),
-                y=Y_ta[i], offset=int(meta["start_offset"]),
-                length=int(meta["n_samples"]),
-            ))
+        if self._use_train_audio:
+            self._store, self._idx = _load_waveform_store()
+            ta = load_train_audio_meta()
+            idx_by_file = dict(zip(self._idx["filename"].astype(str), self._idx.index))
+            Y_ta = build_train_audio_labels(ta)
+            for i, row in ta.iterrows():
+                r = idx_by_file.get(str(row["filename"]))
+                if r is None:
+                    continue
+                meta = self._idx.iloc[r]
+                self._ta_rows.append(SEDTrainSample(
+                    source="train_audio", source_id=int(meta["clip_id"]),
+                    y=Y_ta[i], offset=int(meta["start_offset"]),
+                    length=int(meta["n_samples"]),
+                ))
 
         self._n_classes = len(label_to_idx())
 
@@ -264,17 +271,28 @@ class SEDTrainDataset(Dataset):
 
     def _get_soundscape(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         if not self._sc_files:
-            return self._get_train_audio()
+            if self._use_train_audio:
+                return self._get_train_audio()
+            raise RuntimeError(
+                "SEDTrainDataset has no soundscape files AND use_train_audio=False; "
+                "training pool is empty. Re-enable train_audio or build pseudo cache."
+            )
         fn = self._sc_files[int(self._rng.integers(len(self._sc_files)))]
         is_labeled = fn in self._labeled_set
 
         if is_labeled:
             sub = self._sc_df[self._sc_df["filename"] == fn].sort_values("end_sec")
             if sub.empty:
-                return self._get_train_audio()
-            pick = int(self._rng.integers(len(sub)))
-            win_row = sub.iloc[pick]
-            window_idx = int(win_row["end_sec"]) // 5 - 1
+                # Soundscape file with no GT row that survived the fold filter →
+                # pick another file. With use_train_audio=False this is the only
+                # safe escape; with True, fall back to focal.
+                if self._use_train_audio:
+                    return self._get_train_audio()
+                window_idx = int(self._rng.integers(N_WINDOWS))
+            else:
+                pick = int(self._rng.integers(len(sub)))
+                win_row = sub.iloc[pick]
+                window_idx = int(win_row["end_sec"]) // 5 - 1
         else:
             # Pseudo-only file: sample a random window uniformly.
             window_idx = int(self._rng.integers(N_WINDOWS))
@@ -324,7 +342,12 @@ class SEDTrainDataset(Dataset):
         return x, target, mask
 
     def __getitem__(self, _index: int):
-        if self._rng.random() < self.sfrac and self._sc_files:
+        # Sampling priority:
+        #   - if use_train_audio=False: always soundscape (focal pool empty)
+        #   - else: flip biased coin per soundscape_fraction
+        if not self._use_train_audio:
+            x, y, m = self._get_soundscape()
+        elif self._rng.random() < self.sfrac and self._sc_files:
             x, y, m = self._get_soundscape()
         else:
             x, y, m = self._get_train_audio()

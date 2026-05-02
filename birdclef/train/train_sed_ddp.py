@@ -282,6 +282,7 @@ def train_one_fold(cfg: dict, fold: int | None, dry_run_steps: int = 0) -> dict:
         window_seconds=int(cfg["window_seconds"]),
         pseudo_round=cfg.get("pseudo_round"),
         seed=base_seed + rank,
+        use_train_audio=bool(cfg.get("use_train_audio", True)),
     )
     if ddp:
         sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank,

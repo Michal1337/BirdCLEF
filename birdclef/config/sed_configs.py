@@ -39,6 +39,11 @@ BASELINE = dict(
     window_seconds=5,
     soundscape_fraction=0.5,
     first_window_prob=0.7,
+    # When False, train_audio (focal) pool is disabled; every batch element
+    # comes from soundscapes (labeled GT + optional pseudo). Use for clean
+    # per-fold soundscape-only training. With this on, set
+    # `soundscape_fraction=1.0` is unnecessary — sampling auto-routes.
+    use_train_audio=True,
     # Loss
     loss="focal_bce",
     focal_alpha=0.25,
@@ -78,4 +83,15 @@ SWEEP_SED_COMPARE = [
           n_mels=128, hop_length=320),
     _make(name="sed_nfnet_l0_dual", backbone="eca_nfnet_l0"),
     _make(name="sed_b0_highmix", mixup_alpha=0.8),
+]
+
+
+# Soundscape-only configs — train SED on labeled (and optionally pseudo)
+# train_soundscapes ONLY, no focal train_audio. Uses fold-k holdout for
+# legitimate OOF measurement. Pair with `_03b_stitched_oof_sed.py` after all
+# folds train.
+SWEEP_SED_SC_ONLY = [
+    _make(name="sed_b0_dual_scOnly", use_train_audio=False),
+    _make(name="sed_b0_dual_scOnly_pseudo2",
+          use_train_audio=False, pseudo_round=2),
 ]
