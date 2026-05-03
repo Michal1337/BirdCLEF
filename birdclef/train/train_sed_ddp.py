@@ -467,6 +467,62 @@ def train_one_fold(cfg: dict, fold: int | None, dry_run_steps: int = 0) -> dict:
         history_fh.write(json.dumps(record, default=str) + "\n")
         history_fh.flush()
 
+    # Initial eval at step 0 — captures the warm-start baseline whenever
+    # `init_from` is set (stage 2 finetune, fold-1 salvage, etc.). Lets us
+    # compare "stage 1's primary" to "stage 2's final primary" directly,
+    # and saves a best.pt for the warm-start state so even a regression
+    # leaves us with a working artifact.
+    if _is_main(rank) and init_from:
+        saved = ema.copy_to(model_raw)
+        fold_m = _fold_val_eval(model_raw, device, fold, n_splits=n_splits)
+        ema.restore(model_raw, saved)
+        summary = _combine_eval_summary(fold_m)
+        last_eval = summary
+        f_mauc = summary["fold_val"]["macro_auc"]
+        f_std = summary["fold_val"]["site_auc_std"] or 0.0
+        primary = f_mauc if not math.isnan(f_mauc) else float("-inf")
+        eval_label = "in_sample" if fold is None else "fold_val"
+        fold_tag = (f"fulldata seed={cfg.get('seed', 42)}" if fold is None
+                    else f"f{fold}")
+        print(
+            f"[sed:{cfg['name']} {fold_tag}] eval step=0 (warm-start init)  "
+            f"{eval_label} auc={f_mauc:.4f} "
+            f"(n={summary['fold_val']['n_files']} files)  "
+            f"site_std={f_std:.4f}  primary={primary:.4f}"
+        )
+        _log_history({
+            "kind": "eval", "step": 0, "epoch": -1,
+            "eval_kind": eval_label, "warm_start": True,
+            "fold_val_macro_auc": float(f_mauc) if not math.isnan(f_mauc) else None,
+            "site_auc_std": float(f_std),
+            "rare_auc": summary["fold_val"].get("rare_auc"),
+            "frequent_auc": summary["fold_val"].get("frequent_auc"),
+            "primary": float(primary) if not math.isinf(primary) else None,
+            "n_val_files": int(summary["fold_val"].get("n_files", 0) or 0),
+            "n_val_windows": int(summary["fold_val"].get("n_windows", 0) or 0),
+            "elapsed_min": 0.0,
+        })
+        if primary > best_primary:
+            best_primary = primary
+            best_path = ckpt_dir / "best.pt"
+            torch.save({"state_dict": model_raw.state_dict(),
+                        "ema": ema.shadow,
+                        "cfg": cfg,
+                        "step": 0,
+                        "metrics": summary,
+                        "primary": primary,
+                        "warm_start": True},
+                       best_path)
+            print(f"[sed:{cfg['name']} {fold_tag}] saved warm-start ckpt as best.pt "
+                  f"(primary={primary:.4f}) — training must beat this to overwrite")
+            _log_history({
+                "kind": "best_ckpt", "step": 0,
+                "eval_kind": eval_label, "warm_start": True,
+                "primary": float(primary), "fold_val_macro_auc": float(f_mauc),
+                "site_auc_std": float(f_std),
+                "path": str(best_path),
+            })
+
     for epoch in range(int(cfg["epochs"])):
         if sampler is not None:
             sampler.set_epoch(epoch)
