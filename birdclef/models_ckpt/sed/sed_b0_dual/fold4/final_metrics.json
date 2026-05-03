@@ -1,0 +1,14 @@
+{
+  "final": {
+    "fold_val": {
+      "macro_auc": 0.960443120790261,
+      "site_auc_std": 0.0,
+      "rare_auc": NaN,
+      "frequent_auc": NaN,
+      "n_files": 11,
+      "n_windows": 132
+    }
+  },
+  "best_primary": 0.9740973916407332,
+  "runtime_min": 83.68999709288279
+}

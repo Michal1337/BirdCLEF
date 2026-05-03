@@ -59,7 +59,7 @@ BASELINE = dict(
     grad_clip=1.0,
     ema_decay=0.999,
     # Eval
-    eval_every_n_steps=100,
+    eval_every_n_steps=500,
     pseudo_round=None,
     # DataLoader throughput — soundscape OGG decoding is the hot path under
     # pseudo-label mode. Raise workers until GPU util saturates; prefetch

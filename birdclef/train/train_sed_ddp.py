@@ -22,6 +22,8 @@ import math
 import os
 import sys
 import time
+import warnings
+warnings.filterwarnings("ignore")
 from pathlib import Path
 from typing import Dict, List
 
