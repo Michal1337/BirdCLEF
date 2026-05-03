@@ -45,8 +45,14 @@ def _load_sed_from_ckpt(ckpt_path: Path, device: torch.device) -> tuple[SED, dic
     return m, cfg
 
 
-def _export_one(sed: SED, out_path: Path, opset: int = 17) -> None:
-    """Wrap SED in SEDExportWrapper (ONNX-safe mel) and torch.onnx.export."""
+def _export_one(sed: SED, out_path: Path, opset: int = 20) -> None:
+    """Wrap SED in SEDExportWrapper (ONNX-safe mel) and torch.onnx.export.
+
+    Default opset 20 — the dynamo exporter in torch 2.10+ produces graphs at
+    natural opset ~18-20, and downconverting to 17 fails on `Pad` (no
+    onnx-script adapter). Stay at the natural target. ONNXRuntime ≥ 1.18
+    supports opset 20 fine.
+    """
     from birdclef.config.paths import WINDOW_SAMPLES
 
     wrapper = SEDExportWrapper(sed).eval().cpu()
@@ -80,7 +86,10 @@ def main() -> None:
     ap.add_argument("--ckpt-name", default="best.pt",
                     help="Checkpoint filename inside each fold dir. "
                          "Default `best.pt`.")
-    ap.add_argument("--opset", type=int, default=17)
+    ap.add_argument("--opset", type=int, default=20,
+                    help="ONNX opset version. Default 20 — the natural target "
+                         "for torch 2.10+ dynamo exporter. Stick with 20 unless "
+                         "Kaggle's ONNXRuntime is too old to handle it.")
     args = ap.parse_args()
 
     base_dir = Path(MODEL_ROOT) / "sed" / args.config

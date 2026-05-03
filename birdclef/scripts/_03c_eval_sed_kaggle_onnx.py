@@ -106,12 +106,32 @@ def _predict_file(sess, path: Path) -> np.ndarray:
     Aggregation matches the public notebook (cell 26):
         0.5 * sigmoid(clip_logits) + 0.5 * sigmoid(frame_max)
     Followed by sigma=0.65 Gaussian smoothing across the 12 windows.
+
+    Auto-detects ONNX input signature:
+      - rank 2 (B, T): our SEDExportWrapper bundle (waveform input, ConvMel
+        front-end is inside the model). Feed raw waveform windows.
+      - rank 4 (B, 1, n_mels, n_frames): Tucker's bundle (mel input). Compute
+        mel spectrograms outside the model and feed those.
     """
     from scipy.ndimage import gaussian_filter1d
-    chunks = _file_to_chunks(path)
-    mel = _audio_to_mel(chunks)
-    in_name = sess.get_inputs()[0].name
-    outs = sess.run(None, {in_name: mel})
+    chunks = _file_to_chunks(path)                                # (N_WINDOWS, WINDOW_SAMPLES)
+    in_meta = sess.get_inputs()[0]
+    in_name = in_meta.name
+    in_rank = len(in_meta.shape)
+
+    if in_rank == 2:
+        # Waveform-input: our trained SED ONNX (mel computed inside the model).
+        outs = sess.run(None, {in_name: chunks.astype(np.float32)})
+    elif in_rank == 4:
+        # Mel-input: Tucker's bundle. Compute mel externally.
+        mel = _audio_to_mel(chunks)
+        outs = sess.run(None, {in_name: mel})
+    else:
+        raise SystemExit(
+            f"Unsupported ONNX input rank {in_rank} (shape={in_meta.shape}); "
+            "expected rank 2 (waveform) or rank 4 (mel spectrogram)."
+        )
+
     clip_logits = outs[0]              # (N_WINDOWS, n_classes)
     frame_max = outs[1].max(axis=1)    # (N_WINDOWS, n_classes)
     p = 0.5 * _sigmoid(clip_logits) + 0.5 * _sigmoid(frame_max)
