@@ -1,25 +1,21 @@
-"""Two-stage fold-aware SED training: broad pretrain + labeled finetune.
+"""Two-stage fold-aware SED training: broad pretrain + soundscape finetune.
 
 Stage 1 — pretrain on the full pool (focal `train_audio` + labeled
 fold-train soundscapes + pseudo round 2) for N1 epochs. Same recipe as
 the standard `train_sed_ddp` run; uses the BASELINE config + pseudo_round.
 
-Stage 2 — finetune on labeled fold-train soundscapes ONLY for N2 epochs,
-warm-started from stage 1's best.pt with a smaller LR. Hypothesis:
-specializing the broad-pretrained backbone on in-distribution data shifts
-features toward what test_soundscapes actually looks like.
+Stage 2 — finetune on ALL SOUNDSCAPES (labeled fold-train GT + pseudo
+round 2 unlabeled) — no focal `train_audio`. Warm-started from stage 1's
+best.pt with a smaller LR. Backbone optionally frozen so only the heads
+specialize to in-distribution Pantanal calls.
 
-Why two stages: the soundscape-only training-from-scratch fails (mode
-collapse, fold OOF=0.51) because there's not enough species diversity in
-labeled soundscapes alone. But starting from a broad-pretrained backbone
-that already discriminates 234 species, the labeled fold-train pool can
-nudge it toward Pantanal-specific calling patterns without collapsing.
-
-Stage 2 is small (47 fold-train files × 12 windows = 564 rows). At
-batch=64 × 2 ranks, that's ~4 steps/epoch. Run for many "epochs" (default
-50) to get meaningful step count (~200 finetune steps total). Smaller
-batch and longer schedule are valid if you want more gradient updates;
-override via `--stage2-epochs` and `--stage2-batch-size`.
+Why this recipe: stage 1 builds broad species discrimination from focal
++ pseudo. Stage 2 strips focal, leaving only the in-distribution
+soundscape pool (~10k files × 12 windows ≈ 120k samples). The student
+specializes its predictions to soundscape acoustics without forgetting
+species features. Labeled-only stage 2 was too small (~564 rows → ~4
+steps/epoch) to do meaningful finetuning; pseudo expands the pool to
+real training scale.
 
 Output:
     MODEL_ROOT/sed/<config>_stage1/fold{f}/best.pt    ← broad-pretrain
@@ -64,23 +60,28 @@ def main() -> None:
                     help="Epochs for broad pretrain. Default 40.")
     ap.add_argument("--stage1-pseudo-round", type=int, default=2,
                     help="Pseudo round for stage 1. 0/None for no pseudo. Default 2.")
-    ap.add_argument("--stage2-epochs", type=int, default=50,
-                    help="Epochs for labeled-only finetune. With ~564 fold-train "
-                         "rows and batch=64×2 ranks, ~4 steps/epoch — so 50 epochs "
-                         "≈ 200 finetune steps. Increase if you want more.")
+    ap.add_argument("--stage2-epochs", type=int, default=20,
+                    help="Epochs for soundscape-finetune. Stage 2 pool is now "
+                         "labeled GT + pseudo (~120k samples, ~937 steps/epoch at "
+                         "batch=64×2 ranks). Default 20 epochs ≈ 18.7k steps — "
+                         "comfortable for head finetuning.")
     ap.add_argument("--stage2-lr", type=float, default=1e-4,
                     help="Stage-2 learning rate. Lower than stage 1 (1e-3) since "
                          "we're finetuning, not training from scratch.")
+    ap.add_argument("--stage2-pseudo-round", type=int, default=2,
+                    help="Pseudo round for stage 2. Default 2 (uses round 2 to "
+                         "expand the soundscape pool). Set to 0 / None to use "
+                         "labeled fold-train ONLY (legacy small-pool recipe; not "
+                         "recommended).")
     ap.add_argument("--stage2-batch-size", type=int, default=None,
-                    help="Override batch size for stage 2 (default: same as stage 1). "
-                         "Smaller batch (e.g. 16) gives more gradient steps per epoch.")
+                    help="Override batch size for stage 2 (default: same as stage 1).")
     ap.add_argument("--stage2-warmup-frac", type=float, default=0.0,
                     help="Stage-2 warmup fraction. Default 0.0 — no warmup needed "
                          "when warm-starting from a converged backbone.")
-    ap.add_argument("--stage2-eval-every-n-steps", type=int, default=20,
-                    help="Eval frequency (steps) for stage 2. BASELINE default "
-                         "of 500 misses entirely on the small stage-2 step count. "
-                         "Default 20 → ~10 evals during a typical 50-epoch run.")
+    ap.add_argument("--stage2-eval-every-n-steps", type=int, default=500,
+                    help="Eval frequency (steps) for stage 2. With the expanded "
+                         "soundscape pool (~937 steps/epoch), the BASELINE default "
+                         "of 500 fires ~37 times across 20 epochs — fine.")
     ap.add_argument("--stage2-freeze-backbone", action="store_true", default=True,
                     help="Stage 2: freeze the backbone (timm CNN). Only the "
                          "attention pool + clip head + framewise head are "
@@ -137,8 +138,12 @@ def main() -> None:
     s2_overrides = {
         **common_overrides,
         "epochs": int(args.stage2_epochs),
-        "use_train_audio": False,
-        "pseudo_round": None,                # labeled-only finetune
+        "use_train_audio": False,            # no focal in stage 2
+        # pseudo_round: default 2 → expand soundscape pool with pseudo
+        # rows. Set --stage2-pseudo-round 0 to revert to labeled-only.
+        "pseudo_round": (int(args.stage2_pseudo_round)
+                         if args.stage2_pseudo_round and args.stage2_pseudo_round > 0
+                         else None),
         "lr": float(args.stage2_lr),
         "warmup_frac": float(args.stage2_warmup_frac),
         "eval_every_n_steps": int(args.stage2_eval_every_n_steps),
@@ -152,9 +157,13 @@ def main() -> None:
     if _is_main_rank():
         print()
         print("=" * 78)
-        print(f"STAGE 2 — labeled finetune  config={s2_name}  fold={args.fold}  "
+        pool_desc = ("labeled+pseudo soundscapes" if s2_overrides["pseudo_round"]
+                     else "labeled soundscapes only")
+        print(f"STAGE 2 — soundscape finetune ({pool_desc})  "
+              f"config={s2_name}  fold={args.fold}  "
               f"epochs={s2_overrides['epochs']}  lr={s2_overrides['lr']:.2e}")
         print(f"  freeze_backbone={s2_overrides['freeze_backbone']}  "
+              f"pseudo_round={s2_overrides['pseudo_round']}  "
               f"eval_every_n_steps={s2_overrides['eval_every_n_steps']}")
         print(f"  init_from={s1_ckpt}")
         print("=" * 78)
