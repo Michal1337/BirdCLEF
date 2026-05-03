@@ -144,6 +144,7 @@ def main() -> None:
         if not ckpt.exists():
             print(f"[export] WARN: missing {ckpt}; skipping")
             continue
+        out_path = out_dir / out_filename
         print(f"[export] {subdir}: {ckpt} → {out_path}")
         sed, cfg = _load_sed_from_ckpt(ckpt, device)
         _export_one(sed, out_path, opset=int(args.opset),
