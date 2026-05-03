@@ -77,10 +77,24 @@ def main() -> None:
     ap.add_argument("--stage2-warmup-frac", type=float, default=0.0,
                     help="Stage-2 warmup fraction. Default 0.0 — no warmup needed "
                          "when warm-starting from a converged backbone.")
+    ap.add_argument("--stage2-eval-every-n-steps", type=int, default=20,
+                    help="Eval frequency (steps) for stage 2. BASELINE default "
+                         "of 500 misses entirely on the small stage-2 step count. "
+                         "Default 20 → ~10 evals during a typical 50-epoch run.")
+    ap.add_argument("--stage2-freeze-backbone", action="store_true", default=True,
+                    help="Stage 2: freeze the backbone (timm CNN). Only the "
+                         "attention pool + clip head + framewise head are "
+                         "trained. Keeps backbone BN running stats frozen so "
+                         "the small finetune dataset doesn't drift them. "
+                         "Default ON — disable with --no-stage2-freeze-backbone.")
+    ap.add_argument("--no-stage2-freeze-backbone", action="store_false",
+                    dest="stage2_freeze_backbone",
+                    help="Train the full model in stage 2 (legacy behavior).")
     ap.add_argument("--stage2-only", action="store_true",
                     help="Skip stage 1 (assumes <config>_stage1/fold{f}/best.pt "
                          "already exists). Useful for re-running stage 2 with "
-                         "different LR / epoch count without re-pretraining.")
+                         "different LR / epoch count / freeze settings without "
+                         "re-pretraining. Stage 1 must have finished first.")
     ap.add_argument("--override", nargs="*", default=[],
                     help="k=v pairs (JSON-parsed) applied to BOTH stages' configs.")
     args = ap.parse_args()
@@ -127,6 +141,8 @@ def main() -> None:
         "pseudo_round": None,                # labeled-only finetune
         "lr": float(args.stage2_lr),
         "warmup_frac": float(args.stage2_warmup_frac),
+        "eval_every_n_steps": int(args.stage2_eval_every_n_steps),
+        "freeze_backbone": bool(args.stage2_freeze_backbone),
         "init_from": str(s1_ckpt),
     }
     if args.stage2_batch_size is not None:
@@ -138,6 +154,8 @@ def main() -> None:
         print("=" * 78)
         print(f"STAGE 2 — labeled finetune  config={s2_name}  fold={args.fold}  "
               f"epochs={s2_overrides['epochs']}  lr={s2_overrides['lr']:.2e}")
+        print(f"  freeze_backbone={s2_overrides['freeze_backbone']}  "
+              f"eval_every_n_steps={s2_overrides['eval_every_n_steps']}")
         print(f"  init_from={s1_ckpt}")
         print("=" * 78)
     train_one_fold(s2_cfg, fold=int(args.fold))

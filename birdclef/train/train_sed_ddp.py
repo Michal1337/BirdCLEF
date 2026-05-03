@@ -300,9 +300,31 @@ def train_one_fold(cfg: dict, fold: int | None, dry_run_steps: int = 0) -> dict:
                     if n in ema_shadow:
                         p.data.copy_(ema_shadow[n].to(p.device))
 
+    # Optional: freeze the backbone (timm CNN). Used for stage-2 finetune
+    # in the two-stage recipe — only the heads + attention pool train, so
+    # 200 finetune steps on 564 rows can specialize the heads without
+    # disturbing the broad-pretrained features. BN running stats are also
+    # frozen (backbone.eval() in the train loop) so the small finetune
+    # dataset can't drift them.
+    if bool(cfg.get("freeze_backbone", False)):
+        for p in model_raw.backbone.parameters():
+            p.requires_grad = False
+        if _is_main(rank):
+            n_total = sum(p.numel() for p in model_raw.parameters())
+            n_trainable = sum(p.numel() for p in model_raw.parameters()
+                              if p.requires_grad)
+            print(f"[sed:{cfg['name']} f{fold}] freeze_backbone=True — "
+                  f"trainable: {n_trainable:,} / {n_total:,} "
+                  f"({100 * n_trainable / max(1, n_total):.1f}%)")
+
     if ddp:
-        model = DDP(model, device_ids=[local_rank] if torch.cuda.is_available() else None,
-                    find_unused_parameters=False)
+        # `find_unused_parameters=True` when freezing — DDP needs to know
+        # the backbone has no gradients flowing back.
+        model = DDP(
+            model,
+            device_ids=[local_rank] if torch.cuda.is_available() else None,
+            find_unused_parameters=bool(cfg.get("freeze_backbone", False)),
+        )
     ema = EMA(model_raw, decay=float(cfg["ema_decay"]))
 
     # Loss
@@ -356,7 +378,10 @@ def train_one_fold(cfg: dict, fold: int | None, dry_run_steps: int = 0) -> dict:
 
     wav_aug = WaveformAug().to(device)
 
-    opt = torch.optim.AdamW(model.parameters(), lr=float(cfg["lr"]),
+    # Only optimize parameters with requires_grad=True (omits frozen backbone
+    # when `freeze_backbone` is set).
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    opt = torch.optim.AdamW(trainable_params, lr=float(cfg["lr"]),
                             weight_decay=float(cfg["weight_decay"]))
     steps_per_epoch = max(1, len(loader))
     total_steps = max(1, int(cfg["epochs"]) * steps_per_epoch)
@@ -459,6 +484,10 @@ def train_one_fold(cfg: dict, fold: int | None, dry_run_steps: int = 0) -> dict:
             loss_mask = loss_mask.to(device, non_blocking=True).float()
             if model.training is False:
                 model.train()
+                # If backbone is frozen, keep it in eval mode so BN running
+                # stats don't drift on the small finetune dataset.
+                if bool(cfg.get("freeze_backbone", False)):
+                    model_raw.backbone.eval()
             if float(cfg["mixup_alpha"]) > 0:
                 wav, y = mixup(wav, y, alpha=float(cfg["mixup_alpha"]),
                                mode=str(cfg["mixup_mode"]))
