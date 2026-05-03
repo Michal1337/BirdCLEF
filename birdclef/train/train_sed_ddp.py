@@ -254,6 +254,38 @@ def train_one_fold(cfg: dict, fold: int | None, dry_run_steps: int = 0) -> dict:
 
     model = build_sed_model(cfg, device)
     model_raw = model
+    # Optional warm-start from a previous fold's best.pt — useful for salvaging
+    # folds that fell into the mode-collapse attractor (val AUC stuck at 0.5).
+    # Pre-loaded weights give the optimizer a non-trivial starting point that's
+    # already past the all-zero region.
+    init_from = cfg.get("init_from")
+    if init_from:
+        ckpt_path = Path(init_from)
+        if not ckpt_path.exists():
+            raise SystemExit(f"init_from checkpoint not found: {ckpt_path}")
+        if _is_main(rank):
+            print(f"[sed:{cfg['name']} f{fold}] WARM-START from {ckpt_path}")
+        state = torch.load(ckpt_path, map_location=device)
+        sd = state.get("state_dict", state)
+        # Load with strict=False so a slight architecture variation (e.g. the
+        # framewise head added later) doesn't break the warm-start.
+        missing, unexpected = model_raw.load_state_dict(sd, strict=False)
+        if _is_main(rank):
+            if missing:
+                print(f"  missing keys: {len(missing)} (first 5: {missing[:5]})")
+            if unexpected:
+                print(f"  unexpected keys: {len(unexpected)} (first 5: {unexpected[:5]})")
+        # If the ckpt has EMA shadow, prefer those weights as init too — they're
+        # smoother than the raw state_dict at the moment of save.
+        ema_shadow = state.get("ema") or {}
+        if ema_shadow and _is_main(rank):
+            print(f"  applying EMA shadow ({len(ema_shadow)} params)")
+        if ema_shadow:
+            with torch.no_grad():
+                for n, p in model_raw.named_parameters():
+                    if n in ema_shadow:
+                        p.data.copy_(ema_shadow[n].to(p.device))
+
     if ddp:
         model = DDP(model, device_ids=[local_rank] if torch.cuda.is_available() else None,
                     find_unused_parameters=False)
@@ -356,6 +388,39 @@ def train_one_fold(cfg: dict, fold: int | None, dry_run_steps: int = 0) -> dict:
     last_eval = {}
     t0 = time.time()
 
+    # Per-fold training history — JSONL, append on rank 0 only. One line per
+    # log event ({"kind": "step" | "eval" | "final", ...}). Easy to tail
+    # during training, easy to parse afterwards.
+    history_path = ckpt_dir / "train_history.jsonl"
+    history_fh = None
+    if _is_main(rank):
+        history_fh = open(history_path, "w", encoding="utf-8")
+        # Header line: capture the resolved config + schedule for reproducibility
+        header = {
+            "kind": "header",
+            "config": {k: (list(v) if isinstance(v, tuple) else v) for k, v in cfg.items()
+                       if isinstance(v, (int, float, str, bool, list, tuple, type(None)))},
+            "fold": fold,
+            "n_splits": n_splits,
+            "world_size": int(world_size),
+            "steps_per_epoch": int(steps_per_epoch),
+            "total_steps": int(total_steps),
+            "warmup_steps": int(warmup_steps),
+            "dataset_len": int(len(dataset)),
+            "amp_dtype": amp_dtype_name,
+            "started_at": time.time(),
+        }
+        history_fh.write(json.dumps(header, default=str) + "\n")
+        history_fh.flush()
+        print(f"[sed:{cfg['name']} f{fold}] training history → {history_path}")
+
+    def _log_history(record: dict) -> None:
+        """Append one JSON record to train_history.jsonl. Rank-0 only."""
+        if history_fh is None:
+            return
+        history_fh.write(json.dumps(record, default=str) + "\n")
+        history_fh.flush()
+
     for epoch in range(int(cfg["epochs"])):
         if sampler is not None:
             sampler.set_epoch(epoch)
@@ -408,8 +473,15 @@ def train_one_fold(cfg: dict, fold: int | None, dry_run_steps: int = 0) -> dict:
             ema.update(model_raw)
 
             if _is_main(rank) and step % 50 == 0:
-                print(f"[sed:{cfg['name']} f{fold}] step={step} loss={loss.item():.4f} "
-                      f"lr={opt.param_groups[0]['lr']:.2e}")
+                cur_lr = float(opt.param_groups[0]["lr"])
+                cur_loss = float(loss.item())
+                print(f"[sed:{cfg['name']} f{fold}] step={step} loss={cur_loss:.4f} "
+                      f"lr={cur_lr:.2e}")
+                _log_history({
+                    "kind": "step", "step": int(step), "epoch": int(epoch),
+                    "loss": cur_loss, "lr": cur_lr,
+                    "elapsed_min": (time.time() - t0) / 60.0,
+                })
 
             # Periodic eval (rank 0 only): fold-val only. V-anchor was
             # abandoned — see plan file. Best checkpoint = highest
@@ -429,6 +501,18 @@ def train_one_fold(cfg: dict, fold: int | None, dry_run_steps: int = 0) -> dict:
                     f"(n={summary['fold_val']['n_files']} files)  "
                     f"site_std={f_std:.4f}  primary={primary:.4f}"
                 )
+                _log_history({
+                    "kind": "eval", "step": int(step), "epoch": int(epoch),
+                    "fold_val_macro_auc": float(f_mauc) if not math.isnan(f_mauc) else None,
+                    "site_auc_std": float(f_std),
+                    "rare_auc": summary["fold_val"].get("rare_auc"),
+                    "frequent_auc": summary["fold_val"].get("frequent_auc"),
+                    "primary": float(primary) if not math.isinf(primary) else None,
+                    "n_val_files": int(summary["fold_val"].get("n_files", 0) or 0),
+                    "n_val_windows": int(summary["fold_val"].get("n_windows", 0) or 0),
+                    "best_primary_so_far": float(best_primary) if not math.isinf(best_primary) else None,
+                    "elapsed_min": (time.time() - t0) / 60.0,
+                })
                 if primary > best_primary:
                     best_primary = primary
                     best_path = ckpt_dir / "best.pt"
@@ -441,6 +525,12 @@ def train_one_fold(cfg: dict, fold: int | None, dry_run_steps: int = 0) -> dict:
                                best_path)
                     print(f"[sed:{cfg['name']} f{fold}] ↑ new best primary={primary:.4f}  "
                           f"(fold_val={f_mauc:.4f})")
+                    _log_history({
+                        "kind": "best_ckpt", "step": int(step),
+                        "primary": float(primary), "fold_val_macro_auc": float(f_mauc),
+                        "site_auc_std": float(f_std),
+                        "path": str(best_path),
+                    })
             step += 1
             if dry_run_steps and step >= dry_run_steps:
                 break
@@ -479,6 +569,20 @@ def train_one_fold(cfg: dict, fold: int | None, dry_run_steps: int = 0) -> dict:
         )
         print(f"[sed:{cfg['name']} f{fold}] DONE best_primary={best_primary:.4f} "
               f"runtime={(time.time()-t0)/60:.1f}m")
+        _log_history({
+            "kind": "final", "step": int(step),
+            "fold_val_macro_auc": float(f_mauc) if not math.isnan(f_mauc) else None,
+            "site_auc_std": float(f_std),
+            "rare_auc": summary["fold_val"].get("rare_auc"),
+            "frequent_auc": summary["fold_val"].get("frequent_auc"),
+            "primary": float(final_primary) if not math.isinf(final_primary) else None,
+            "best_primary": float(best_primary) if not math.isinf(best_primary) else None,
+            "n_val_files": int(summary["fold_val"].get("n_files", 0) or 0),
+            "n_val_windows": int(summary["fold_val"].get("n_windows", 0) or 0),
+            "runtime_min": (time.time() - t0) / 60.0,
+        })
+        if history_fh is not None:
+            history_fh.close()
     _teardown_ddp(ddp)
     # Caller side reads `metrics.global` for the sweep summary; we surface
     # the fold_val summary there so a single-fold run produces a usable row
