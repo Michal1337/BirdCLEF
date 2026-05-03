@@ -111,29 +111,37 @@ def _site_hour_ids(meta_files: pd.DataFrame, site2i: dict, cap: int):
     return sids, hids
 
 
+def _ssm_device() -> torch.device:
+    """Pick CUDA when available; CPU otherwise. Used by both ProtoSSM and
+    ResidualSSM training/prediction. With pseudo-augmented training the
+    pool grows to ~120k rows, so GPU is meaningfully faster than CPU."""
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
 def _train_proto_ssm(
     emb: np.ndarray, scores: np.ndarray, Y: np.ndarray, meta_files: pd.DataFrame,
     cfg: dict,
 ) -> LightProtoSSM:
+    device = _ssm_device()
     n_classes = Y.shape[1]
     cap = int(cfg["n_sites_cap"])
     model = LightProtoSSM(SSMHeadConfig(
         d_input=emb.shape[1], n_classes=n_classes, n_windows=N_WINDOWS,
         n_sites=cap, use_cross_attn=True, cross_attn_heads=2,
-    ))
+    )).to(device)
     model.init_prototypes(
-        torch.tensor(emb, dtype=torch.float32),
-        torch.tensor(Y, dtype=torch.float32),
+        torch.tensor(emb, dtype=torch.float32, device=device),
+        torch.tensor(Y, dtype=torch.float32, device=device),
     )
     site2i = _site2i(meta_files, cap)
     site_ids, hour_ids = _site_hour_ids(meta_files, site2i, cap)
 
     n_files = emb.shape[0] // N_WINDOWS
-    emb_t = torch.tensor(emb.reshape(n_files, N_WINDOWS, -1), dtype=torch.float32)
-    sc_t = torch.tensor(scores.reshape(n_files, N_WINDOWS, -1), dtype=torch.float32)
-    lab_t = torch.tensor(Y.reshape(n_files, N_WINDOWS, -1).astype(np.float32))
-    site_t = torch.tensor(site_ids, dtype=torch.long)
-    hour_t = torch.tensor(hour_ids, dtype=torch.long)
+    emb_t = torch.tensor(emb.reshape(n_files, N_WINDOWS, -1), dtype=torch.float32, device=device)
+    sc_t = torch.tensor(scores.reshape(n_files, N_WINDOWS, -1), dtype=torch.float32, device=device)
+    lab_t = torch.tensor(Y.reshape(n_files, N_WINDOWS, -1).astype(np.float32), device=device)
+    site_t = torch.tensor(site_ids, dtype=torch.long, device=device)
+    hour_t = torch.tensor(hour_ids, dtype=torch.long, device=device)
 
     loss_kind = cfg["loss"]
     if loss_kind == "focal_bce":
@@ -152,7 +160,7 @@ def _train_proto_ssm(
             float(cfg["proto_pos_weight_cap"]),
         ).astype(np.float32)
         loss_fn = build_loss("bce_posw",
-                             pos_weight=torch.tensor(pos_w),
+                             pos_weight=torch.tensor(pos_w, device=device),
                              label_smoothing=float(cfg["label_smoothing"]))
 
     opt = torch.optim.AdamW(model.parameters(), lr=float(cfg["proto_lr"]), weight_decay=1e-3)
@@ -210,14 +218,17 @@ def _predict_proto(
     model, emb: np.ndarray, scores: np.ndarray, meta_files: pd.DataFrame,
     cfg: dict,
 ) -> np.ndarray:
+    # Pick the model's own device — handles both training-just-finished case
+    # (model on GPU) and reload-from-checkpoint case (model on CPU until moved).
+    device = next(model.parameters()).device
     cap = int(cfg["n_sites_cap"])
     site2i = _site2i(meta_files, cap)
     site_ids, hour_ids = _site_hour_ids(meta_files, site2i, cap)
     n_files = emb.shape[0] // N_WINDOWS
-    emb_t = torch.tensor(emb.reshape(n_files, N_WINDOWS, -1), dtype=torch.float32)
-    sc_t = torch.tensor(scores.reshape(n_files, N_WINDOWS, -1), dtype=torch.float32)
-    site_t = torch.tensor(site_ids, dtype=torch.long)
-    hour_t = torch.tensor(hour_ids, dtype=torch.long)
+    emb_t = torch.tensor(emb.reshape(n_files, N_WINDOWS, -1), dtype=torch.float32, device=device)
+    sc_t = torch.tensor(scores.reshape(n_files, N_WINDOWS, -1), dtype=torch.float32, device=device)
+    site_t = torch.tensor(site_ids, dtype=torch.long, device=device)
+    hour_t = torch.tensor(hour_ids, dtype=torch.long, device=device)
     if cfg["tta"] == "window_roll":
         shifts = tuple(int(x) for x in cfg["tta_shifts"])
         outs = []
@@ -227,7 +238,7 @@ def _predict_proto(
                     e = emb_t; sc = sc_t
                 else:
                     e = torch.roll(emb_t, s, dims=1); sc = torch.roll(sc_t, s, dims=1)
-                o = model(e, sc, site_ids=site_t, hours=hour_t).numpy()
+                o = model(e, sc, site_ids=site_t, hours=hour_t).cpu().numpy()
                 if s != 0:
                     o = np.roll(o, -s, axis=1)
                 outs.append(o)
@@ -236,7 +247,7 @@ def _predict_proto(
     # so we do a single pass. Real waveform-shift TTA lives in the inference
     # template where raw audio is available and Perch runs >1 time.
     with torch.no_grad():
-        o = model(emb_t, sc_t, site_ids=site_t, hours=hour_t).numpy()
+        o = model(emb_t, sc_t, site_ids=site_t, hours=hour_t).cpu().numpy()
     return o.reshape(-1, scores.shape[1])
 
 
@@ -451,6 +462,7 @@ def _apply_mlp_probes(
 def _train_residual(
     emb, first_pass_flat, Y, site_ids, hour_ids, cfg
 ):
+    device = _ssm_device()
     n_classes = Y.shape[1]
     n_files = emb.shape[0] // N_WINDOWS
     emb_f = emb.reshape(n_files, N_WINDOWS, -1)
@@ -465,11 +477,11 @@ def _train_residual(
     perm = torch.randperm(n_files, generator=rng).numpy()
     n_val = max(1, int(0.15 * n_files))
     tr_i = perm[n_val:]; va_i = perm[:n_val]
-    emb_t = torch.tensor(emb_f, dtype=torch.float32)
-    fp_t = torch.tensor(fp_f, dtype=torch.float32)
-    res_t = torch.tensor(residuals, dtype=torch.float32)
-    site_t = torch.tensor(site_ids, dtype=torch.long)
-    hour_t = torch.tensor(hour_ids, dtype=torch.long)
+    emb_t = torch.tensor(emb_f, dtype=torch.float32, device=device)
+    fp_t = torch.tensor(fp_f, dtype=torch.float32, device=device)
+    res_t = torch.tensor(residuals, dtype=torch.float32, device=device)
+    site_t = torch.tensor(site_ids, dtype=torch.long, device=device)
+    hour_t = torch.tensor(hour_ids, dtype=torch.long, device=device)
 
     model = ResidualSSM(ResidualSSMConfig(
         d_input=emb.shape[1], d_scores=n_classes, n_classes=n_classes,
@@ -477,7 +489,7 @@ def _train_residual(
         d_model=int(cfg["residual_d_model"]),
         d_state=int(cfg["residual_d_state"]),
         dropout=float(cfg["residual_dropout"]),
-    ))
+    )).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=float(cfg["residual_lr"]), weight_decay=1e-3)
     n_epochs = int(cfg["residual_n_epochs"])
     sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=float(cfg["residual_lr"]),
@@ -611,14 +623,15 @@ def run_pipeline_for_split(
     first_pass_tr = float(cfg["ensemble_w"]) * proto_tr + (1.0 - float(cfg["ensemble_w"])) * sc_tr_mlp
 
     res = _train_residual(emb_tr, first_pass_tr, Y_tr, tr_site_ids, tr_hour_ids, cfg)
+    res_device = next(res.parameters()).device
     with torch.no_grad():
         n_va = emb_va.shape[0] // N_WINDOWS
         corr = res(
-            torch.tensor(emb_va.reshape(n_va, N_WINDOWS, -1), dtype=torch.float32),
-            torch.tensor(first_pass_va.reshape(n_va, N_WINDOWS, -1), dtype=torch.float32),
-            site_ids=torch.tensor(va_site_ids, dtype=torch.long),
-            hours=torch.tensor(va_hour_ids, dtype=torch.long),
-        ).numpy().reshape(-1, cache.Y.shape[1])
+            torch.tensor(emb_va.reshape(n_va, N_WINDOWS, -1), dtype=torch.float32, device=res_device),
+            torch.tensor(first_pass_va.reshape(n_va, N_WINDOWS, -1), dtype=torch.float32, device=res_device),
+            site_ids=torch.tensor(va_site_ids, dtype=torch.long, device=res_device),
+            hours=torch.tensor(va_hour_ids, dtype=torch.long, device=res_device),
+        ).cpu().numpy().reshape(-1, cache.Y.shape[1])
     final_logits = first_pass_va + float(cfg["correction_weight"]) * corr
 
     # Calibrated thresholds + post-processing
