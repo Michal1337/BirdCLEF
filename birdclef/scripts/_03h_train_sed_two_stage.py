@@ -92,10 +92,22 @@ def main() -> None:
                     dest="stage2_freeze_backbone",
                     help="Train the full model in stage 2 (legacy behavior).")
     ap.add_argument("--stage2-only", action="store_true",
-                    help="Skip stage 1 (assumes <config>_stage1/fold{f}/best.pt "
+                    help="Skip stage 1 (assumes <stage1-from>/fold{f}/best.pt "
                          "already exists). Useful for re-running stage 2 with "
                          "different LR / epoch count / freeze settings without "
                          "re-pretraining. Stage 1 must have finished first.")
+    ap.add_argument("--stage1-from", type=str, default=None,
+                    help="Override the config name to look for stage-1 "
+                         "checkpoints under. Default: <config>_stage1. Use "
+                         "this to reuse fold checkpoints from a prior "
+                         "training run, e.g. `--stage1-from sed_b0_dual` "
+                         "loads from `MODEL_ROOT/sed/sed_b0_dual/fold{k}/best.pt`. "
+                         "Combine with --stage2-only to skip retraining stage 1.")
+    ap.add_argument("--stage1-ckpt", type=str, default=None,
+                    help="Direct override of the stage-1 checkpoint path. "
+                         "Use `{fold}` as a placeholder for the fold index, "
+                         "e.g. `--stage1-ckpt path/to/fold{fold}/best.pt`. "
+                         "Takes precedence over --stage1-from if both given.")
     ap.add_argument("--override", nargs="*", default=[],
                     help="k=v pairs (JSON-parsed) applied to BOTH stages' configs.")
     args = ap.parse_args()
@@ -104,7 +116,10 @@ def main() -> None:
     from birdclef.train.train_sed_ddp import parse_overrides
     common_overrides = parse_overrides(args.override)
 
-    s1_name = f"{args.config}_stage1"
+    # Stage 1 dir name. If --stage1-from is given (e.g. to reuse the
+    # existing `sed_b0_dual` fold checkpoints), use it; otherwise default
+    # to `<config>_stage1`.
+    s1_name = args.stage1_from if args.stage1_from else f"{args.config}_stage1"
     s2_name = f"{args.config}_stage2"
 
     # ── Stage 1: broad pretrain ─────────────────────────────────────────
@@ -127,8 +142,11 @@ def main() -> None:
         train_one_fold(s1_cfg, fold=int(args.fold))
 
     # ── Stage 2: labeled fine-tune, warm-started from stage 1 ───────────
-    s1_ckpt = (Path(MODEL_ROOT) / "sed" / s1_name
-               / f"fold{int(args.fold)}" / "best.pt")
+    if args.stage1_ckpt:
+        s1_ckpt = Path(args.stage1_ckpt.format(fold=int(args.fold)))
+    else:
+        s1_ckpt = (Path(MODEL_ROOT) / "sed" / s1_name
+                   / f"fold{int(args.fold)}" / "best.pt")
     if not s1_ckpt.exists():
         raise SystemExit(
             f"Stage 1 ckpt not found at {s1_ckpt}. "
