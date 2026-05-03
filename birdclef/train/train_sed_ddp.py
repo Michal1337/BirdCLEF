@@ -201,9 +201,21 @@ def _fold_val_eval(
     model: torch.nn.Module, device: torch.device, fold: int,
     n_splits: int = 5, max_files: int = 0,
 ) -> Dict:
-    """Evaluate on the val split of the current training fold. Rank-0 only."""
+    """Evaluate on the val files. Rank-0 only.
+
+    - Fold-aware mode (fold=0..n_splits-1): evaluate on that fold's
+      held-out val files (honest OOF).
+    - Full-data mode (fold=None): evaluate on ALL labeled soundscapes
+      (in-sample fit, LEAKED — the model was trained on these rows).
+      Useful for collapse detection and confirming the model reached
+      the memorization ceiling. NOT a generalization metric.
+    """
     if fold is None:
-        return {"macro_auc": float("nan"), "n_files": 0, "n_windows": 0}
+        sc_meta = load_soundscape_meta()
+        all_labeled = sc_meta[sc_meta["fully_labeled"]]["filename"].astype(str).unique().tolist()
+        return _eval_on_soundscape_files(
+            model, device, all_labeled, max_files=max_files,
+        )
     return _eval_on_soundscape_files(
         model, device, _fold_val_filenames(fold, n_splits=n_splits),
         max_files=max_files,
@@ -385,7 +397,14 @@ def train_one_fold(cfg: dict, fold: int | None, dry_run_steps: int = 0) -> dict:
     step = 0
     best_primary = float("-inf")
     best_path = None
-    ckpt_dir = Path(MODEL_ROOT) / "sed" / cfg["name"] / f"fold{fold if fold is not None else -1}"
+    # In full-data mode (fold=None) different seeds need different ckpt dirs
+    # so multi-seed runs don't clobber each other. Fold-aware mode keeps the
+    # original `fold{k}` layout.
+    if fold is None:
+        ckpt_dir = (Path(MODEL_ROOT) / "sed" / cfg["name"]
+                    / f"fulldata_seed{int(cfg.get('seed', 42))}")
+    else:
+        ckpt_dir = Path(MODEL_ROOT) / "sed" / cfg["name"] / f"fold{fold}"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     last_eval = {}
     t0 = time.time()
@@ -496,18 +515,23 @@ def train_one_fold(cfg: dict, fold: int | None, dry_run_steps: int = 0) -> dict:
                 last_eval = summary
                 f_mauc = summary["fold_val"]["macro_auc"]
                 f_std = summary["fold_val"]["site_auc_std"] or 0.0
-                # Primary metric for best-checkpoint selection = fold-val
-                # macro AUC. Tracks the competition metric directly. site_std
-                # is still printed and saved as a diagnostic.
+                # Primary metric for best-checkpoint selection = val macro AUC.
+                # In fold-aware mode this is honest OOF; in full-data mode this
+                # is in-sample fit (leaked but useful for collapse detection
+                # and memorization-ceiling check).
                 primary = f_mauc if not math.isnan(f_mauc) else float("-inf")
+                eval_label = "in_sample" if fold is None else "fold_val"
+                fold_tag = (f"fulldata seed={cfg.get('seed', 42)}" if fold is None
+                            else f"f{fold}")
                 print(
-                    f"[sed:{cfg['name']} f{fold}] eval step={step}  "
-                    f"fold_val auc={f_mauc:.4f} "
+                    f"[sed:{cfg['name']} {fold_tag}] eval step={step}  "
+                    f"{eval_label} auc={f_mauc:.4f} "
                     f"(n={summary['fold_val']['n_files']} files)  "
                     f"site_std={f_std:.4f}  primary={primary:.4f}"
                 )
                 _log_history({
                     "kind": "eval", "step": int(step), "epoch": int(epoch),
+                    "eval_kind": eval_label,    # "in_sample" or "fold_val"
                     "fold_val_macro_auc": float(f_mauc) if not math.isnan(f_mauc) else None,
                     "site_auc_std": float(f_std),
                     "rare_auc": summary["fold_val"].get("rare_auc"),
@@ -528,10 +552,11 @@ def train_one_fold(cfg: dict, fold: int | None, dry_run_steps: int = 0) -> dict:
                                 "metrics": summary,
                                 "primary": primary},
                                best_path)
-                    print(f"[sed:{cfg['name']} f{fold}] ↑ new best primary={primary:.4f}  "
-                          f"(fold_val={f_mauc:.4f})")
+                    print(f"[sed:{cfg['name']} {fold_tag}] ↑ new best primary={primary:.4f}  "
+                          f"({eval_label}={f_mauc:.4f})")
                     _log_history({
                         "kind": "best_ckpt", "step": int(step),
+                        "eval_kind": eval_label,
                         "primary": float(primary), "fold_val_macro_auc": float(f_mauc),
                         "site_auc_std": float(f_std),
                         "path": str(best_path),
@@ -558,13 +583,26 @@ def train_one_fold(cfg: dict, fold: int | None, dry_run_steps: int = 0) -> dict:
             f"(n={summary['fold_val']['n_files']})  "
             f"site_std={f_std:.4f}  primary={final_primary:.4f}"
         )
-        if final_primary > best_primary:
-            best_primary = final_primary
+        # In full-data mode (fold=None) there's no held-out fold-val, so the
+        # primary is NaN/-inf and best-ckpt selection during training never
+        # fired. Save the FINAL (EMA-applied) state as best.pt — that's the
+        # deployable artifact. In fold-aware mode, this branch only fires if
+        # the final eval beats the best seen during training, which is rare
+        # but valid.
+        if fold is None or final_primary > best_primary:
+            best_primary = final_primary if final_primary > best_primary else best_primary
             best_path = ckpt_dir / "best.pt"
+            # Write EMA shadow as the "deployed" weights (the model is in
+            # `saved`-restored state right now, so re-snapshot EMA before save).
+            ema_saved = ema.copy_to(model_raw)
             torch.save({"state_dict": model_raw.state_dict(),
                         "ema": ema.shadow, "cfg": cfg, "step": step,
                         "metrics": summary, "primary": final_primary},
                        best_path)
+            ema.restore(model_raw, ema_saved)
+            if fold is None:
+                print(f"[sed:{cfg['name']} fulldata seed={cfg.get('seed', 42)}] "
+                      f"saved final ckpt → {best_path}")
         (ckpt_dir / "final_metrics.json").write_text(
             json.dumps({
                 "final": summary,
@@ -617,7 +655,12 @@ def parse_overrides(pairs: list[str]) -> dict:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", required=True, help="Name key in sed_configs; honoured verbatim")
-    ap.add_argument("--fold", type=int, default=0)
+    ap.add_argument("--fold", type=int, default=0,
+                    help="Fold index 0..n_splits-1 for fold-aware training, "
+                         "or -1 for full-data (no holdout — trains on every "
+                         "labeled file, skips fold-val eval). Use full-data "
+                         "for actual LB deployment after fold-aware OOF "
+                         "validates the recipe.")
     ap.add_argument("--dry-run-steps", type=int, default=0)
     ap.add_argument("--override", nargs="*", default=[],
                     help="k=v pairs (JSON-parsed) to override config")
@@ -625,7 +668,11 @@ def main():
     overrides = parse_overrides(args.override)
 
     cfg = _build_cfg(args.config, overrides)
-    train_one_fold(cfg, fold=args.fold, dry_run_steps=int(args.dry_run_steps))
+    # --fold -1 → full-data mode (no holdout). Pass fold=None into the trainer
+    # so SEDTrainDataset skips the fold filter and the fold-val eval returns
+    # NaN AUC (no eval performed).
+    fold_arg = None if int(args.fold) < 0 else int(args.fold)
+    train_one_fold(cfg, fold=fold_arg, dry_run_steps=int(args.dry_run_steps))
 
 
 if __name__ == "__main__":

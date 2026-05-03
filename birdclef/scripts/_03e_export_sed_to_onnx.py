@@ -92,8 +92,14 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", required=True,
                     help="SED config name; checkpoints expected at "
-                         f"{MODEL_ROOT}/sed/<config>/fold{{0..K-1}}/best.pt")
-    ap.add_argument("--n-folds", type=int, default=5)
+                         f"{MODEL_ROOT}/sed/<config>/<subdir>/best.pt where "
+                         "<subdir> is `fold{N}` for fold-aware or "
+                         "`fulldata_seed{S}` for full-data multi-seed.")
+    ap.add_argument("--n-folds", type=int, default=5,
+                    help="Number of folds to export (fold-aware mode).")
+    ap.add_argument("--seeds", type=int, nargs="+", default=None,
+                    help="Seeds to export (full-data mode). When given, ignores "
+                         "--n-folds and exports each fulldata_seed{S} subdir.")
     ap.add_argument("--out-dir", required=True,
                     help="Where to write sed_fold{0..K-1}.onnx files. "
                          "e.g. `models/sed_inhouse` (a sibling to models/sed_kaggle).")
@@ -117,15 +123,28 @@ def main() -> None:
     print(f"[export] config={args.config}  base_dir={base_dir}")
     print(f"[export] out_dir={out_dir}  opset={args.opset}")
 
+    # Build the (subdir_name, output_filename) plan based on mode.
+    if args.seeds:
+        plan = [
+            (f"fulldata_seed{s}", f"sed_fold{i}.onnx")
+            for i, s in enumerate(args.seeds)
+        ]
+        print(f"[export] full-data mode: {len(plan)} seeds → {[s for _, s in plan]}")
+    else:
+        plan = [
+            (f"fold{i}", f"sed_fold{i}.onnx")
+            for i in range(int(args.n_folds))
+        ]
+        print(f"[export] fold-aware mode: {len(plan)} folds")
+
     device = torch.device("cpu")
     n_exported = 0
-    for fold in range(int(args.n_folds)):
-        ckpt = base_dir / f"fold{fold}" / args.ckpt_name
+    for subdir, out_filename in plan:
+        ckpt = base_dir / subdir / args.ckpt_name
         if not ckpt.exists():
-            print(f"[export] WARN: missing {ckpt}; skipping fold {fold}")
+            print(f"[export] WARN: missing {ckpt}; skipping")
             continue
-        out_path = out_dir / f"sed_fold{fold}.onnx"
-        print(f"[export] fold {fold}: {ckpt} → {out_path}")
+        print(f"[export] {subdir}: {ckpt} → {out_path}")
         sed, cfg = _load_sed_from_ckpt(ckpt, device)
         _export_one(sed, out_path, opset=int(args.opset),
                     use_dynamo=bool(args.use_dynamo))
