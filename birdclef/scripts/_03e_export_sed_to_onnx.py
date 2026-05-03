@@ -45,24 +45,30 @@ def _load_sed_from_ckpt(ckpt_path: Path, device: torch.device) -> tuple[SED, dic
     return m, cfg
 
 
-def _export_one(sed: SED, out_path: Path, opset: int = 20) -> None:
+def _export_one(sed: SED, out_path: Path, opset: int = 17,
+                use_dynamo: bool = False) -> None:
     """Wrap SED in SEDExportWrapper (ONNX-safe mel) and torch.onnx.export.
 
-    Default opset 20 — the dynamo exporter in torch 2.10+ produces graphs at
-    natural opset ~18-20, and downconverting to 17 fails on `Pad` (no
-    onnx-script adapter). Stay at the natural target. ONNXRuntime ≥ 1.18
-    supports opset 20 fine.
+    Defaults to the LEGACY exporter (`dynamo=False`) — the dynamo exporter
+    in torch 2.10+ has known issues hardcoding internal Reshape shapes from
+    the batch=1 trace, so when ORT runs with batch=12 it fails at a
+    `gemm_input_reshape` node. The legacy exporter respects `dynamic_axes`
+    on intermediate ops more reliably.
+
+    Default opset 17 — Tucker's bundle uses 17 and ORT supports it
+    everywhere. Bump to 20 if your local torch warns about deprecated ops
+    on 17.
     """
     from birdclef.config.paths import WINDOW_SAMPLES
 
     wrapper = SEDExportWrapper(sed).eval().cpu()
-    # Dummy input: 1 5-second window (B=1, T=WINDOW_SAMPLES). Dynamic batch axis.
-    dummy = torch.zeros(1, WINDOW_SAMPLES, dtype=torch.float32)
+    # Dummy input: a representative-sized batch (B=12 = N_WINDOWS) so the
+    # trace doesn't pin batch=1 in any internal op. Combined with
+    # dynamic_axes batch=0, the resulting graph accepts any batch size.
+    dummy = torch.zeros(12, WINDOW_SAMPLES, dtype=torch.float32)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.onnx.export(
-        wrapper,
-        dummy,
-        str(out_path),
+
+    export_kwargs = dict(
         opset_version=int(opset),
         input_names=["waveform"],
         output_names=["clip_logits", "framewise_logits"],
@@ -72,6 +78,14 @@ def _export_one(sed: SED, out_path: Path, opset: int = 20) -> None:
             "framewise_logits": {0: "batch"},
         },
     )
+    # `dynamo` kwarg only exists on torch ≥ 2.5; older versions silently use
+    # the legacy path. Pass it conditionally.
+    try:
+        torch.onnx.export(wrapper, dummy, str(out_path),
+                          dynamo=bool(use_dynamo), **export_kwargs)
+    except TypeError:
+        # Older torch — no dynamo kwarg, default is legacy path.
+        torch.onnx.export(wrapper, dummy, str(out_path), **export_kwargs)
 
 
 def main() -> None:
@@ -86,10 +100,13 @@ def main() -> None:
     ap.add_argument("--ckpt-name", default="best.pt",
                     help="Checkpoint filename inside each fold dir. "
                          "Default `best.pt`.")
-    ap.add_argument("--opset", type=int, default=20,
-                    help="ONNX opset version. Default 20 — the natural target "
-                         "for torch 2.10+ dynamo exporter. Stick with 20 unless "
-                         "Kaggle's ONNXRuntime is too old to handle it.")
+    ap.add_argument("--opset", type=int, default=17,
+                    help="ONNX opset version. Default 17 — matches Tucker's "
+                         "bundle and is widely supported by ORT.")
+    ap.add_argument("--use-dynamo", action="store_true",
+                    help="Use the new dynamo exporter (torch ≥ 2.5). "
+                         "Default OFF — legacy exporter handles dynamic batch "
+                         "more reliably for SED graphs.")
     args = ap.parse_args()
 
     base_dir = Path(MODEL_ROOT) / "sed" / args.config
@@ -110,18 +127,23 @@ def main() -> None:
         out_path = out_dir / f"sed_fold{fold}.onnx"
         print(f"[export] fold {fold}: {ckpt} → {out_path}")
         sed, cfg = _load_sed_from_ckpt(ckpt, device)
-        _export_one(sed, out_path, opset=int(args.opset))
-        # Quick sanity check on the exported model
+        _export_one(sed, out_path, opset=int(args.opset),
+                    use_dynamo=bool(args.use_dynamo))
+        # Quick sanity check on the exported model — try BOTH a small batch
+        # (1 window) AND the full N_WINDOWS=12 batch the inference loop will
+        # use. Catches dynamic-axis bugs at export time, not later in eval.
         import onnxruntime as ort
         import numpy as np
         sess = ort.InferenceSession(str(out_path), providers=["CPUExecutionProvider"])
-        x = np.zeros((1, cfg["sample_rate"] * 5), dtype=np.float32)
-        outs = sess.run(None, {sess.get_inputs()[0].name: x})
-        clip_shape = outs[0].shape
-        fw_shape = outs[1].shape
+        in_name = sess.get_inputs()[0].name
+        x_one = np.zeros((1, cfg["sample_rate"] * 5), dtype=np.float32)
+        outs_one = sess.run(None, {in_name: x_one})
+        x_full = np.zeros((12, cfg["sample_rate"] * 5), dtype=np.float32)
+        outs_full = sess.run(None, {in_name: x_full})
         size_mb = out_path.stat().st_size / 1024**2
         print(f"[export]   exported OK — size={size_mb:.1f} MB  "
-              f"clip={clip_shape}  framewise={fw_shape}")
+              f"B=1 clip={outs_one[0].shape} fw={outs_one[1].shape}  "
+              f"B=12 clip={outs_full[0].shape} fw={outs_full[1].shape}")
         n_exported += 1
 
     if n_exported == 0:
