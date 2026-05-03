@@ -494,7 +494,10 @@ def train_one_fold(cfg: dict, fold: int | None, dry_run_steps: int = 0) -> dict:
                 last_eval = summary
                 f_mauc = summary["fold_val"]["macro_auc"]
                 f_std = summary["fold_val"]["site_auc_std"] or 0.0
-                primary = (f_mauc - 1.0 * f_std) if not math.isnan(f_mauc) else float("-inf")
+                # Primary metric for best-checkpoint selection = fold-val
+                # macro AUC. Tracks the competition metric directly. site_std
+                # is still printed and saved as a diagnostic.
+                primary = f_mauc if not math.isnan(f_mauc) else float("-inf")
                 print(
                     f"[sed:{cfg['name']} f{fold}] eval step={step}  "
                     f"fold_val auc={f_mauc:.4f} "
@@ -545,7 +548,8 @@ def train_one_fold(cfg: dict, fold: int | None, dry_run_steps: int = 0) -> dict:
         summary = _combine_eval_summary(fold_m)
         f_mauc = summary["fold_val"]["macro_auc"]
         f_std = summary["fold_val"]["site_auc_std"] or 0.0
-        final_primary = (f_mauc - 1.0 * f_std) if not math.isnan(f_mauc) else float("-inf")
+        # Final primary = fold-val macro AUC (matches checkpoint-selection metric).
+        final_primary = f_mauc if not math.isnan(f_mauc) else float("-inf")
         print(
             f"[sed:{cfg['name']} f{fold}] FINAL  "
             f"fold_val auc={f_mauc:.4f} "
