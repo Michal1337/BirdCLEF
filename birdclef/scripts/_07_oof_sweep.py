@@ -9,6 +9,7 @@ from birdclef.config.paths import FOLD_KINDS, OUTPUT_ROOT
 from birdclef.config.ssm_configs import (
     SWEEP_BEST_SSM,
     SWEEP_CHEAP_WINS,
+    SWEEP_LARGER_SSM,
     SWEEP_NOISE_FLOOR,
 )
 from birdclef.sweep.runner import run_sweep
@@ -19,6 +20,7 @@ PRESETS = {
     "cheap_wins": SWEEP_CHEAP_WINS,
     "best_ssm": SWEEP_BEST_SSM,
     "noise_floor": SWEEP_NOISE_FLOOR,
+    "larger_ssm": SWEEP_LARGER_SSM,
 }
 
 

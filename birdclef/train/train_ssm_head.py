@@ -127,7 +127,12 @@ def _train_proto_ssm(
     cap = int(cfg["n_sites_cap"])
     model = LightProtoSSM(SSMHeadConfig(
         d_input=emb.shape[1], n_classes=n_classes, n_windows=N_WINDOWS,
-        n_sites=cap, use_cross_attn=True, cross_attn_heads=2,
+        n_sites=cap,
+        d_model=int(cfg.get("proto_d_model", 128)),
+        d_state=int(cfg.get("proto_d_state", 16)),
+        dropout=float(cfg.get("proto_dropout", 0.15)),
+        use_cross_attn=bool(cfg.get("proto_use_cross_attn", True)),
+        cross_attn_heads=int(cfg.get("proto_cross_attn_heads", 2)),
     )).to(device)
     model.init_prototypes(
         torch.tensor(emb, dtype=torch.float32, device=device),

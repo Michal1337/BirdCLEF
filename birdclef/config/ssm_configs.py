@@ -48,6 +48,13 @@ BASELINE = dict(
     proto_distill_weight=0.15,
     proto_swa_start_frac=0.65,
     proto_swa_lr=4e-4,
+    # ProtoSSM head capacity. Default mirrors SSMHeadConfig defaults so
+    # behaviour is unchanged for existing runs. Overridable in sweeps.
+    proto_d_model=128,
+    proto_d_state=16,
+    proto_dropout=0.15,
+    proto_cross_attn_heads=2,
+    proto_use_cross_attn=True,
     residual_n_epochs=30,
     residual_lr=1e-3,
     residual_patience=8,
@@ -135,3 +142,34 @@ NOISE_FLOOR_SEEDS = (42, 7, 13, 21, 99)
 SWEEP_NOISE_FLOOR = [
     _make(name=f"baseline_s{s}", seed=int(s)) for s in NOISE_FLOOR_SEEDS
 ]
+
+
+# Larger SSM sweep — three capacity steps × 5 seeds each. Tests whether
+# the 128-dim SSM head is undersized for the task. Scales BOTH proto and
+# residual SSMs together since they share the architectural family.
+#
+#   d256/state32  — 2× d_model, 2× d_state
+#   d384/state48  — 3× d_model, 3× d_state
+#   d512/state64  — 4× d_model, 4× d_state
+#
+# All variants keep BASELINE's other hyperparameters (n_epochs, lr,
+# patience, etc). 5 seeds per size lets us read mean ± std and decide if
+# any size beats BASELINE's noise floor.
+LARGER_SSM_SEEDS = (42, 7, 13, 21, 99)
+LARGER_SSM_SIZES = [
+    {"name": "d256_s32", "proto_d_model": 256, "proto_d_state": 32,
+     "residual_d_model": 256, "residual_d_state": 32},
+    {"name": "d384_s48", "proto_d_model": 384, "proto_d_state": 48,
+     "residual_d_model": 384, "residual_d_state": 48},
+    {"name": "d512_s64", "proto_d_model": 512, "proto_d_state": 64,
+     "residual_d_model": 512, "residual_d_state": 64},
+]
+SWEEP_LARGER_SSM = []
+for size in LARGER_SSM_SIZES:
+    for seed in LARGER_SSM_SEEDS:
+        kwargs = {k: v for k, v in size.items() if k != "name"}
+        SWEEP_LARGER_SSM.append(_make(
+            name=f"ssm_{size['name']}_s{seed}",
+            seed=int(seed),
+            **kwargs,
+        ))
